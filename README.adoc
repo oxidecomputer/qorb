@@ -1,0 +1,10 @@
+:showtitle:
+:toc: left
+:icons: font
+
+= Qorb
+
+Qorb is a work-in-progress Connection Pooling library, heavily inspired by
+the "Cueball" connection pooling library.
+
+It is not yet functional, but this space will be updated when it's ready for usage.
