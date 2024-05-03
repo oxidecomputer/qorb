@@ -6,7 +6,13 @@ pub struct Policy {
 
     /// The maximum number of connections which can be opened by this pool.
     pub maximum_connections: usize,
+}
 
-    /// The maximum number of concurrent requests to send to resolvers.
-    pub maximum_resolver_concurrency: usize,
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            spare_connections_wanted: 8,
+            maximum_connections: 16,
+        }
+    }
 }

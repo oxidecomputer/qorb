@@ -8,5 +8,7 @@ license = "MPL-2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+debug-ignore = "1.0"
+derive-where = "1.2"
 thiserror = "1.0"
-tokio = { version = "1.37.0", features = ["sync"] }
+tokio = { version = "1.37.0", features = ["macros", "sync", "rt"] }

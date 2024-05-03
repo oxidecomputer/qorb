@@ -140,8 +140,8 @@ impl ControlledDelay {
                 // Note that when "must_hit_target_by" is set, it gets
                 // set to "now + interval". Admittedly, that's a different
                 // value of "now" than the one being evaluated here.
-                now - must_hit_target_by >=
-                    self.params.interval * self.params.interval_hysteresis_factor
+                now - must_hit_target_by
+                    >= self.params.interval * self.params.interval_hysteresis_factor
             })
             .unwrap_or(false);
 
@@ -186,7 +186,7 @@ impl ControlledDelay {
         self.queue_cleared_inner(Instant::now());
     }
 
-    fn queue_cleared_inner(&mut self, now: Instant,) {
+    fn queue_cleared_inner(&mut self, now: Instant) {
         self.last_emptied = Some(now);
         self.drop_next = None;
         self.dropping = false;
@@ -298,9 +298,11 @@ mod test {
                 Some(must_hit_target_by) => {
                     format!(
                         "{} ms",
-                        must_hit_target_by.duration_since(self.test_start).as_millis()
+                        must_hit_target_by
+                            .duration_since(self.test_start)
+                            .as_millis()
                     )
-                },
+                }
                 None => "None".to_string(),
             };
 
@@ -310,11 +312,12 @@ mod test {
                         "{} ms",
                         drop_next.duration_since(self.test_start).as_millis()
                     )
-                },
+                }
                 None => "None".to_string(),
             };
 
-            format!("ControlledDelay:\n\
+            format!(
+                "ControlledDelay:\n\
                 \tdropping: {dropping}\n\
                 \tmust_hit_target_by: {must_hit_target_by},\n\
                 \tdrop_next: {drop_next}\n\
@@ -323,8 +326,6 @@ mod test {
                 drop_count = self.cd.drop_count,
             )
         }
-
-
     }
 
     #[test]
@@ -338,11 +339,11 @@ mod test {
         let mut harness = TestHarness::new(cd);
 
         harness
-            .push()             // >-> 1 ms to complete
-            .wait(ms(1))        //   |
-            .push()             // >-|-> completes immediately
-            .expect_dequeue()   // <-< |
-            .expect_dequeue();  // <---<
+            .push() // >-> 1 ms to complete
+            .wait(ms(1)) //   |
+            .push() // >-|-> completes immediately
+            .expect_dequeue() // <-< |
+            .expect_dequeue(); // <---<
     }
 
     #[test]
@@ -356,15 +357,15 @@ mod test {
         let mut harness = TestHarness::new(cd);
 
         harness
-            .push()           // >-> 100 ms to complete
-            .push()           // >-|-> 200 ms to complete
-            .push()           // >-|-|-> 300 ms to complete
-            .wait(ms(100))    //   | | |
+            .push() // >-> 100 ms to complete
+            .push() // >-|-> 200 ms to complete
+            .push() // >-|-|-> 300 ms to complete
+            .wait(ms(100)) //   | | |
             .expect_dequeue() // <-< | |
-            .wait(ms(100))    //     | |
-            .expect_drop()    // <---< |
-            .wait(ms(100))    //       |
-            .expect_drop();   // <-----<
+            .wait(ms(100)) //     | |
+            .expect_drop() // <---< |
+            .wait(ms(100)) //       |
+            .expect_drop(); // <-----<
     }
 
     #[test]
@@ -413,10 +414,7 @@ mod test {
             .expect_drop();
 
         // Request #4
-        harness
-            .push()
-            .wait(ms(58))
-            .expect_drop();
+        harness.push().wait(ms(58)).expect_drop();
     }
 
     #[test]

@@ -7,9 +7,11 @@ use thiserror::Error;
 pub enum Error {}
 
 /// Describes the name of a backend.
+#[derive(PartialEq, Eq, Debug, Hash)]
 pub struct Name(pub String);
 
 /// A single instance of a service.
+#[derive(PartialEq, Eq, Debug, Hash)]
 pub struct Backend {
     name: Name,
     address: SocketAddr,
