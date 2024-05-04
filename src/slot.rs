@@ -6,7 +6,7 @@ use debug_ignore::DebugIgnore;
 use derive_where::derive_where;
 use std::collections::BTreeMap;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -75,17 +75,6 @@ impl<Conn: Connection> BorrowedConnection<Conn> {
     }
 }
 
-/// A request which may be sent to a slot set
-enum Request<Conn: Connection> {
-    /// Adjusts the number of "wanted" slots which should exist in the set.
-    SetWantedCount(usize),
-
-    /// Claims a slot from the set, if one exists.
-    Claim {
-        tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>,
-    },
-}
-
 pub(crate) struct SetParameters {
     /// The backend to which all the slots are connected, or trying to connect
     pub(crate) backend: Backend,
@@ -97,20 +86,17 @@ pub(crate) struct SetParameters {
     pub(crate) max_count: usize,
 }
 
-struct SetInner<Conn: Connection> {
+/// A set of slots for a particular backend.
+pub(crate) struct Set<Conn: Connection> {
     params: SetParameters,
 
     // Interface for actually connecting to backends
     backend_connector: SharedConnector<Conn>,
 
-    // Receiver for messages to manage the connection pool.
-    mgr_rx: mpsc::Receiver<Request<Conn>>,
-
     // Sender and receiver for returning old handles.
     //
-    // This is isolated from "mgr_rx" to guarantee a size, and to vend out
-    // permits to claim::Handles so they can be sure that their connections
-    // can return to the set without error.
+    // This is to guarantee a size, and to vend out permits to claim::Handles so they can be sure
+    // that their connections can return to the set without error.
     slot_tx: mpsc::Sender<BorrowedConnection<Conn>>,
     slot_rx: mpsc::Receiver<BorrowedConnection<Conn>>,
 
@@ -120,9 +106,8 @@ struct SetInner<Conn: Connection> {
     next_slot_id: SlotId,
 }
 
-impl<Conn: Connection> SetInner<Conn> {
-    fn new(
-        mgr_rx: mpsc::Receiver<Request<Conn>>,
+impl<Conn: Connection> Set<Conn> {
+    pub(crate) fn new(
         mut params: SetParameters,
         backend_connector: SharedConnector<Conn>,
     ) -> Self {
@@ -138,7 +123,6 @@ impl<Conn: Connection> SetInner<Conn> {
         Self {
             params,
             backend_connector,
-            mgr_rx,
             slot_tx,
             slot_rx,
             slots,
@@ -200,6 +184,11 @@ impl<Conn: Connection> SetInner<Conn> {
         self.conform_slot_count();
     }
 
+    pub fn set_wanted_count(&mut self, count: usize) {
+        self.params.desired_count = std::cmp::min(count, self.params.max_count);
+        self.conform_slot_count();
+    }
+
     // Makes the number of slots as close to "desired_count" as we can get.
     fn conform_slot_count(&mut self) {
         let desired = self.params.desired_count;
@@ -238,7 +227,7 @@ impl<Conn: Connection> SetInner<Conn> {
         }
     }
 
-    fn claim_connection(&mut self) -> Result<claim::Handle<Conn>, Error> {
+    pub fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         // Before we vend out the slot's connection to a client, make sure that
         // we have space to take it back once they're done with it.
         let Ok(permit) = self.slot_tx.clone().try_reserve_owned() else {
@@ -254,7 +243,12 @@ impl<Conn: Connection> SetInner<Conn> {
         Ok(handle)
     }
 
-    async fn run(mut self) {
+    /// Must be called periodically to handle background tasks for the slot set.
+    ///
+    /// This includes:
+    /// - Recycling previously-claimed connections returned by clients
+    /// - TODO
+    pub async fn step(&mut self) {
         loop {
             tokio::select! {
                 request = self.slot_rx.recv() => {
@@ -265,68 +259,8 @@ impl<Conn: Connection> SetInner<Conn> {
                         },
                     }
                 },
-                request = self.mgr_rx.recv() => {
-                    use Request::*;
-                    match request {
-                        Some(SetWantedCount(count)) => {
-                            self.params.desired_count = std::cmp::min(count, self.params.max_count);
-                            self.conform_slot_count();
-                        },
-                        Some(Claim { tx } ) => {
-                            let result = self.claim_connection();
-                            let _ = tx.send(result);
-                        },
-                        None => return,
-                    }
-                },
                 // TODO: also, monitor our own slots for progress??
             }
         }
-    }
-}
-
-/// A set of slots for a particular backend.
-///
-/// This set is monitored by a task that updates their states, and
-/// responds to requests for different quantities of slots.
-pub(crate) struct Set<Conn: Connection> {
-    handle: tokio::task::JoinHandle<()>,
-    mgr_tx: mpsc::Sender<Request<Conn>>,
-}
-
-impl<Conn: Connection> Set<Conn> {
-    /// Creates a new slot set for a backend.
-    pub(crate) fn new(params: SetParameters, backend_connector: SharedConnector<Conn>) -> Self {
-        let (mgr_tx, mgr_rx) = mpsc::channel(1);
-        let handle = tokio::task::spawn(async move {
-            let worker = SetInner::new(mgr_rx, params, backend_connector);
-            worker.run().await;
-        });
-
-        Self { handle, mgr_tx }
-    }
-
-    /// Requests a claim from the background task.
-    ///
-    /// Returns an error if the handle cannot be acquired.
-    pub(crate) async fn claim(&self) -> Result<claim::Handle<Conn>, Error> {
-        let (tx, rx) = oneshot::channel();
-
-        self.mgr_tx
-            .send(Request::Claim { tx })
-            .await
-            .map_err(|_| Error::SlotWorkerTerminated)?;
-        rx.await.map_err(|_| Error::SlotWorkerTerminated)?
-    }
-
-    /// Adjusts the number of slots open to this backend.
-    ///
-    /// Returns when this new size is acknowledged, but it may take longer to
-    /// actually conform to the requested size.
-    pub(crate) async fn resize(&self, size: usize) -> Result<(), Error> {
-        self.mgr_tx
-            .send(Request::SetWantedCount(size))
-            .await
-            .map_err(|_| Error::SlotWorkerTerminated)
     }
 }

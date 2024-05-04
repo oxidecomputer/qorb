@@ -33,7 +33,9 @@ enum Request<Conn: Connection> {
 struct PoolInner<Conn: Connection> {
     resolver: resolver::BoxedResolver,
     backend_connector: backend::SharedConnector<Conn>,
+
     slots: HashMap<backend::Backend, slot::Set<Conn>>,
+
     policy: Policy,
 
     rx: mpsc::Receiver<Request<Conn>>,
@@ -71,6 +73,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                     self.backend_connector.clone(),
                 );
                 self.slots.insert(backend, slot_set);
+
             },
             BackendRemoved { name } => {
                 todo!();
@@ -84,16 +87,30 @@ impl<Conn: Connection> PoolInner<Conn> {
     async fn run(mut self) {
         let mut resolver_monitor = self.resolver.monitor();
         loop {
+            // TODO: It would be cool to confirm this isn't too expensive?
+            //
+            // It's nice to let the pool be able to directly call "&mut self"
+            // functions on the slot sets -- it does own them -- but it's tricky
+            // to balance that with "being in charge of when we actually await
+            // all their work".
+            let slot_work = futures::future::join_all(
+                self.slots
+                    .values_mut()
+                    .map(|set| set.step())
+            );
+
             tokio::select! {
+                // Handle requests from clients
                 request = self.rx.recv() => {
                     match request {
                         Some(Request::Claim { tx }) => {
-                            let result = self.claim().await;
+                            let result = self.claim();
                             let _ = tx.send(result);
                         },
                         None => return,
                     }
                 }
+                // Handle updates from the resolver
                 resolve_event = resolver_monitor.recv() => {
                     match resolve_event {
                         Ok(event) => self.handle_resolve_event(event),
@@ -102,24 +119,23 @@ impl<Conn: Connection> PoolInner<Conn> {
                         }
                     }
                 }
+                // Handle updates from the slot sets
+                _ = slot_work => {}
             }
         }
     }
 
-    pub async fn claim(&self) -> Result<claim::Handle<Conn>, Error> {
+    pub fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         // TODO: We need a smarter policy to pick the backend.
         //
         // This is where the priority list could come into play.
         //
         // NOTE: For now, we're trying the first one?
-        let Some(set) = self.slots.values().next() else {
+        let Some(set) = self.slots.values_mut().next() else {
             return Err(Error::NoBackends);
         };
 
-        // TODO: Do we actually want the *pool* to await a response from
-        // the slot set? We could forward the request on behalf of the client,
-        // or we could try sending requests to many backends at once.
-        let claim = set.claim().await?;
+        let claim = set.claim()?;
         Ok(claim)
     }
 }
