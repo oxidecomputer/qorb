@@ -14,6 +14,7 @@ pub enum ResolverState {
 #[derive(Error, Clone, Debug)]
 pub enum ResolveError {}
 
+#[derive(Clone)]
 pub enum ResolveEvent {
     BackendAdded { backend: Backend },
     BackendRemoved { name: backend::Name },
@@ -25,7 +26,7 @@ pub enum ResolveEvent {
 /// The resolver is responsible for knowing which [crate::service::Name]
 /// it is resolving. It is responsible for reporting the set of
 /// all possible backends, but not reporting nor tracking their health.
-pub trait Resolver {
+pub trait Resolver: Send + Sync {
     /// Allows a caller to monitor for updates from the resolver.
     fn monitor(&self) -> broadcast::Receiver<ResolveEvent>;
 

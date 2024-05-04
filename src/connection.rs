@@ -1,1 +1,1 @@
-pub trait Connection {}
+pub trait Connection: Send + 'static {}

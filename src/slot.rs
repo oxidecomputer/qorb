@@ -1,4 +1,4 @@
-use crate::backend::Backend;
+use crate::backend::{Backend, SharedConnector};
 use crate::claim;
 use crate::connection::Connection;
 
@@ -100,6 +100,9 @@ pub(crate) struct SetParameters {
 struct SetInner<Conn: Connection> {
     params: SetParameters,
 
+    // Interface for actually connecting to backends
+    backend_connector: SharedConnector<Conn>,
+
     // Receiver for messages to manage the connection pool.
     mgr_rx: mpsc::Receiver<Request<Conn>>,
 
@@ -118,7 +121,11 @@ struct SetInner<Conn: Connection> {
 }
 
 impl<Conn: Connection> SetInner<Conn> {
-    fn new(mgr_rx: mpsc::Receiver<Request<Conn>>, mut params: SetParameters) -> Self {
+    fn new(
+        mgr_rx: mpsc::Receiver<Request<Conn>>,
+        mut params: SetParameters,
+        backend_connector: SharedConnector<Conn>,
+    ) -> Self {
         let (slot_tx, slot_rx) = mpsc::channel(params.max_count);
 
         // Cap the "goal" slot count to always be within the maximum size
@@ -130,6 +137,7 @@ impl<Conn: Connection> SetInner<Conn> {
 
         Self {
             params,
+            backend_connector,
             mgr_rx,
             slot_tx,
             slot_rx,
@@ -148,6 +156,11 @@ impl<Conn: Connection> SetInner<Conn> {
     ) -> Option<claim::Handle<Conn>> {
         for (id, slot) in &mut self.slots {
             if matches!(slot.state, State::ConnectedUnclaimed(_)) {
+                // We intentionally "take the connection out" of the slot and
+                // "place it into a claim::Handle" in the same method.
+                //
+                // This makes it difficult to leak a connection, unless the drop
+                // method of the claim::Handle is skipped.
                 let State::ConnectedUnclaimed(DebugIgnore(conn)) =
                     std::mem::replace(&mut slot.state, State::ConnectedClaimed)
                 else {
@@ -159,7 +172,8 @@ impl<Conn: Connection> SetInner<Conn> {
                 let borrowed_conn = BorrowedConnection::new(conn, *id);
 
                 // The "drop" method of the claim::Handle will return it to
-                // the slot set, through slot_tx -> slot_rx.
+                // the slot set, through the permit (which is connected to
+                // slot_rx).
                 return Some(claim::Handle::new(borrowed_conn, permit));
             }
         }
@@ -225,9 +239,8 @@ impl<Conn: Connection> SetInner<Conn> {
     }
 
     fn claim_connection(&mut self) -> Result<claim::Handle<Conn>, Error> {
-        // Before we vend out the slot's connection to a
-        // client, make sure that we have space to take it
-        // back once they're done with it.
+        // Before we vend out the slot's connection to a client, make sure that
+        // we have space to take it back once they're done with it.
         let Ok(permit) = self.slot_tx.clone().try_reserve_owned() else {
             // This is more of an "all slots in-use" error,
             // but it should look the same to clients.
@@ -281,12 +294,12 @@ pub(crate) struct Set<Conn: Connection> {
     mgr_tx: mpsc::Sender<Request<Conn>>,
 }
 
-impl<Conn: Connection + Send + 'static> Set<Conn> {
+impl<Conn: Connection> Set<Conn> {
     /// Creates a new slot set for a backend.
-    pub(crate) fn new(params: SetParameters) -> Self {
+    pub(crate) fn new(params: SetParameters, backend_connector: SharedConnector<Conn>) -> Self {
         let (mgr_tx, mgr_rx) = mpsc::channel(1);
         let handle = tokio::task::spawn(async move {
-            let worker = SetInner::new(mgr_rx, params);
+            let worker = SetInner::new(mgr_rx, params, backend_connector);
             worker.run().await;
         });
 
@@ -295,7 +308,6 @@ impl<Conn: Connection + Send + 'static> Set<Conn> {
 
     /// Requests a claim from the background task.
     ///
-    /// Does not block.
     /// Returns an error if the handle cannot be acquired.
     pub(crate) async fn claim(&self) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();

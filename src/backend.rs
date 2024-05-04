@@ -1,27 +1,30 @@
 use crate::connection;
 
+use async_trait::async_trait;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {}
 
 /// Describes the name of a backend.
-#[derive(PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct Name(pub String);
 
 /// A single instance of a service.
-#[derive(PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct Backend {
     name: Name,
     address: SocketAddr,
 }
 
 /// Describes how a connection to a Backend should be constructed.
-pub trait BackendConnector {
+#[async_trait]
+pub trait Connector: Send + Sync {
     type Connection: connection::Connection;
 
-    fn connect(&self, backend: &Backend) -> Result<Self::Connection, Error>;
+    async fn connect(&self, backend: &Backend) -> Result<Self::Connection, Error>;
 }
 
-pub type BoxedBackendConnector<Conn> = Box<dyn BackendConnector<Connection = Conn>>;
+pub type SharedConnector<Conn> = Arc<dyn Connector<Connection = Conn>>;
