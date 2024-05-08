@@ -64,9 +64,8 @@ impl<Conn: Connection> PoolInner<Conn> {
                 // Make sure that we have a slot set for each of the backends.
                 for (name, backend) in backends {
                     let _slot_set = self.slots.entry(name.clone()).or_insert_with(|| {
-                        // TODO: Respect TTL?
                         slot::Set::new(
-                            slot::SetParameters {
+                            slot::SetConfig {
                                 backend: backend.clone(),
                                 desired_count: 16,
                                 max_count: 16,
@@ -169,5 +168,11 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
             .await
             .map_err(|_| Error::Terminated)?;
         rx.await.map_err(|_| Error::Terminated)?
+    }
+}
+
+impl<Conn: Connection> Drop for Pool<Conn> {
+    fn drop(&mut self) {
+        self.handle.abort()
     }
 }

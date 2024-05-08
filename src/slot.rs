@@ -27,9 +27,6 @@ enum State<Conn: Connection> {
 
     /// The slot has an active connection to a backend, and is claimed.
     ConnectedClaimed,
-
-    /// The slot is not connected, and is not attempting to connect.
-    Stopped,
 }
 
 impl<Conn: Connection> State<Conn> {
@@ -58,8 +55,8 @@ impl<Conn: Connection> Slot<Conn> {
     }
 }
 
-/// An arbitrary opaque identifier for a slot, to distinguish it from
-/// other slots which already exist.
+// An arbitrary opaque identifier for a slot, to distinguish it from
+// other slots which already exist.
 type SlotId = usize;
 
 /// A wrapper around a connection that gives the slot set enough context
@@ -75,7 +72,7 @@ impl<Conn: Connection> BorrowedConnection<Conn> {
     }
 }
 
-pub(crate) struct SetParameters {
+pub(crate) struct SetConfig {
     /// The backend to which all the slots are connected, or trying to connect
     pub(crate) backend: Backend,
 
@@ -88,7 +85,7 @@ pub(crate) struct SetParameters {
 
 /// A set of slots for a particular backend.
 pub(crate) struct Set<Conn: Connection> {
-    params: SetParameters,
+    config: SetConfig,
 
     // Interface for actually connecting to backends
     backend_connector: SharedConnector<Conn>,
@@ -107,18 +104,18 @@ pub(crate) struct Set<Conn: Connection> {
 }
 
 impl<Conn: Connection> Set<Conn> {
-    pub(crate) fn new(mut params: SetParameters, backend_connector: SharedConnector<Conn>) -> Self {
-        let (slot_tx, slot_rx) = mpsc::channel(params.max_count);
+    pub(crate) fn new(mut config: SetConfig, backend_connector: SharedConnector<Conn>) -> Self {
+        let (slot_tx, slot_rx) = mpsc::channel(config.max_count);
 
         // Cap the "goal" slot count to always be within the maximum size
-        params.desired_count = std::cmp::min(params.desired_count, params.max_count);
+        config.desired_count = std::cmp::min(config.desired_count, config.max_count);
 
         // Set up the initial set of slots
-        let init_count = params.desired_count;
+        let init_count = config.desired_count;
         let slots = BTreeMap::from_iter((0..init_count).into_iter().map(|id| (id, Slot::new())));
 
         Self {
-            params,
+            config,
             backend_connector,
             slot_tx,
             slot_rx,
@@ -182,13 +179,13 @@ impl<Conn: Connection> Set<Conn> {
     }
 
     pub fn set_wanted_count(&mut self, count: usize) {
-        self.params.desired_count = std::cmp::min(count, self.params.max_count);
+        self.config.desired_count = std::cmp::min(count, self.config.max_count);
         self.conform_slot_count();
     }
 
     // Makes the number of slots as close to "desired_count" as we can get.
     fn conform_slot_count(&mut self) {
-        let desired = self.params.desired_count;
+        let desired = self.config.desired_count;
 
         if desired < self.slots.len() {
             // Fewer slots wanted. Remove as many as we can.

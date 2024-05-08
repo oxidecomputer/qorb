@@ -31,11 +31,16 @@ struct Client {
     resolver: TokioAsyncResolver,
     hardcoded_ttl: Option<Duration>,
 
+    // TODO: We definitely need a more elaborate representation of health here,
+    // beyond "the number of missed requests in a row we've had".
+    //
+    // This number will go up when the DNS client cannot access the server, but
+    // this is but one of many signals.
     missed_requests_count: usize,
 }
 
 impl Client {
-    fn new(address: SocketAddr) -> Self {
+    fn new(address: SocketAddr, hardcoded_ttl: Option<Duration>) -> Self {
         let mut rc = ResolverConfig::new();
         rc.add_name_server(NameServerConfig::new(address, Protocol::Udp));
         let mut opts = ResolverOpts::default();
@@ -43,7 +48,7 @@ impl Client {
         let resolver = TokioAsyncResolver::tokio(rc, opts);
         Self {
             resolver,
-            hardcoded_ttl: None,
+            hardcoded_ttl,
             missed_requests_count: 0,
         }
     }
@@ -107,42 +112,64 @@ impl Client {
 
 /// Resolves a service name to a backend by contacting several DNS servers.
 pub struct DnsResolver {
+    // What service are we trying to find backends for?
     service: service::Name,
 
-    // TODO: We probably want to track e.g. health of these servers.
-    //
-    // TODO: We also want to track the servers that have been uncovered
-    // dynamically.
-    //
-    // TODO: These servers might also go away?
+    // What DNS servers are we actively contacting?
     dns_servers: Vec<Client>,
 
+    // What backends do we think we've found so far?
     backends: HashMap<backend::Name, BackendRecord>,
 
-    max_dns_concurrency: usize,
+    config: DnsResolverConfig,
 }
 
 // How often do we want to query the DNS servers for updates on the set of
 // available backends?
-const QUERY_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_QUERY_INTERVAL: Duration = Duration::from_secs(60);
 
 // How long do we expect a healthy DNS server to take to respond?
-const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub struct DnsResolverConfig {
+    /// How many DNS servers should we query concurrently?
+    pub max_dns_concurrency: usize,
+
+    /// How long should we wait before re-querying DNS servers?
+    pub query_interval: Duration,
+
+    /// After starting to query a DNS server, how long until we timeout?
+    pub query_timeout: Duration,
+
+    /// Provides an option to ignore TTL from DNS
+    pub hardcoded_ttl: Option<Duration>,
+}
+
+impl Default for DnsResolverConfig {
+    fn default() -> Self {
+        Self {
+            max_dns_concurrency: 5,
+            query_interval: DEFAULT_QUERY_INTERVAL,
+            query_timeout: DEFAULT_QUERY_TIMEOUT,
+            hardcoded_ttl: None,
+        }
+    }
+}
 
 impl DnsResolver {
     pub fn new(
         service: service::Name,
         bootstrap_servers: Vec<SocketAddr>,
-        max_dns_concurrency: usize,
+        config: DnsResolverConfig,
     ) -> Self {
         Self {
             service,
             dns_servers: bootstrap_servers
                 .into_iter()
-                .map(|address| Client::new(address))
+                .map(|address| Client::new(address, config.hardcoded_ttl))
                 .collect(),
             backends: HashMap::new(),
-            max_dns_concurrency,
+            config,
         }
     }
 
@@ -151,8 +178,9 @@ impl DnsResolver {
         let mut dns_lookup = FuturesUnordered::new();
         dns_lookup.extend(self.dns_servers.iter_mut().map(|client| {
             let service = &self.service;
+            let duration = self.config.query_timeout;
             async move {
-                let result = timeout(QUERY_TIMEOUT, client.lookup_socket_v6(service)).await;
+                let result = timeout(duration, client.lookup_socket_v6(service)).await;
                 (client, result)
             }
         }));
@@ -163,7 +191,7 @@ impl DnsResolver {
         let first_result = Arc::new(Mutex::new(None));
 
         dns_lookup
-            .for_each_concurrent(Some(self.max_dns_concurrency), |(client, result)| {
+            .for_each_concurrent(Some(self.config.max_dns_concurrency), |(client, result)| {
                 let first_result = first_result.clone();
                 async move {
                     match result {
@@ -185,7 +213,8 @@ impl DnsResolver {
             .await;
 
         // TODO: As a policy choice, we could combine the results of
-        // all DNS servers?
+        // all DNS servers. At the moment, however, we're taking "whoever
+        // returned results the fastest".
         let Some(backends) = first_result.lock().unwrap().take() else {
             return vec![];
         };
@@ -251,7 +280,7 @@ impl DnsResolver {
 #[async_trait]
 impl Resolver for DnsResolver {
     async fn step(&mut self) -> Vec<resolver::Event> {
-        let mut query_interval = tokio::time::interval(QUERY_INTERVAL);
+        let mut query_interval = tokio::time::interval(self.config.query_interval);
         loop {
             let next_tick = query_interval.tick();
             let next_backend_expiration = self.sleep_until_next_backend_expiration();
@@ -269,9 +298,11 @@ impl Resolver for DnsResolver {
                     }
                 },
 
-                // TODO: Monitor TTLs of our own DNS servers.
+                // TODO: There's more work we need to do here, under the realm of
+                // "Dynamic DNS":
                 //
-                // This is "dynamic DNS"
+                // - Query DNS for the set over servers we should be using
+                // - Monitor the TTLs of our own DNS Servers
             }
         }
     }

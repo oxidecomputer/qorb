@@ -7,7 +7,7 @@ pub struct Handle<Conn: Connection> {
     permit: Option<OwnedPermit<BorrowedConnection<Conn>>>,
 }
 
-// TODO: Should this impl deref here?
+// TODO: Should this impl deref?
 //
 // The handle basically wants to be treated like a Connection.
 impl<Conn: Connection> Handle<Conn> {
@@ -28,6 +28,9 @@ impl<Conn: Connection> Handle<Conn> {
 
 impl<Conn: Connection> Drop for Handle<Conn> {
     fn drop(&mut self) {
-        self.permit.take().unwrap().send(self.inner.take().unwrap());
+        let conn = self.inner.take().unwrap();
+        let permit = self.permit.take().unwrap();
+
+        permit.send(conn);
     }
 }
