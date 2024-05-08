@@ -18,7 +18,7 @@ pub mod resolver;
 pub mod service;
 
 // Necessary for implementation
-mod codel;
+// mod codel;
 mod slot;
 
 // Default implementations of generic interfaces

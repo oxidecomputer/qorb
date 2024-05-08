@@ -107,10 +107,7 @@ pub(crate) struct Set<Conn: Connection> {
 }
 
 impl<Conn: Connection> Set<Conn> {
-    pub(crate) fn new(
-        mut params: SetParameters,
-        backend_connector: SharedConnector<Conn>,
-    ) -> Self {
+    pub(crate) fn new(mut params: SetParameters, backend_connector: SharedConnector<Conn>) -> Self {
         let (slot_tx, slot_rx) = mpsc::channel(params.max_count);
 
         // Cap the "goal" slot count to always be within the maximum size
@@ -243,7 +240,7 @@ impl<Conn: Connection> Set<Conn> {
         Ok(handle)
     }
 
-    /// Must be called periodically to handle background tasks for the slot set.
+    /// Handles background tasks for the slot set.
     ///
     /// This includes:
     /// - Recycling previously-claimed connections returned by clients

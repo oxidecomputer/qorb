@@ -18,7 +18,7 @@ pub enum Error {
     Slot(#[from] slot::Error),
 
     #[error("Cannot resolve backend name for service")]
-    Resolve(#[from] resolver::ResolveError),
+    Resolve(#[from] resolver::Error),
 
     #[error("Pool terminated")]
     Terminated,
@@ -31,10 +31,10 @@ enum Request<Conn: Connection> {
 }
 
 struct PoolInner<Conn: Connection> {
-    resolver: resolver::BoxedResolver,
     backend_connector: backend::SharedConnector<Conn>,
 
-    slots: HashMap<backend::Backend, slot::Set<Conn>>,
+    resolver: resolver::BoxedResolver,
+    slots: HashMap<backend::Name, slot::Set<Conn>>,
 
     policy: Policy,
 
@@ -57,47 +57,44 @@ impl<Conn: Connection> PoolInner<Conn> {
         }
     }
 
-    fn handle_resolve_event(
-        &mut self,
-        event: resolver::ResolveEvent,
-    ) {
-        use resolver::ResolveEvent::*;
+    fn handle_resolve_event(&mut self, event: resolver::Event) {
+        use resolver::Event::*;
         match event {
-            BackendAdded { backend } => {
-                let slot_set = slot::Set::new(
-                    slot::SetParameters {
-                        backend: backend.clone(),
-                        desired_count: 16,
-                        max_count: 16,
-                    },
-                    self.backend_connector.clone(),
-                );
-                self.slots.insert(backend, slot_set);
-
-            },
-            BackendRemoved { name } => {
-                todo!();
-            },
-            StateChange { state } => {
-                todo!();
-            },
+            Added(backends) => {
+                // Make sure that we have a slot set for each of the backends.
+                for (name, backend) in backends {
+                    let _slot_set = self.slots.entry(name.clone()).or_insert_with(|| {
+                        // TODO: Respect TTL?
+                        slot::Set::new(
+                            slot::SetParameters {
+                                backend: backend.clone(),
+                                desired_count: 16,
+                                max_count: 16,
+                            },
+                            self.backend_connector.clone(),
+                        )
+                    });
+                }
+            }
+            Removed(backend_names) => {
+                for name in backend_names {
+                    self.slots.remove(&name);
+                }
+            }
         }
     }
 
     async fn run(mut self) {
-        let mut resolver_monitor = self.resolver.monitor();
         loop {
-            // TODO: It would be cool to confirm this isn't too expensive?
+            // TODO: Wrap all the work in "Box::pin"?
             //
-            // It's nice to let the pool be able to directly call "&mut self"
-            // functions on the slot sets -- it does own them -- but it's tricky
-            // to balance that with "being in charge of when we actually await
-            // all their work".
-            let slot_work = futures::future::join_all(
-                self.slots
-                    .values_mut()
-                    .map(|set| set.step())
-            );
+            // This didn't work last time you tried because they each held
+            // "&mut" references to "self", which conflicted with you also
+            // mutating "self" below (e.g., in "claim()",
+            // "handle_resolve_event()").
+
+            let slot_work =
+                futures::future::join_all(self.slots.values_mut().map(|set| set.step()));
 
             tokio::select! {
                 // Handle requests from clients
@@ -111,12 +108,9 @@ impl<Conn: Connection> PoolInner<Conn> {
                     }
                 }
                 // Handle updates from the resolver
-                resolve_event = resolver_monitor.recv() => {
-                    match resolve_event {
-                        Ok(event) => self.handle_resolve_event(event),
-                        Err(_) => {
-                            todo!("Handle this case of resolver funk");
-                        }
+                events = self.resolver.step() => {
+                    for event in events {
+                        self.handle_resolve_event(event);
                     }
                 }
                 // Handle updates from the slot sets
@@ -164,16 +158,16 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
             worker.run().await;
         });
 
-        Self {
-            handle,
-            tx,
-        }
+        Self { handle, tx }
     }
 
     pub async fn claim(&self) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
 
-        self.tx.send(Request::Claim { tx }).await.map_err(|_| Error::Terminated)?;
+        self.tx
+            .send(Request::Claim { tx })
+            .await
+            .map_err(|_| Error::Terminated)?;
         rx.await.map_err(|_| Error::Terminated)?
     }
 }

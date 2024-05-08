@@ -15,8 +15,7 @@ pub struct Name(pub String);
 /// A single instance of a service.
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct Backend {
-    name: Name,
-    address: SocketAddr,
+    pub address: SocketAddr,
 }
 
 /// Describes how a connection to a Backend should be constructed.
