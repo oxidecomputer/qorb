@@ -5,8 +5,11 @@ use crate::connection::Connection;
 use debug_ignore::DebugIgnore;
 use derive_where::derive_where;
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::{AbortHandle, JoinHandle};
+use tokio::time::{interval, Duration};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -19,38 +22,132 @@ pub enum Error {
 
 #[derive_where(Debug)]
 enum State<Conn: Connection> {
-    /// The slot is attempting to connect.
+    // The slot is attempting to connect.
+    //
+    // - (On success) State becomes ConnectedUnclaimed
     Connecting,
 
-    /// The slot has an active connection to a backend, and is ready for use.
+    // The slot has an active connection to a backend, and is ready for use.
+    //
+    // - (On client claim request) State becomes ConnectedClaimed
+    // - (On health monitor task) State becomes ConnectedChecking
     ConnectedUnclaimed(DebugIgnore<Conn>),
 
-    /// The slot has an active connection to a backend, and is claimed.
+    // The slot has an active connection to a backend, and is being validated.
+    //
+    // - (On success) State becomes ConnectedUnclaimed
+    // - (On failure) State becomes Connecting
+    ConnectedChecking,
+
+    // The slot has an active connection to a backend, and is claimed.
+    //
+    // - (When claim dropped) State becomes ConnectedClaimed
     ConnectedClaimed,
 }
 
 impl<Conn: Connection> State<Conn> {
     fn removable(&self) -> bool {
-        use State::*;
         match self {
-            ConnectedClaimed => false,
+            State::ConnectedClaimed => false,
             _ => true,
         }
     }
 }
 
-/// A slot represents a connection to a single backend,
-/// which may or may not actually exist.
-///
-/// Slots scale up and down in quantity at the request of the rebalancer.
-pub struct Slot<Conn: Connection> {
+struct SlotInner<Conn: Connection> {
     state: State<Conn>,
+
+    // A task which may may be monitoring the slot.
+    //
+    // In the "Connecting" state, this task attempts to connect to the backend.
+    // In the "ConnectedUnclaimed", this task monitors the connection's health.
+    handle: Option<AbortHandle>,
+}
+
+impl<Conn: Connection> Drop for SlotInner<Conn> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
+// A slot represents a connection to a single backend,
+// which may or may not actually exist.
+//
+// Slots scale up and down in quantity at the request of the rebalancer.
+struct Slot<Conn: Connection> {
+    inner: Arc<Mutex<SlotInner<Conn>>>,
+}
+
+impl<Conn: Connection> Clone for Slot<Conn> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<Conn: Connection> Slot<Conn> {
-    pub fn new() -> Self {
-        Self {
-            state: State::Connecting,
+    // TODO: There's a lot of policy we can integrate here:
+    // - Should we actually try connecting immediately? Or should we
+    // stagger to avoid a thundering herd?
+    // - How long should we backoff here? Would anything trigger us
+    // to reduce that backoff?
+    // - Would we ever stop trying to connect?
+    //
+    // ... In the meantime, we are:
+    //
+    // - Connecting immediately
+    // - Retrying every one second on failure
+    async fn loop_until_connected(&self, connector: &SharedConnector<Conn>, backend: &Backend) {
+        loop {
+            match connector.connect(&backend).await {
+                Ok(conn) => {
+                    let mut slot = self.inner.lock().unwrap();
+                    slot.state = State::ConnectedUnclaimed(DebugIgnore(conn));
+                }
+                Err(_err) => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    async fn validate_health_if_connected(&self, connector: &SharedConnector<Conn>) {
+        // Grab the connection, if and only if it's idle in
+        // the pool.
+        let mut conn = {
+            let mut slot = self.inner.lock().unwrap();
+            if !matches!(slot.state, State::ConnectedUnclaimed(_)) {
+                return;
+            }
+            let State::ConnectedUnclaimed(DebugIgnore(conn)) =
+                std::mem::replace(&mut slot.state, State::ConnectedChecking)
+            else {
+                return;
+            };
+            conn
+        };
+
+        // It's important that we don't hold the slot lock across an
+        // await point. To avoid this issue, we actually take the
+        // slot out of the connection pool, replacing the state of
+        // "ConnectedUnclaimed" with "ConnectedChecking".
+        //
+        // This actually makes the connection unavailable to clients
+        // while we're performing the health checks. It's important
+        // that we put the state back after the check succeed!
+        let result = connector.is_valid(&mut conn).await;
+
+        let mut slot = self.inner.lock().unwrap();
+        match result {
+            Ok(()) => {
+                slot.state = State::ConnectedUnclaimed(DebugIgnore(conn));
+            }
+            Err(_) => {
+                slot.state = State::Connecting;
+            }
         }
     }
 }
@@ -83,12 +180,22 @@ pub(crate) struct SetConfig {
     pub(crate) max_count: usize,
 }
 
-/// A set of slots for a particular backend.
-pub(crate) struct Set<Conn: Connection> {
+enum SetRequest<Conn: Connection> {
+    Claim {
+        tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>,
+    },
+    SetWantedCount {
+        count: usize,
+    },
+}
+
+struct SetWorker<Conn: Connection> {
     config: SetConfig,
 
     // Interface for actually connecting to backends
     backend_connector: SharedConnector<Conn>,
+
+    rx: mpsc::Receiver<SetRequest<Conn>>,
 
     // Sender and receiver for returning old handles.
     //
@@ -103,25 +210,87 @@ pub(crate) struct Set<Conn: Connection> {
     next_slot_id: SlotId,
 }
 
-impl<Conn: Connection> Set<Conn> {
-    pub(crate) fn new(mut config: SetConfig, backend_connector: SharedConnector<Conn>) -> Self {
+impl<Conn: Connection> SetWorker<Conn> {
+    fn new(
+        rx: mpsc::Receiver<SetRequest<Conn>>,
+        config: SetConfig,
+        backend_connector: SharedConnector<Conn>,
+    ) -> Self {
         let (slot_tx, slot_rx) = mpsc::channel(config.max_count);
-
-        // Cap the "goal" slot count to always be within the maximum size
-        config.desired_count = std::cmp::min(config.desired_count, config.max_count);
-
-        // Set up the initial set of slots
-        let init_count = config.desired_count;
-        let slots = BTreeMap::from_iter((0..init_count).into_iter().map(|id| (id, Slot::new())));
-
-        Self {
+        let mut set = Self {
             config,
             backend_connector,
+            rx,
             slot_tx,
             slot_rx,
-            slots,
-            next_slot_id: init_count,
-        }
+            slots: BTreeMap::new(),
+            next_slot_id: 0,
+        };
+        set.set_wanted_count(set.config.desired_count);
+        set
+    }
+
+    // Creates a new Slot, which always starts as "Connecting", and spawn a task
+    // to actually connect to the backend and monitor slot health.
+    fn create_slot(&mut self, slot_id: SlotId) {
+        let slot = Slot {
+            inner: Arc::new(Mutex::new(SlotInner {
+                state: State::Connecting,
+                handle: None,
+            })),
+        };
+        let slot = self.slots.entry(slot_id).or_insert(slot).clone();
+
+        slot.inner.lock().unwrap().handle = Some(
+            tokio::task::spawn({
+                let slot = slot.clone();
+                let connector = self.backend_connector.clone();
+                let backend = self.config.backend.clone();
+                async move {
+                    let mut monitor_interval = interval(Duration::from_secs(30));
+                    loop {
+                        enum Work {
+                            DoConnect,
+                            DoMonitor,
+                        }
+
+                        // We're deciding what work to do, based on the state,
+                        // within an isolated scope. This is due to:
+                        // https://github.com/rust-lang/rust/issues/69663
+                        //
+                        // Even if we drop the MutexGuard before `.await` points,
+                        // rustc still sees something "non-Send" held across an
+                        // `.await`.
+                        let work = {
+                            let slot_inner = slot.inner.lock().unwrap();
+                            match &slot_inner.state {
+                                State::Connecting => Work::DoConnect,
+                                State::ConnectedUnclaimed(_)
+                                | State::ConnectedChecking
+                                | State::ConnectedClaimed => Work::DoMonitor,
+                            }
+                        };
+
+                        match work {
+                            Work::DoConnect => {
+                                slot.loop_until_connected(&connector, &backend).await;
+                                monitor_interval.reset();
+                            }
+                            Work::DoMonitor => {
+                                // TODO: There is policy that could be integrated here:
+                                // - How often do we check on the connections?
+                                // - Should we customize the connections on acquisition /
+                                // destruction?
+                                monitor_interval.tick().await;
+                                slot.validate_health_if_connected(&connector).await;
+                                monitor_interval.reset();
+                            }
+                        }
+                    }
+                }
+            })
+            .abort_handle(),
+        );
     }
 
     // Borrows a connection out of the first unclaimed slot.
@@ -133,6 +302,7 @@ impl<Conn: Connection> Set<Conn> {
         permit: mpsc::OwnedPermit<BorrowedConnection<Conn>>,
     ) -> Option<claim::Handle<Conn>> {
         for (id, slot) in &mut self.slots {
+            let mut slot = slot.inner.lock().unwrap();
             if matches!(slot.state, State::ConnectedUnclaimed(_)) {
                 // We intentionally "take the connection out" of the slot and
                 // "place it into a claim::Handle" in the same method.
@@ -160,17 +330,26 @@ impl<Conn: Connection> Set<Conn> {
 
     // Takes back borrowed slots from clients who dropped their claim handles.
     fn recycle_connection(&mut self, borrowed_conn: BorrowedConnection<Conn>) {
-        let slot = self.slots.get_mut(&borrowed_conn.id).expect(
-            "A borrowed connection was returned to this\
+        let slot_id = borrowed_conn.id;
+        let slot = self
+            .slots
+            .get_mut(&slot_id)
+            .expect(
+                "A borrowed connection was returned to this\
                 pool, and it should reference a slot that \
                 cannot be removed while borrowed",
-        );
-        assert!(
-            matches!(slot.state, State::ConnectedClaimed),
-            "Unexpected slot state {:?}",
-            slot.state
-        );
-        slot.state = State::ConnectedUnclaimed(DebugIgnore(borrowed_conn.conn));
+            )
+            .inner
+            .clone();
+        {
+            let mut slot = slot.lock().unwrap();
+            assert!(
+                matches!(slot.state, State::ConnectedClaimed),
+                "Unexpected slot state {:?}",
+                slot.state
+            );
+            slot.state = State::ConnectedUnclaimed(DebugIgnore(borrowed_conn.conn));
+        }
 
         // If we tried to shrink the slot count while too many connections were
         // in-use, it's possible there's more work to do. Try to conform the
@@ -178,7 +357,7 @@ impl<Conn: Connection> Set<Conn> {
         self.conform_slot_count();
     }
 
-    pub fn set_wanted_count(&mut self, count: usize) {
+    fn set_wanted_count(&mut self, count: usize) {
         self.config.desired_count = std::cmp::min(count, self.config.max_count);
         self.conform_slot_count();
     }
@@ -200,6 +379,7 @@ impl<Conn: Connection> Set<Conn> {
                 if to_remove.len() >= count_to_remove {
                     break;
                 }
+                let slot = slot.inner.lock().unwrap();
                 if slot.state.removable() {
                     to_remove.push(*key);
                 }
@@ -212,16 +392,14 @@ impl<Conn: Connection> Set<Conn> {
             // More slots wanted. This case is easy, we can always fill
             // in "connecting" slots immediately.
             let new_slots = desired - self.slots.len();
-            self.slots.extend(
-                (self.next_slot_id..self.next_slot_id + new_slots)
-                    .into_iter()
-                    .map(|id| (id, Slot::new())),
-            );
+            for slot_id in self.next_slot_id..self.next_slot_id + new_slots {
+                self.create_slot(slot_id);
+            }
             self.next_slot_id += new_slots;
         }
     }
 
-    pub fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
+    fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         // Before we vend out the slot's connection to a client, make sure that
         // we have space to take it back once they're done with it.
         let Ok(permit) = self.slot_tx.clone().try_reserve_owned() else {
@@ -237,12 +415,7 @@ impl<Conn: Connection> Set<Conn> {
         Ok(handle)
     }
 
-    /// Handles background tasks for the slot set.
-    ///
-    /// This includes:
-    /// - Recycling previously-claimed connections returned by clients
-    /// - TODO
-    pub async fn step(&mut self) {
+    async fn run(&mut self) {
         loop {
             tokio::select! {
                 request = self.slot_rx.recv() => {
@@ -253,8 +426,63 @@ impl<Conn: Connection> Set<Conn> {
                         },
                     }
                 },
-                // TODO: also, monitor our own slots for progress??
+                request = self.rx.recv() => {
+                    match request {
+                        Some(SetRequest::Claim { tx }) => {
+                            let result = self.claim();
+                            let _ = tx.send(result);
+                        },
+                        Some(SetRequest::SetWantedCount { count }) => {
+                            self.set_wanted_count(count);
+                        },
+                        None => return,
+                    }
+                }
             }
         }
+    }
+}
+
+/// A set of slots for a particular backend.
+pub(crate) struct Set<Conn: Connection> {
+    tx: mpsc::Sender<SetRequest<Conn>>,
+
+    handle: JoinHandle<()>,
+}
+
+impl<Conn: Connection> Set<Conn> {
+    pub(crate) fn new(config: SetConfig, backend_connector: SharedConnector<Conn>) -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        let handle = tokio::task::spawn(async move {
+            let mut worker = SetWorker::new(rx, config, backend_connector);
+            worker.run().await;
+        });
+
+        Self { tx, handle }
+    }
+
+    pub(crate) async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
+        let (tx, rx) = oneshot::channel();
+
+        self.tx
+            .send(SetRequest::Claim { tx })
+            .await
+            .map_err(|_| Error::SlotWorkerTerminated)?;
+
+        rx.await.map_err(|_| Error::SlotWorkerTerminated)?
+    }
+
+    pub(crate) async fn set_wanted_count(&mut self, count: usize) -> Result<(), Error> {
+        self.tx
+            .send(SetRequest::SetWantedCount { count })
+            .await
+            .map_err(|_| Error::SlotWorkerTerminated)?;
+        Ok(())
+    }
+}
+
+impl<Conn: Connection> Drop for Set<Conn> {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }

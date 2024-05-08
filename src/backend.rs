@@ -1,3 +1,5 @@
+//! The interface for identifying and connecting to backend services.
+
 use crate::connection;
 
 use async_trait::async_trait;
@@ -23,7 +25,11 @@ pub struct Backend {
 pub trait Connector: Send + Sync {
     type Connection: connection::Connection;
 
+    /// Creates a connection to a backend.
     async fn connect(&self, backend: &Backend) -> Result<Self::Connection, Error>;
+
+    /// Determines if the connection to a backend is still valid.
+    async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Error>;
 }
 
 pub type SharedConnector<Conn> = Arc<dyn Connector<Connection = Conn>>;

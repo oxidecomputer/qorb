@@ -15,7 +15,7 @@ pub enum Event {
     Added(Vec<(backend::Name, Backend)>),
 
     /// One or more backends have been removed
-    Removed(Vec<backend::Name>)
+    Removed(Vec<backend::Name>),
 }
 
 /// Translates a service name into a set of backends.

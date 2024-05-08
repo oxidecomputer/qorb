@@ -1,3 +1,5 @@
+//! Configuration options which can alter the behavior of the pool.
+
 /// Policy which is applicable to a connection pool.
 #[derive(Clone, Debug)]
 pub struct Policy {

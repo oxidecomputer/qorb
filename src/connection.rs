@@ -1,1 +1,3 @@
-pub trait Connection: Send + 'static {}
+//! Interface for raw connections.
+
+pub trait Connection: Send + Sync + 'static {}

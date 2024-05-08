@@ -1,3 +1,5 @@
+//! A pool which uses a [resolver] to find a [backend], and vend out a [claim]
+
 use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -85,40 +87,30 @@ impl<Conn: Connection> PoolInner<Conn> {
 
     async fn run(mut self) {
         loop {
-            // TODO: Wrap all the work in "Box::pin"?
-            //
-            // This didn't work last time you tried because they each held
-            // "&mut" references to "self", which conflicted with you also
-            // mutating "self" below (e.g., in "claim()",
-            // "handle_resolve_event()").
-
-            let slot_work =
-                futures::future::join_all(self.slots.values_mut().map(|set| set.step()));
-
             tokio::select! {
                 // Handle requests from clients
                 request = self.rx.recv() => {
                     match request {
                         Some(Request::Claim { tx }) => {
-                            let result = self.claim();
+                            let result = self.claim().await;
                             let _ = tx.send(result);
                         },
                         None => return,
                     }
                 }
                 // Handle updates from the resolver
+                //
+                // TODO: Do we want this to just happen in a bg task?
                 events = self.resolver.step() => {
                     for event in events {
                         self.handle_resolve_event(event);
                     }
                 }
-                // Handle updates from the slot sets
-                _ = slot_work => {}
             }
         }
     }
 
-    pub fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
+    pub async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         // TODO: We need a smarter policy to pick the backend.
         //
         // This is where the priority list could come into play.
@@ -128,7 +120,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             return Err(Error::NoBackends);
         };
 
-        let claim = set.claim()?;
+        let claim = set.claim().await?;
         Ok(claim)
     }
 }
@@ -160,6 +152,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
         Self { handle, tx }
     }
 
+    /// Acquires a handle to a connection within the connection pool.
     pub async fn claim(&self) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
 

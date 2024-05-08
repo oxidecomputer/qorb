@@ -1,3 +1,5 @@
+//! Implementation of [Resolver] for DNS
+
 use crate::backend;
 use crate::resolver::{self, Resolver};
 use crate::service;
@@ -22,9 +24,9 @@ use tokio::time::timeout;
 #[derive(Clone)]
 struct BackendRecord {
     /// What backend have we found?
-    pub backend: backend::Backend,
+    backend: backend::Backend,
     /// When does this record expire?
-    pub expires_at: Option<Instant>,
+    expires_at: Option<Instant>,
 }
 
 struct Client {
@@ -126,22 +128,31 @@ pub struct DnsResolver {
 
 // How often do we want to query the DNS servers for updates on the set of
 // available backends?
-const DEFAULT_QUERY_INTERVAL: Duration = Duration::from_secs(60);
+pub const DEFAULT_QUERY_INTERVAL: Duration = Duration::from_secs(60);
 
 // How long do we expect a healthy DNS server to take to respond?
-const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Configuration options to tweak resolution behavior.
 pub struct DnsResolverConfig {
     /// How many DNS servers should we query concurrently?
+    ///
+    /// Default: 5
     pub max_dns_concurrency: usize,
 
     /// How long should we wait before re-querying DNS servers?
+    ///
+    /// Default: 60 seconds
     pub query_interval: Duration,
 
     /// After starting to query a DNS server, how long until we timeout?
+    ///
+    /// Default: 10 seconds
     pub query_timeout: Duration,
 
-    /// Provides an option to ignore TTL from DNS
+    /// Provides an option to ignore TTL from DNS and use an override
+    ///
+    /// Default: None, TTL is respected
     pub hardcoded_ttl: Option<Duration>,
 }
 
