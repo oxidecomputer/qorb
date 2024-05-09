@@ -1,15 +1,16 @@
 //! A pool which uses a [resolver] to find a [backend], and vend out a [claim]
 
-use std::collections::HashMap;
-use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
-
 use crate::backend;
 use crate::claim;
 use crate::connection::Connection;
 use crate::policy::Policy;
 use crate::resolver;
 use crate::slot;
+
+use std::collections::HashMap;
+use thiserror::Error;
+use tokio::sync::{mpsc, oneshot};
+use tracing::{instrument, span, Level};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -63,11 +64,11 @@ impl<Conn: Connection> PoolInner<Conn> {
         use resolver::Event::*;
         match event {
             Added(backends) => {
-                // Make sure that we have a slot set for each of the backends.
+                span!(Level::TRACE, "Adding slots for backends");
                 for (name, backend) in backends {
                     let _slot_set = self.slots.entry(name.clone()).or_insert_with(|| {
                         slot::Set::new(
-                            slot::SetConfig::default(),
+                            self.policy.set_config.clone(),
                             backend.clone(),
                             self.backend_connector.clone(),
                         )
@@ -75,6 +76,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                 }
             }
             Removed(backend_names) => {
+                span!(Level::TRACE, "Removing slots for backends");
                 for name in backend_names {
                     self.slots.remove(&name);
                 }
@@ -107,7 +109,8 @@ impl<Conn: Connection> PoolInner<Conn> {
         }
     }
 
-    pub async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
+    #[instrument(skip(self), err, name = "PoolInner::claim")]
+    async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         // TODO: We need a smarter policy to pick the backend.
         //
         // This is where the priority list could come into play.
@@ -134,6 +137,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     /// - resolver: Describes how backends should be found for the service.
     /// - backend_connector: Describes how the connections to a specific
     /// backend should be made.
+    #[instrument(skip(resolver, backend_connector), name = "Pool::new")]
     pub fn new(
         resolver: resolver::BoxedResolver,
         backend_connector: backend::SharedConnector<Conn>,
@@ -150,6 +154,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     }
 
     /// Acquires a handle to a connection within the connection pool.
+    #[instrument(level = "debug", skip(self), err, name = "Pool::claim")]
     pub async fn claim(&self) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
 

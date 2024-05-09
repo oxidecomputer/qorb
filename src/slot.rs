@@ -166,7 +166,7 @@ impl<Conn: Connection> BorrowedConnection<Conn> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SetConfig {
     /// The currently-desired number of slots to use
     pub desired_count: usize,
