@@ -235,12 +235,12 @@ impl DnsResolver {
 
         let our_backends = &mut self.backends;
         for (name, record) in &backends {
-            if !our_backends.contains_key(&name) {
+            if !our_backends.contains_key(name) {
                 added.push((name.clone(), record.backend.clone()));
             }
         }
         for name in our_backends.keys() {
-            if !backends.contains_key(&name) {
+            if !backends.contains_key(name) {
                 removed.push(name.clone());
             }
         }
@@ -253,7 +253,7 @@ impl DnsResolver {
         if !removed.is_empty() {
             events.push(resolver::Event::Removed(removed));
         }
-        return events;
+        events
     }
 
     async fn sleep_until_next_backend_expiration(&self) -> backend::Name {
@@ -272,9 +272,9 @@ impl DnsResolver {
                 return backend;
             };
             if backend_expiration < *soonest_expiration {
-                return backend;
+                backend
             } else {
-                return soonest;
+                soonest
             }
         });
 

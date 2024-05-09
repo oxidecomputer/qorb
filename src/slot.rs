@@ -49,10 +49,7 @@ enum State<Conn: Connection> {
 
 impl<Conn: Connection> State<Conn> {
     fn removable(&self) -> bool {
-        match self {
-            State::ConnectedClaimed => false,
-            _ => true,
-        }
+        !matches!(self, State::ConnectedClaimed)
     }
 }
 
@@ -100,7 +97,7 @@ impl<Conn: Connection> Slot<Conn> {
         let mut retry_duration = config.min_connection_backoff.add_spread(config.spread);
 
         loop {
-            match connector.connect(&backend).await {
+            match connector.connect(backend).await {
                 Ok(conn) => {
                     let mut slot = self.inner.lock().unwrap();
                     slot.state = State::ConnectedUnclaimed(DebugIgnore(conn));
@@ -208,12 +205,24 @@ impl Default for SetConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+struct Stats {
+    connecting_slots: usize,
+    unclaimed_slots: usize,
+    checking_slots: usize,
+    claimed_slots: usize,
+}
+
 enum SetRequest<Conn: Connection> {
     Claim {
         tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>,
     },
     SetWantedCount {
         count: usize,
+    },
+    #[allow(dead_code)]
+    GetStats {
+        tx: oneshot::Sender<Stats>,
     },
 }
 
@@ -402,43 +411,61 @@ impl<Conn: Connection> SetWorker<Conn> {
     }
 
     // Makes the number of slots as close to "desired_count" as we can get.
+    #[instrument(level = "trace", skip(self))]
     fn conform_slot_count(&mut self) {
         let desired = self.config.desired_count;
 
-        if desired < self.slots.len() {
-            // Fewer slots wanted. Remove as many as we can.
-            let count_to_remove = self.slots.len() - desired;
-            let mut to_remove = Vec::with_capacity(count_to_remove);
+        use std::cmp::Ordering::*;
+        match desired.cmp(&self.slots.len()) {
+            Less => {
+                // Fewer slots wanted. Remove as many as we can.
+                event!(
+                    Level::TRACE,
+                    desired = desired,
+                    current = self.slots.len(),
+                    "Reducing slot count"
+                );
+                let count_to_remove = self.slots.len() - desired;
+                let mut to_remove = Vec::with_capacity(count_to_remove);
 
-            // Gather all the keys we are trying to remove.
-            //
-            // If there are many non-removable slots, it's possible
-            // we don't immediately quiesce to this smaller requested count.
-            for (key, slot) in &self.slots {
-                if to_remove.len() >= count_to_remove {
-                    break;
+                // Gather all the keys we are trying to remove.
+                //
+                // If there are many non-removable slots, it's possible
+                // we don't immediately quiesce to this smaller requested count.
+                for (key, slot) in &self.slots {
+                    if to_remove.len() >= count_to_remove {
+                        break;
+                    }
+                    let slot = slot.inner.lock().unwrap();
+                    if slot.state.removable() {
+                        to_remove.push(*key);
+                    }
                 }
-                let slot = slot.inner.lock().unwrap();
-                if slot.state.removable() {
-                    to_remove.push(*key);
-                }
-            }
 
-            for key in to_remove {
-                self.slots.remove(&key);
+                for key in to_remove {
+                    self.slots.remove(&key);
+                }
             }
-        } else if desired > self.slots.len() {
-            // More slots wanted. This case is easy, we can always fill
-            // in "connecting" slots immediately.
-            let new_slots = desired - self.slots.len();
-            for slot_id in self.next_slot_id..self.next_slot_id + new_slots {
-                self.create_slot(slot_id);
+            Greater => {
+                // More slots wanted. This case is easy, we can always fill
+                // in "connecting" slots immediately.
+                event!(
+                    Level::TRACE,
+                    desired = desired,
+                    current = self.slots.len(),
+                    "Increasing slot count"
+                );
+                let new_slots = desired - self.slots.len();
+                for slot_id in self.next_slot_id..self.next_slot_id + new_slots {
+                    self.create_slot(slot_id);
+                }
+                self.next_slot_id += new_slots;
             }
-            self.next_slot_id += new_slots;
+            Equal => {}
         }
     }
 
-    #[instrument(level = "trace", skip(self))]
+    #[instrument(level = "trace", skip(self), err)]
     fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         // Before we vend out the slot's connection to a client, make sure that
         // we have space to take it back once they're done with it.
@@ -453,6 +480,29 @@ impl<Conn: Connection> SetWorker<Conn> {
         };
 
         Ok(handle)
+    }
+
+    #[instrument(level = "trace", skip(self))]
+    #[allow(dead_code)]
+    fn get_stats(&mut self) -> Stats {
+        let mut stats = Stats {
+            connecting_slots: 0,
+            unclaimed_slots: 0,
+            checking_slots: 0,
+            claimed_slots: 0,
+        };
+
+        for slot in self.slots.values() {
+            let slot = slot.inner.lock().unwrap();
+            match slot.state {
+                State::Connecting => stats.connecting_slots += 1,
+                State::ConnectedUnclaimed(_) => stats.unclaimed_slots += 1,
+                State::ConnectedChecking => stats.checking_slots += 1,
+                State::ConnectedClaimed => stats.claimed_slots += 1,
+            }
+        }
+
+        stats
     }
 
     #[instrument(level = "trace", skip(self), name = "SetWorker::run")]
@@ -476,6 +526,9 @@ impl<Conn: Connection> SetWorker<Conn> {
                         Some(SetRequest::SetWantedCount { count }) => {
                             self.set_wanted_count(count);
                         },
+                        Some(SetRequest::GetStats { tx }) => {
+                            let _ = tx.send(self.get_stats());
+                        },
                         None => {
                             return;
                         }
@@ -494,6 +547,12 @@ pub(crate) struct Set<Conn: Connection> {
 }
 
 impl<Conn: Connection> Set<Conn> {
+    /// Creates a new slot set.
+    ///
+    /// Creates several slots which attempt to connect to the backend service
+    /// through background tasks.
+    ///
+    /// These tasks are stopped when [Set] is dropped.
     pub(crate) fn new(
         config: SetConfig,
         backend: Backend,
@@ -508,6 +567,9 @@ impl<Conn: Connection> Set<Conn> {
         Self { tx, handle }
     }
 
+    /// Returns a claim from the slot set, if one is connected.
+    ///
+    /// If no unclaimed slots are connected, an error is returned.
     #[instrument(skip(self), name = "Set::claim")]
     pub(crate) async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
@@ -520,6 +582,11 @@ impl<Conn: Connection> Set<Conn> {
         rx.await.map_err(|_| Error::SlotWorkerTerminated)?
     }
 
+    /// Updates the number of "wanted" slots within the slot set.
+    ///
+    /// This will eventually update the number of slots being used by the slot
+    /// set, though it may take a moment to propagate if many slots are
+    /// currently claimed by clients.
     #[instrument(skip(self), name = "Set::set_wanted_count")]
     pub(crate) async fn set_wanted_count(&mut self, count: usize) -> Result<(), Error> {
         self.tx
@@ -527,6 +594,22 @@ impl<Conn: Connection> Set<Conn> {
             .await
             .map_err(|_| Error::SlotWorkerTerminated)?;
         Ok(())
+    }
+
+    // Collect statistics about the number of slots within each respective
+    // state.
+    //
+    // Calling this function is racy, so its usage is recommended only for
+    // test environments and visibility.
+    #[instrument(skip(self), name = "Set::get_stats")]
+    async fn get_stats(&mut self) -> Result<Stats, Error> {
+        let (tx, rx) = oneshot::channel();
+
+        self.tx
+            .send(SetRequest::GetStats { tx })
+            .await
+            .map_err(|_| Error::SlotWorkerTerminated)?;
+        Ok(rx.await.map_err(|_| Error::SlotWorkerTerminated)?)
     }
 }
 
@@ -565,7 +648,7 @@ mod test {
 
     const BACKEND: SocketAddr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0));
 
-    fn setup_tracing() {
+    fn setup_tracing_subscriber() {
         tracing_subscriber::fmt()
             .with_thread_names(true)
             .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ENTER)
@@ -576,22 +659,33 @@ mod test {
 
     #[tokio::test]
     async fn test_one_claim() {
-        setup_tracing();
+        setup_tracing_subscriber();
         let mut set = Set::new(
-            SetConfig::default(),
+            SetConfig {
+                desired_count: 5,
+                ..Default::default()
+            },
             backend::Backend { address: BACKEND },
             Arc::new(TestConnector {}),
         );
 
-        // TODO: Would be need to have a better way to inspect the slot set
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Let the connections fill up
+        loop {
+            let stats = set.get_stats().await.unwrap();
+            if stats.unclaimed_slots == 0 {
+                event!(Level::WARN, "No unclaimed slots");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                break;
+            }
+        }
 
         let _conn = set.claim().await.unwrap();
     }
 
     #[tokio::test]
     async fn test_all_claims() {
-        setup_tracing();
+        setup_tracing_subscriber();
         let mut set = Set::new(
             SetConfig {
                 desired_count: 3,
@@ -602,8 +696,16 @@ mod test {
             Arc::new(TestConnector {}),
         );
 
-        // TODO: Would be need to have a better way to inspect the slot set
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Let the connections fill up
+        loop {
+            let stats = set.get_stats().await.unwrap();
+            if stats.unclaimed_slots < 3 {
+                event!(Level::WARN, "Not enough unclaimed slots");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                break;
+            }
+        }
 
         let _conn1 = set.claim().await.unwrap();
         let _conn2 = set.claim().await.unwrap();
@@ -613,8 +715,17 @@ mod test {
 
         drop(conn3);
 
-        // TODO: Would be need to have a better way to inspect the slot set
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Let the connection be recycled
+        loop {
+            let stats = set.get_stats().await.unwrap();
+            if stats.unclaimed_slots < 1 {
+                event!(Level::WARN, "Not enough unclaimed slots");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                break;
+            }
+        }
+
         let _conn4 = set.claim().await.unwrap();
     }
 }
