@@ -14,5 +14,10 @@ debug-ignore = "1.0"
 derive-where = "1.2"
 futures = "0.3"
 hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
+rand = "0.8"
 thiserror = "1.0"
 tokio = { version = "1.37.0", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tracing-subscriber = "0.3"

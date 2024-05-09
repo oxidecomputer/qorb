@@ -25,6 +25,7 @@ pub mod resolver;
 pub mod service;
 
 // Necessary for implementation
+mod backoff;
 // mod codel;
 mod slot;
 

@@ -1,4 +1,5 @@
 use crate::backend::{Backend, SharedConnector};
+use crate::backoff::ExponentialBackoff;
 use crate::claim;
 use crate::connection::Connection;
 
@@ -10,6 +11,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{interval, Duration};
+use tracing::{event, instrument, span, Level};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -89,26 +91,24 @@ impl<Conn: Connection> Clone for Slot<Conn> {
 }
 
 impl<Conn: Connection> Slot<Conn> {
-    // TODO: There's a lot of policy we can integrate here:
-    // - Should we actually try connecting immediately? Or should we
-    // stagger to avoid a thundering herd?
-    // - How long should we backoff here? Would anything trigger us
-    // to reduce that backoff?
-    // - Would we ever stop trying to connect?
-    //
-    // ... In the meantime, we are:
-    //
-    // - Connecting immediately
-    // - Retrying every one second on failure
-    async fn loop_until_connected(&self, connector: &SharedConnector<Conn>, backend: &Backend) {
+    async fn loop_until_connected(
+        &self,
+        config: &SetConfig,
+        connector: &SharedConnector<Conn>,
+        backend: &Backend,
+    ) {
+        let mut retry_duration = config.min_connection_backoff.add_spread(config.spread);
+
         loop {
             match connector.connect(&backend).await {
                 Ok(conn) => {
                     let mut slot = self.inner.lock().unwrap();
                     slot.state = State::ConnectedUnclaimed(DebugIgnore(conn));
+                    return;
                 }
                 Err(_err) => {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    retry_duration = retry_duration.exponential_backoff();
+                    tokio::time::sleep(retry_duration).await;
                 }
             }
         }
@@ -169,15 +169,43 @@ impl<Conn: Connection> BorrowedConnection<Conn> {
     }
 }
 
-pub(crate) struct SetConfig {
-    /// The backend to which all the slots are connected, or trying to connect
-    pub(crate) backend: Backend,
+#[derive(Clone)]
+pub struct SetConfig {
+    /// The currently-desired number of slots to use
+    pub desired_count: usize,
 
-    /// The currently-desired number of slots to use.
-    pub(crate) desired_count: usize,
+    /// The max number of slots for the connection set
+    pub max_count: usize,
 
-    /// The max number of slots for the connection set.
-    pub(crate) max_count: usize,
+    /// The minimum time before retrying connection requests
+    pub min_connection_backoff: Duration,
+
+    /// The maximum time to backoff between connection requests
+    pub max_connection_backoff: Duration,
+
+    /// When retrying a connection, add a random amount of delay between [0, spread)
+    pub spread: Duration,
+
+    /// How long to wait before checking on the health of a connection.
+    ///
+    /// This has no backoff - on success, we wait this same period, and
+    /// on failure, we use the "connection_backoff" configs.
+    ///
+    /// If "None", no periodic checks are performed.
+    pub health_interval: Option<Duration>,
+}
+
+impl Default for SetConfig {
+    fn default() -> Self {
+        Self {
+            desired_count: 8,
+            max_count: 16,
+            min_connection_backoff: Duration::from_millis(20),
+            max_connection_backoff: Duration::from_secs(30),
+            spread: Duration::from_millis(20),
+            health_interval: Some(Duration::from_secs(30)),
+        }
+    }
 }
 
 enum SetRequest<Conn: Connection> {
@@ -190,6 +218,7 @@ enum SetRequest<Conn: Connection> {
 }
 
 struct SetWorker<Conn: Connection> {
+    backend: Backend,
     config: SetConfig,
 
     // Interface for actually connecting to backends
@@ -214,10 +243,12 @@ impl<Conn: Connection> SetWorker<Conn> {
     fn new(
         rx: mpsc::Receiver<SetRequest<Conn>>,
         config: SetConfig,
+        backend: Backend,
         backend_connector: SharedConnector<Conn>,
     ) -> Self {
         let (slot_tx, slot_rx) = mpsc::channel(config.max_count);
         let mut set = Self {
+            backend,
             config,
             backend_connector,
             rx,
@@ -244,11 +275,15 @@ impl<Conn: Connection> SetWorker<Conn> {
         slot.inner.lock().unwrap().handle = Some(
             tokio::task::spawn({
                 let slot = slot.clone();
+                let config = self.config.clone();
                 let connector = self.backend_connector.clone();
-                let backend = self.config.backend.clone();
+                let backend = self.backend.clone();
                 async move {
-                    let mut monitor_interval = interval(Duration::from_secs(30));
+                    let mut monitor_interval =
+                        interval(config.health_interval.unwrap_or(Duration::MAX));
+
                     loop {
+                        event!(Level::TRACE, slot_id = slot_id, "Starting Slot work loop");
                         enum Work {
                             DoConnect,
                             DoMonitor,
@@ -273,14 +308,17 @@ impl<Conn: Connection> SetWorker<Conn> {
 
                         match work {
                             Work::DoConnect => {
-                                slot.loop_until_connected(&connector, &backend).await;
+                                span!(Level::TRACE, "Slot worker connecting", slot_id);
+                                slot.loop_until_connected(&config, &connector, &backend)
+                                    .await;
                                 monitor_interval.reset();
                             }
                             Work::DoMonitor => {
-                                // TODO: There is policy that could be integrated here:
-                                // - How often do we check on the connections?
-                                // - Should we customize the connections on acquisition /
-                                // destruction?
+                                // TODO: What if this task is super long?
+                                // TODO: Do we need a way to "kick back to
+                                // connecting" if a client connects, and sees an
+                                // issue on setup/teardown?
+                                span!(Level::TRACE, "Slot worker monitoring", slot_id);
                                 monitor_interval.tick().await;
                                 slot.validate_health_if_connected(&connector).await;
                                 monitor_interval.reset();
@@ -329,6 +367,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     }
 
     // Takes back borrowed slots from clients who dropped their claim handles.
+    #[instrument(level = "trace", skip(self, borrowed_conn))]
     fn recycle_connection(&mut self, borrowed_conn: BorrowedConnection<Conn>) {
         let slot_id = borrowed_conn.id;
         let slot = self
@@ -399,6 +438,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         }
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         // Before we vend out the slot's connection to a client, make sure that
         // we have space to take it back once they're done with it.
@@ -415,6 +455,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         Ok(handle)
     }
 
+    #[instrument(level = "trace", skip(self), name = "SetWorker::run")]
     async fn run(&mut self) {
         loop {
             tokio::select! {
@@ -435,7 +476,9 @@ impl<Conn: Connection> SetWorker<Conn> {
                         Some(SetRequest::SetWantedCount { count }) => {
                             self.set_wanted_count(count);
                         },
-                        None => return,
+                        None => {
+                            return;
+                        }
                     }
                 }
             }
@@ -451,16 +494,21 @@ pub(crate) struct Set<Conn: Connection> {
 }
 
 impl<Conn: Connection> Set<Conn> {
-    pub(crate) fn new(config: SetConfig, backend_connector: SharedConnector<Conn>) -> Self {
+    pub(crate) fn new(
+        config: SetConfig,
+        backend: Backend,
+        backend_connector: SharedConnector<Conn>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(1);
         let handle = tokio::task::spawn(async move {
-            let mut worker = SetWorker::new(rx, config, backend_connector);
+            let mut worker = SetWorker::new(rx, config, backend, backend_connector);
             worker.run().await;
         });
 
         Self { tx, handle }
     }
 
+    #[instrument(skip(self), name = "Set::claim")]
     pub(crate) async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
 
@@ -472,6 +520,7 @@ impl<Conn: Connection> Set<Conn> {
         rx.await.map_err(|_| Error::SlotWorkerTerminated)?
     }
 
+    #[instrument(skip(self), name = "Set::set_wanted_count")]
     pub(crate) async fn set_wanted_count(&mut self, count: usize) -> Result<(), Error> {
         self.tx
             .send(SetRequest::SetWantedCount { count })
@@ -484,5 +533,88 @@ impl<Conn: Connection> Set<Conn> {
 impl<Conn: Connection> Drop for Set<Conn> {
     fn drop(&mut self) {
         self.handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::backend;
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    struct TestConnection {}
+
+    impl crate::connection::Connection for TestConnection {}
+
+    struct TestConnector {}
+
+    #[async_trait::async_trait]
+    impl backend::Connector for TestConnector {
+        type Connection = TestConnection;
+
+        /// Creates a connection to a backend.
+        async fn connect(&self, _backend: &Backend) -> Result<Self::Connection, backend::Error> {
+            Ok(TestConnection {})
+        }
+
+        /// Determines if the connection to a backend is still valid.
+        async fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), backend::Error> {
+            Ok(())
+        }
+    }
+
+    const BACKEND: SocketAddr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0));
+
+    fn setup_tracing() {
+        tracing_subscriber::fmt()
+            .with_thread_names(true)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ENTER)
+            .with_max_level(tracing::Level::TRACE)
+            .with_test_writer()
+            .init();
+    }
+
+    #[tokio::test]
+    async fn test_one_claim() {
+        setup_tracing();
+        let mut set = Set::new(
+            SetConfig::default(),
+            backend::Backend { address: BACKEND },
+            Arc::new(TestConnector {}),
+        );
+
+        // TODO: Would be need to have a better way to inspect the slot set
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let _conn = set.claim().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_all_claims() {
+        setup_tracing();
+        let mut set = Set::new(
+            SetConfig {
+                desired_count: 3,
+                max_count: 10,
+                ..Default::default()
+            },
+            backend::Backend { address: BACKEND },
+            Arc::new(TestConnector {}),
+        );
+
+        // TODO: Would be need to have a better way to inspect the slot set
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let _conn1 = set.claim().await.unwrap();
+        let _conn2 = set.claim().await.unwrap();
+        let conn3 = set.claim().await.unwrap();
+
+        set.claim().await.map(|_| ()).unwrap_err();
+
+        drop(conn3);
+
+        // TODO: Would be need to have a better way to inspect the slot set
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _conn4 = set.claim().await.unwrap();
     }
 }

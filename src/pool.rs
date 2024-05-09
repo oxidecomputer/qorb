@@ -67,11 +67,8 @@ impl<Conn: Connection> PoolInner<Conn> {
                 for (name, backend) in backends {
                     let _slot_set = self.slots.entry(name.clone()).or_insert_with(|| {
                         slot::Set::new(
-                            slot::SetConfig {
-                                backend: backend.clone(),
-                                desired_count: 16,
-                                max_count: 16,
-                            },
+                            slot::SetConfig::default(),
+                            backend.clone(),
                             self.backend_connector.clone(),
                         )
                     });
