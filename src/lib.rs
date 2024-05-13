@@ -27,7 +27,10 @@ pub mod service;
 // Necessary for implementation
 mod backoff;
 // mod codel;
+mod priority_list;
+mod rebalancer;
 mod slot;
+mod window_counter;
 
 // Default implementations of generic interfaces
 pub mod resolvers;

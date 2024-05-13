@@ -1,15 +1,13 @@
 //! Configuration options which can alter the behavior of the pool.
 
 use crate::slot::SetConfig;
+use tokio::time::Duration;
 
 /// Policy which is applicable to a connection pool.
 #[derive(Clone, Debug)]
 pub struct Policy {
-    /// The desired number of connections that are open and ready for usage.
-    pub spare_connections_wanted: usize,
-
-    /// The maximum number of connections which can be opened by this pool.
-    pub maximum_connections: usize,
+    /// The interval at which rebalancing backends should occur.
+    pub rebalance_interval: Duration,
 
     /// Configuration for a slot set attempting to connect to a backend
     pub set_config: SetConfig,
@@ -18,8 +16,7 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            spare_connections_wanted: 8,
-            maximum_connections: 16,
+            rebalance_interval: Duration::from_secs(60),
             set_config: SetConfig::default(),
         }
     }

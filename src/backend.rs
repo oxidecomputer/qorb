@@ -11,7 +11,7 @@ use thiserror::Error;
 pub enum Error {}
 
 /// Describes the name of a backend.
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Debug, Hash)]
 pub struct Name(pub String);
 
 /// A single instance of a service.

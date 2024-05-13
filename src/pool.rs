@@ -4,12 +4,15 @@ use crate::backend;
 use crate::claim;
 use crate::connection::Connection;
 use crate::policy::Policy;
+use crate::priority_list::PriorityList;
+use crate::rebalancer;
 use crate::resolver;
 use crate::slot;
 
 use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::interval;
 use tracing::{instrument, span, Level};
 
 #[derive(Error, Debug)]
@@ -38,6 +41,7 @@ struct PoolInner<Conn: Connection> {
 
     resolver: resolver::BoxedResolver,
     slots: HashMap<backend::Name, slot::Set<Conn>>,
+    priority_list: PriorityList<backend::Name>,
 
     policy: Policy,
 
@@ -55,6 +59,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             resolver,
             backend_connector,
             slots: HashMap::new(),
+            priority_list: PriorityList::new(),
             policy,
             rx,
         }
@@ -67,6 +72,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                 span!(Level::TRACE, "Adding slots for backends");
                 for (name, backend) in backends {
                     let _slot_set = self.slots.entry(name.clone()).or_insert_with(|| {
+                        self.priority_list.push(rebalancer::new_backend(name));
                         slot::Set::new(
                             self.policy.set_config.clone(),
                             backend.clone(),
@@ -85,6 +91,8 @@ impl<Conn: Connection> PoolInner<Conn> {
     }
 
     async fn run(mut self) {
+        let mut rebalance_interval = interval(self.policy.rebalance_interval);
+        rebalance_interval.reset();
         loop {
             tokio::select! {
                 // Handle requests from clients
@@ -105,23 +113,73 @@ impl<Conn: Connection> PoolInner<Conn> {
                         self.handle_resolve_event(event);
                     }
                 }
+                _ = rebalance_interval.tick() => {
+                    self.rebalance();
+                },
             }
         }
     }
 
+    fn rebalance(&mut self) {
+        let mut iter = std::mem::take(&mut self.priority_list).into_iter();
+        let mut new_priority_list = PriorityList::new();
+        while let Some(std::cmp::Reverse(mut weighted_backend)) = iter.next() {
+            // If the backend no longer exists, drop it from the priority list.
+            let Some(slot) = self.slots.get(&weighted_backend.value) else {
+                continue;
+            };
+
+            // Otherwise, the backend priority is set to the number of failures
+            // seen. More failures => less preferable backend.
+            weighted_backend.score = slot.failure_count();
+            rebalancer::add_random_jitter(&mut weighted_backend);
+            new_priority_list.push(weighted_backend);
+        }
+        self.priority_list = new_priority_list;
+    }
+
     #[instrument(skip(self), err, name = "PoolInner::claim")]
     async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
-        // TODO: We need a smarter policy to pick the backend.
-        //
-        // This is where the priority list could come into play.
-        //
-        // NOTE: For now, we're trying the first one?
-        let Some(set) = self.slots.values_mut().next() else {
-            return Err(Error::NoBackends);
-        };
+        let mut attempted_backend = vec![];
+        let mut result = Err(Error::NoBackends);
 
-        let claim = set.claim().await?;
-        Ok(claim)
+        loop {
+            // Whenever we consider a new backend, add it to the
+            // "attempted_backend" list. We want to put it back in the
+            // priority list before returning, but we don't want to
+            // re-consider the same backend twice for this request.
+            let Some(mut weighted_backend) = self.priority_list.pop() else {
+                break;
+            };
+
+            // The priority list lags behind the known set of backends, so it's
+            // possible we have stale entries referencing backends that have
+            // been removed. If that's the case, remove them here.
+            //
+            // This will also happen when we periodically rebalance
+            // the priority list.
+            let Some(set) = self.slots.get_mut(&weighted_backend.value) else {
+                continue;
+            };
+
+            // Use this claim if we can, or continue looking if we can't use it.
+            //
+            // Either way, put this backend back in the priority list after
+            // we're done with it.
+            let Ok(claim) = set.claim().await else {
+                rebalancer::claimed_err(&mut weighted_backend);
+                attempted_backend.push(weighted_backend);
+                continue;
+            };
+            rebalancer::claimed_ok(&mut weighted_backend);
+            attempted_backend.push(weighted_backend);
+
+            result = Ok(claim);
+            break;
+        }
+
+        self.priority_list.extend(attempted_backend.into_iter());
+        result
     }
 }
 

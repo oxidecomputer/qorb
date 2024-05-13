@@ -2,6 +2,7 @@ use crate::backend::{Backend, SharedConnector};
 use crate::backoff::ExponentialBackoff;
 use crate::claim;
 use crate::connection::Connection;
+use crate::window_counter::WindowedCounter;
 
 use debug_ignore::DebugIgnore;
 use derive_where::derive_where;
@@ -76,12 +77,14 @@ impl<Conn: Connection> Drop for SlotInner<Conn> {
 //
 // Slots scale up and down in quantity at the request of the rebalancer.
 struct Slot<Conn: Connection> {
+    failure_window: Arc<WindowedCounter>,
     inner: Arc<Mutex<SlotInner<Conn>>>,
 }
 
 impl<Conn: Connection> Clone for Slot<Conn> {
     fn clone(&self) -> Self {
         Self {
+            failure_window: self.failure_window.clone(),
             inner: self.inner.clone(),
         }
     }
@@ -104,6 +107,7 @@ impl<Conn: Connection> Slot<Conn> {
                     return;
                 }
                 Err(_err) => {
+                    self.failure_window.add(1);
                     retry_duration = retry_duration.exponential_backoff();
                     tokio::time::sleep(retry_duration).await;
                 }
@@ -143,6 +147,7 @@ impl<Conn: Connection> Slot<Conn> {
                 slot.state = State::ConnectedUnclaimed(DebugIgnore(conn));
             }
             Err(_) => {
+                self.failure_window.add(1);
                 slot.state = State::Connecting;
             }
         }
@@ -233,6 +238,7 @@ struct SetWorker<Conn: Connection> {
     // Interface for actually connecting to backends
     backend_connector: SharedConnector<Conn>,
 
+    // Interface for receiving client requests
     rx: mpsc::Receiver<SetRequest<Conn>>,
 
     // Sender and receiver for returning old handles.
@@ -245,6 +251,8 @@ struct SetWorker<Conn: Connection> {
     // The actual slots themselves.
     slots: BTreeMap<SlotId, Slot<Conn>>,
 
+    failure_window: Arc<WindowedCounter>,
+
     next_slot_id: SlotId,
 }
 
@@ -254,12 +262,14 @@ impl<Conn: Connection> SetWorker<Conn> {
         config: SetConfig,
         backend: Backend,
         backend_connector: SharedConnector<Conn>,
+        failure_window: Arc<WindowedCounter>,
     ) -> Self {
         let (slot_tx, slot_rx) = mpsc::channel(config.max_count);
         let mut set = Self {
             backend,
             config,
             backend_connector,
+            failure_window,
             rx,
             slot_tx,
             slot_rx,
@@ -274,6 +284,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     // to actually connect to the backend and monitor slot health.
     fn create_slot(&mut self, slot_id: SlotId) {
         let slot = Slot {
+            failure_window: self.failure_window.clone(),
             inner: Arc::new(Mutex::new(SlotInner {
                 state: State::Connecting,
                 handle: None,
@@ -543,6 +554,8 @@ impl<Conn: Connection> SetWorker<Conn> {
 pub(crate) struct Set<Conn: Connection> {
     tx: mpsc::Sender<SetRequest<Conn>>,
 
+    failure_window: Arc<WindowedCounter>,
+
     handle: JoinHandle<()>,
 }
 
@@ -559,12 +572,22 @@ impl<Conn: Connection> Set<Conn> {
         backend_connector: SharedConnector<Conn>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1);
-        let handle = tokio::task::spawn(async move {
-            let mut worker = SetWorker::new(rx, config, backend, backend_connector);
-            worker.run().await;
+        let failure_duration = config.max_connection_backoff * 2;
+        let failure_window = Arc::new(WindowedCounter::new(failure_duration));
+        let handle = tokio::task::spawn({
+            let failure_window = failure_window.clone();
+            async move {
+                let mut worker =
+                    SetWorker::new(rx, config, backend, backend_connector, failure_window);
+                worker.run().await;
+            }
         });
 
-        Self { tx, handle }
+        Self {
+            tx,
+            failure_window,
+            handle,
+        }
     }
 
     /// Returns a claim from the slot set, if one is connected.
@@ -594,6 +617,14 @@ impl<Conn: Connection> Set<Conn> {
             .await
             .map_err(|_| Error::SlotWorkerTerminated)?;
         Ok(())
+    }
+
+    /// Returns the number of failures encountered over a window of time.
+    ///
+    /// This acts as a proxy for backend health.
+    #[instrument(skip(self), ret, name = "Set::failure_count")]
+    pub(crate) fn failure_count(&self) -> usize {
+        self.failure_window.sum()
     }
 
     // Collect statistics about the number of slots within each respective
