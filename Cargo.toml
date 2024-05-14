@@ -17,6 +17,7 @@ hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
 rand = "0.8"
 thiserror = "1.0"
 tokio = { version = "1.37.0", features = ["macros", "rt", "sync", "time"] }
+tokio-stream = { version = "0.1", features = [ "sync" ] }
 tracing = "0.1"
 
 [dev-dependencies]

@@ -9,10 +9,13 @@ use crate::rebalancer;
 use crate::resolver;
 use crate::slot;
 
+use futures::StreamExt;
 use std::collections::HashMap;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::interval;
+use tokio_stream::wrappers::WatchStream;
+use tokio_stream::StreamMap;
 use tracing::{instrument, span, Level};
 
 #[derive(Error, Debug)]
@@ -66,53 +69,62 @@ impl<Conn: Connection> PoolInner<Conn> {
     }
 
     // Sum up the total number of spares across all slot sets.
-    fn stats_summary(&self) -> crate::slot::Stats {
-        let mut stats = crate::slot::Stats::default();
+    fn stats_summary(&self) -> slot::Stats {
+        let mut stats = slot::Stats::default();
         for slot_set in self.slots.values() {
             stats = stats + slot_set.get_stats();
         }
         stats
     }
 
-    fn handle_resolve_event(&mut self, event: resolver::Event) {
+    // Creates or destroys slots sets, depending on the event from
+    // the resolver.
+    //
+    // Returns the newly added backends, if any.
+    fn handle_resolve_event(
+        &mut self,
+        event: resolver::Event,
+    ) -> Vec<(backend::Name, watch::Receiver<slot::SetState>)> {
         use resolver::Event::*;
+
+        let mut new_backends = vec![];
         match event {
             Added(backends) => {
                 let _span = span!(Level::TRACE, "Adding slots for backends").entered();
                 if backends.is_empty() {
-                    return;
+                    return vec![];
                 }
 
-                // Gather information from all backends
+                // Gather information from all backends to make sure we don't provision
+                // more slots than the maximum indicated by our policy.
                 let stats = self.stats_summary();
-                let total_spares = stats.spares();
-                let total_slots = stats.all_slots();
+                let mut slots_left = self.policy.max_slots.saturating_sub(stats.all_slots());
 
-                let mut new_spares = if self.policy.spares_wanted > total_spares {
-                    self.policy.spares_wanted - total_spares
-                } else {
-                    0
-                };
-
-                // Enforce slot maximums
-                if total_slots + new_spares > self.policy.max_slots {
-                    new_spares = self.policy.max_slots - total_slots;
-                }
-
-                let new_spares_per_backend = new_spares.div_ceil(backends.len());
                 for (name, backend) in backends {
                     let _slot_set = self.slots.entry(name.clone()).or_insert_with(|| {
-                        self.priority_list.push(rebalancer::new_backend(name));
+                        self.priority_list
+                            .push(rebalancer::new_backend(name.clone()));
 
-                        let spare_count = std::cmp::min(new_spares_per_backend, new_spares);
-                        new_spares -= spare_count;
+                        // If we provision zero slots: We'll provision one later during
+                        // rebalancing, if we can.
+                        //
+                        // If we provision one slot: Once it connects, and the backend looks
+                        // viable, we'll provision more slots, if we can.
+                        let initial_slot_count = if slots_left > 0 {
+                            slots_left -= 1;
+                            1
+                        } else {
+                            0
+                        };
 
-                        slot::Set::new(
+                        let set = slot::Set::new(
                             self.policy.set_config.clone(),
-                            spare_count,
+                            initial_slot_count,
                             backend.clone(),
                             self.backend_connector.clone(),
-                        )
+                        );
+                        new_backends.push((name, set.monitor()));
+                        set
                     });
                 }
             }
@@ -122,12 +134,17 @@ impl<Conn: Connection> PoolInner<Conn> {
                     self.slots.remove(&name);
                 }
             }
-        }
+        };
+
+        new_backends
     }
 
     async fn run(mut self) {
         let mut rebalance_interval = interval(self.policy.rebalance_interval);
         rebalance_interval.reset();
+
+        let mut new_backends = vec![];
+        let mut backend_status_stream = StreamMap::new();
         loop {
             tokio::select! {
                 // Handle requests from clients
@@ -141,14 +158,29 @@ impl<Conn: Connection> PoolInner<Conn> {
                     }
                 }
                 // Handle updates from the resolver
-                //
                 // TODO: Do we want this to just happen in a bg task?
                 events = self.resolver.step() => {
+                    // Update the set of backends we know about,
+                    // and gather the list of all "new" backends.
                     for event in events {
-                        self.handle_resolve_event(event);
+                        new_backends.extend(self.handle_resolve_event(event));
+                    }
+
+                    // Monitor all the new backends for changes
+                    for (name, receiver) in new_backends.drain(..) {
+                        backend_status_stream.insert(
+                            name,
+                            WatchStream::new(receiver),
+                        );
                     }
                 }
+                // Periodically rebalance the allocation of slots to backends
                 _ = rebalance_interval.tick() => {
+                    self.rebalance().await;
+                }
+                // If any of the slots change state, update their allocations.
+                Some((_name, _status)) = &mut backend_status_stream.next() => {
+                    rebalance_interval.reset();
                     self.rebalance().await;
                 },
             }
@@ -161,14 +193,14 @@ impl<Conn: Connection> PoolInner<Conn> {
 
         // Pass 1: Limit spares from backends that might not be functioning
         while let Some((name, slot_set)) = self.slots.iter_mut().next() {
-            let stats = slot_set.get_stats();
-            if stats.has_only_connecting_slots() {
-                // TODO: Do we care about synchronization here, for stats
-                // purposes?
-                let _ = slot_set.set_wanted_count(1).await;
-                questionable_backend_count += 1;
-            } else {
-                usable_backends.push(name.clone());
+            match slot_set.get_state() {
+                slot::SetState::Offline => {
+                    let _ = slot_set.set_wanted_count(1).await;
+                    questionable_backend_count += 1;
+                }
+                slot::SetState::Online => {
+                    usable_backends.push(name.clone());
+                }
             }
         }
 

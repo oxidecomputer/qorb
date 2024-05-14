@@ -9,7 +9,7 @@ use derive_where::derive_where;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{interval, Duration};
 use tracing::{event, instrument, span, Instrument, Level};
@@ -57,6 +57,7 @@ impl<Conn: Connection> State<Conn> {
 struct SlotInner<Conn: Connection> {
     state: State<Conn>,
     stats: Arc<Mutex<Stats>>,
+    status_tx: watch::Sender<SetState>,
 
     // A task which may may be monitoring the slot.
     //
@@ -66,12 +67,36 @@ struct SlotInner<Conn: Connection> {
 }
 
 impl<Conn: Connection> SlotInner<Conn> {
+    // Transitions to a new state, returning the old state.
+    //
+    // Additionally, if this updates the state of the whole backend,
+    // emits a SetState.
     fn state_transition(&mut self, new: State<Conn>) -> State<Conn> {
         let old = std::mem::replace(&mut self.state, new);
 
         let mut stats = self.stats.lock().unwrap();
+        let before_no_connected = stats.has_no_connected_slots();
         stats.exit_state(&old);
         stats.enter_state(&self.state);
+        let after_no_connected = stats.has_no_connected_slots();
+
+        // "Only connecting" may mean:
+        // - We're initializing the backend, or
+        // - All connections to this backend have failed
+        //
+        // Either way, transitioning into or out of this state is
+        // an important signal to the pool, which may want to tune
+        // the number of slots provisioned to this set.
+        match (before_no_connected, after_no_connected) {
+            (true, false) => {
+                self.status_tx.send_replace(SetState::Online);
+            }
+            (false, true) => {
+                self.status_tx.send_replace(SetState::Offline);
+            }
+            _ => (),
+        };
+
         old
     }
 }
@@ -242,34 +267,14 @@ impl std::ops::Add for Stats {
 }
 
 impl Stats {
-    /// Returns true if the number of connecting slots is non-zero,
-    /// but no other types of slots.
-    pub(crate) fn has_only_connecting_slots(&self) -> bool {
-        self.connecting_slots != 0
-            && self.unclaimed_slots == 0
-            && self.checking_slots == 0
-            && self.claimed_slots == 0
-    }
-
+    /// Returns the total number of slots in use, regardless of their state.
     pub(crate) fn all_slots(&self) -> usize {
         self.connecting_slots + self.unclaimed_slots + self.checking_slots + self.claimed_slots
     }
 
-    pub(crate) fn spares(&self) -> usize {
-        self.unclaimed_slots + self.checking_slots
-    }
-
-    fn slot_created(&mut self) {
-        self.connecting_slots += 1;
-    }
-
-    fn exit_state<Conn: Connection>(&mut self, state: &State<Conn>) {
-        match state {
-            State::Connecting => self.connecting_slots -= 1,
-            State::ConnectedUnclaimed(_) => self.unclaimed_slots -= 1,
-            State::ConnectedChecking => self.checking_slots -= 1,
-            State::ConnectedClaimed => self.claimed_slots -= 1,
-        };
+    // Returns true if there are no known connected slots.
+    fn has_no_connected_slots(&self) -> bool {
+        self.unclaimed_slots == 0 && self.checking_slots == 0 && self.claimed_slots == 0
     }
 
     fn enter_state<Conn: Connection>(&mut self, state: &State<Conn>) {
@@ -278,6 +283,15 @@ impl Stats {
             State::ConnectedUnclaimed(_) => self.unclaimed_slots += 1,
             State::ConnectedChecking => self.checking_slots += 1,
             State::ConnectedClaimed => self.claimed_slots += 1,
+        };
+    }
+
+    fn exit_state<Conn: Connection>(&mut self, state: &State<Conn>) {
+        match state {
+            State::Connecting => self.connecting_slots -= 1,
+            State::ConnectedUnclaimed(_) => self.unclaimed_slots -= 1,
+            State::ConnectedChecking => self.checking_slots -= 1,
+            State::ConnectedClaimed => self.claimed_slots -= 1,
         };
     }
 }
@@ -314,6 +328,9 @@ struct SetWorker<Conn: Connection> {
     // Interface for receiving client requests
     rx: mpsc::Receiver<SetRequest<Conn>>,
 
+    // Interface for communicating backend status
+    status_tx: watch::Sender<SetState>,
+
     // Sender and receiver for returning old handles.
     //
     // This is to guarantee a size, and to vend out permits to claim::Handles so they can be sure
@@ -337,6 +354,7 @@ struct SetWorker<Conn: Connection> {
 impl<Conn: Connection> SetWorker<Conn> {
     fn new(
         rx: mpsc::Receiver<SetRequest<Conn>>,
+        status_tx: watch::Sender<SetState>,
         config: SetConfig,
         wanted_count: usize,
         backend: Backend,
@@ -353,6 +371,7 @@ impl<Conn: Connection> SetWorker<Conn> {
             stats,
             failure_window,
             rx,
+            status_tx,
             slot_tx,
             slot_rx,
             slots: BTreeMap::new(),
@@ -370,11 +389,15 @@ impl<Conn: Connection> SetWorker<Conn> {
             inner: Arc::new(Mutex::new(SlotInner {
                 state: State::Connecting,
                 stats: self.stats.clone(),
+                status_tx: self.status_tx.clone(),
                 handle: None,
             })),
         };
         let slot = self.slots.entry(slot_id).or_insert(slot).clone();
-        self.stats.lock().unwrap().slot_created();
+        self.stats
+            .lock()
+            .unwrap()
+            .enter_state(&State::<Conn>::Connecting);
 
         slot.inner.lock().unwrap().handle = Some(
             tokio::task::spawn({
@@ -623,9 +646,20 @@ impl<Conn: Connection> SetWorker<Conn> {
     }
 }
 
+/// Describes the overall status of the backend.
+#[derive(Debug, Copy, Clone)]
+pub(crate) enum SetState {
+    /// At least one slot is connected to the backend.
+    Online,
+
+    /// No slots are known to be connected to the backend.
+    Offline,
+}
+
 /// A set of slots for a particular backend.
 pub(crate) struct Set<Conn: Connection> {
     tx: mpsc::Sender<SetRequest<Conn>>,
+    status_rx: watch::Receiver<SetState>,
 
     stats: Arc<Mutex<Stats>>,
     failure_window: Arc<WindowedCounter>,
@@ -647,6 +681,7 @@ impl<Conn: Connection> Set<Conn> {
         backend_connector: SharedConnector<Conn>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1);
+        let (status_tx, status_rx) = watch::channel(SetState::Offline);
         let failure_duration = config.max_connection_backoff * 2;
         let stats = Arc::new(Mutex::new(Stats::default()));
         let failure_window = Arc::new(WindowedCounter::new(failure_duration));
@@ -656,6 +691,7 @@ impl<Conn: Connection> Set<Conn> {
             async move {
                 let mut worker = SetWorker::new(
                     rx,
+                    status_tx,
                     config,
                     wanted_count,
                     backend,
@@ -669,10 +705,25 @@ impl<Conn: Connection> Set<Conn> {
 
         Self {
             tx,
+            status_rx,
             stats,
             failure_window,
             handle,
         }
+    }
+
+    /// Returns a [tokio::mpsc::watch::Receiver] emitting the last-known [SetState].
+    ///
+    /// This provides an interface for the pool to use to monitor slot health.
+    #[instrument(skip(self), name = "Set::monitor")]
+    pub(crate) fn monitor(&self) -> watch::Receiver<SetState> {
+        self.status_rx.clone()
+    }
+
+    /// Returns the last-known [SetState].
+    #[instrument(skip(self), ret, name = "Set::get_state")]
+    pub(crate) fn get_state(&self) -> SetState {
+        *self.status_rx.borrow()
     }
 
     /// Returns a claim from the slot set, if one is connected.
