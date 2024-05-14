@@ -59,8 +59,7 @@ impl<T: Ord> Extend<WeightedValue<T>> for PriorityList<T> {
     where
         I: IntoIterator<Item = WeightedValue<T>>,
     {
-        self.priority_list
-            .extend(iter.into_iter().map(|v| Reverse(v)))
+        self.priority_list.extend(iter.into_iter().map(Reverse))
     }
 }
 

@@ -221,9 +221,9 @@ impl<Conn: Connection> PoolInner<Conn> {
             let _ = slot_set.set_wanted_count(slots_wanted_per_backend).await;
         }
 
-        let mut iter = std::mem::take(&mut self.priority_list).into_iter();
+        let iter = std::mem::take(&mut self.priority_list).into_iter();
         let mut new_priority_list = PriorityList::new();
-        while let Some(std::cmp::Reverse(mut weighted_backend)) = iter.next() {
+        for std::cmp::Reverse(mut weighted_backend) in iter {
             // If the backend no longer exists, drop it from the priority list.
             let Some(slot) = self.slots.get(&weighted_backend.value) else {
                 continue;

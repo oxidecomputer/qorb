@@ -23,6 +23,7 @@ pub enum Error {
     SlotWorkerTerminated,
 }
 
+// The state of an individual slot within a slot set.
 #[derive_where(Debug)]
 enum State<Conn: Connection> {
     // The slot is attempting to connect.
@@ -70,7 +71,7 @@ impl<Conn: Connection> SlotInner<Conn> {
     // Transitions to a new state, returning the old state.
     //
     // Additionally, if this updates the state of the whole backend,
-    // emits a SetState.
+    // emits a SetState on [Self::status_tx].
     fn state_transition(&mut self, new: State<Conn>) -> State<Conn> {
         let old = std::mem::replace(&mut self.state, new);
 
@@ -80,8 +81,8 @@ impl<Conn: Connection> SlotInner<Conn> {
         stats.enter_state(&self.state);
         let after_no_connected = stats.has_no_connected_slots();
 
-        // "Only connecting" may mean:
-        // - We're initializing the backend, or
+        // "Not connected" may mean:
+        // - We're still initializing the backend, or
         // - All connections to this backend have failed
         //
         // Either way, transitioning into or out of this state is
@@ -143,7 +144,8 @@ impl<Conn: Connection> Slot<Conn> {
                     slot.state_transition(State::ConnectedUnclaimed(DebugIgnore(conn)));
                     return;
                 }
-                Err(_err) => {
+                Err(err) => {
+                    event!(Level::WARN, err = ?err, backend = ?backend, "Failed to connect");
                     self.failure_window.add(1);
                     retry_duration =
                         retry_duration.exponential_backoff(config.max_connection_backoff);
@@ -246,7 +248,7 @@ impl Default for SetConfig {
 }
 
 /// Describes the state of connections to this backend.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Stats {
     pub(crate) connecting_slots: usize,
     pub(crate) unclaimed_slots: usize,
@@ -293,17 +295,6 @@ impl Stats {
             State::ConnectedChecking => self.checking_slots -= 1,
             State::ConnectedClaimed => self.claimed_slots -= 1,
         };
-    }
-}
-
-impl Default for Stats {
-    fn default() -> Self {
-        Self {
-            connecting_slots: 0,
-            unclaimed_slots: 0,
-            checking_slots: 0,
-            claimed_slots: 0,
-        }
     }
 }
 
