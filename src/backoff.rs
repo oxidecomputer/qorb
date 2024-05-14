@@ -3,7 +3,7 @@ use tokio::time::Duration;
 
 pub trait ExponentialBackoff: Sized {
     fn add_spread(&self, spread: Duration) -> Self;
-    fn exponential_backoff(&self) -> Self;
+    fn exponential_backoff(&self, max: Duration) -> Self;
 }
 
 impl ExponentialBackoff for Duration {
@@ -13,7 +13,7 @@ impl ExponentialBackoff for Duration {
         self.saturating_add(Duration::from_nanos(spread.try_into().unwrap()))
     }
 
-    fn exponential_backoff(&self) -> Self {
-        self.saturating_mul(2)
+    fn exponential_backoff(&self, max: Duration) -> Self {
+        std::cmp::min(self.saturating_mul(2), max)
     }
 }

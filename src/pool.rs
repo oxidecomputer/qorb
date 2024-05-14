@@ -56,8 +56,8 @@ impl<Conn: Connection> PoolInner<Conn> {
         rx: mpsc::Receiver<Request<Conn>>,
     ) -> Self {
         Self {
-            resolver,
             backend_connector,
+            resolver,
             slots: HashMap::new(),
             priority_list: PriorityList::new(),
             policy,
@@ -65,16 +65,58 @@ impl<Conn: Connection> PoolInner<Conn> {
         }
     }
 
+    // Sum up the total number of spares across all slot sets.
+    fn stats_summary(&self) -> crate::slot::Stats {
+        let mut stats = crate::slot::Stats::default();
+        for slot_set in self.slots.values() {
+            stats = stats + slot_set.get_stats();
+        }
+        stats
+    }
+
     fn handle_resolve_event(&mut self, event: resolver::Event) {
         use resolver::Event::*;
         match event {
             Added(backends) => {
-                span!(Level::TRACE, "Adding slots for backends");
+                let _span = span!(Level::TRACE, "Adding slots for backends").entered();
+                if backends.is_empty() {
+                    return;
+                }
+
+                // Gather information from all backends
+                let stats = self.stats_summary();
+                let total_spares = stats.spares();
+                let total_slots = stats.all_slots();
+
+                // We attempt to spread all remaining spares across the backends
+                // we see. This assumes that it's desirable to provision spares
+                // to backends as soon as they're seen from the resolver.
+                //
+                // This has the side effect that late-arriving backends won't
+                // have space for spares. This is okay -- we'll wait to use them
+                // until the next time rebalancing occurs.
+                let mut new_spares = if self.policy.spares_wanted > total_spares {
+                    self.policy.spares_wanted - total_spares
+                } else {
+                    0
+                };
+
+                // Enforce slot maximums
+                if total_slots + new_spares > self.policy.max_slots {
+                    new_spares = self.policy.max_slots - total_slots;
+                }
+
+                let new_spares_per_backend = new_spares.div_ceil(backends.len());
                 for (name, backend) in backends {
                     let _slot_set = self.slots.entry(name.clone()).or_insert_with(|| {
                         self.priority_list.push(rebalancer::new_backend(name));
+
+                        let spare_count = std::cmp::min(new_spares_per_backend, new_spares);
+                        new_spares -= spare_count;
+
                         slot::Set::new(
                             self.policy.set_config.clone(),
+                            spare_count,
                             backend.clone(),
                             self.backend_connector.clone(),
                         )
@@ -82,7 +124,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                 }
             }
             Removed(backend_names) => {
-                span!(Level::TRACE, "Removing slots for backends");
+                let _span = span!(Level::TRACE, "Removing slots for backends").entered();
                 for name in backend_names {
                     self.slots.remove(&name);
                 }
@@ -121,6 +163,8 @@ impl<Conn: Connection> PoolInner<Conn> {
     }
 
     fn rebalance(&mut self) {
+        let stats = self.stats_summary();
+
         let mut iter = std::mem::take(&mut self.priority_list).into_iter();
         let mut new_priority_list = PriorityList::new();
         while let Some(std::cmp::Reverse(mut weighted_backend)) = iter.next() {
@@ -132,6 +176,8 @@ impl<Conn: Connection> PoolInner<Conn> {
             // Otherwise, the backend priority is set to the number of failures
             // seen. More failures => less preferable backend.
             weighted_backend.score = slot.failure_count();
+
+            // TODO: Is this randomness actually necessary?
             rebalancer::add_random_jitter(&mut weighted_backend);
             new_priority_list.push(weighted_backend);
         }

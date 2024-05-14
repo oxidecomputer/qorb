@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{interval, Duration};
-use tracing::{event, instrument, span, Level};
+use tracing::{event, instrument, span, Instrument, Level};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -56,12 +56,24 @@ impl<Conn: Connection> State<Conn> {
 
 struct SlotInner<Conn: Connection> {
     state: State<Conn>,
+    stats: Arc<Mutex<Stats>>,
 
     // A task which may may be monitoring the slot.
     //
     // In the "Connecting" state, this task attempts to connect to the backend.
     // In the "ConnectedUnclaimed", this task monitors the connection's health.
     handle: Option<AbortHandle>,
+}
+
+impl<Conn: Connection> SlotInner<Conn> {
+    fn state_transition(&mut self, new: State<Conn>) -> State<Conn> {
+        let old = std::mem::replace(&mut self.state, new);
+
+        let mut stats = self.stats.lock().unwrap();
+        stats.exit_state(&old);
+        stats.enter_state(&self.state);
+        old
+    }
 }
 
 impl<Conn: Connection> Drop for SlotInner<Conn> {
@@ -103,31 +115,33 @@ impl<Conn: Connection> Slot<Conn> {
             match connector.connect(backend).await {
                 Ok(conn) => {
                     let mut slot = self.inner.lock().unwrap();
-                    slot.state = State::ConnectedUnclaimed(DebugIgnore(conn));
+                    slot.state_transition(State::ConnectedUnclaimed(DebugIgnore(conn)));
                     return;
                 }
                 Err(_err) => {
                     self.failure_window.add(1);
-                    retry_duration = retry_duration.exponential_backoff();
+                    retry_duration =
+                        retry_duration.exponential_backoff(config.max_connection_backoff);
                     tokio::time::sleep(retry_duration).await;
                 }
             }
         }
     }
 
+    #[instrument(level = "trace", skip(self, connector))]
     async fn validate_health_if_connected(&self, connector: &SharedConnector<Conn>) {
-        // Grab the connection, if and only if it's idle in
-        // the pool.
+        // Grab the connection, if and only if it's idle in the pool.
         let mut conn = {
             let mut slot = self.inner.lock().unwrap();
             if !matches!(slot.state, State::ConnectedUnclaimed(_)) {
                 return;
             }
             let State::ConnectedUnclaimed(DebugIgnore(conn)) =
-                std::mem::replace(&mut slot.state, State::ConnectedChecking)
+                slot.state_transition(State::ConnectedChecking)
             else {
-                return;
+                panic!("We just verified that the state was 'ConnectedUnclaimed'");
             };
+
             conn
         };
 
@@ -144,11 +158,11 @@ impl<Conn: Connection> Slot<Conn> {
         let mut slot = self.inner.lock().unwrap();
         match result {
             Ok(()) => {
-                slot.state = State::ConnectedUnclaimed(DebugIgnore(conn));
+                slot.state_transition(State::ConnectedUnclaimed(DebugIgnore(conn)));
             }
             Err(_) => {
                 self.failure_window.add(1);
-                slot.state = State::Connecting;
+                slot.state_transition(State::Connecting);
             }
         }
     }
@@ -173,9 +187,6 @@ impl<Conn: Connection> BorrowedConnection<Conn> {
 
 #[derive(Clone, Debug)]
 pub struct SetConfig {
-    /// The currently-desired number of slots to use
-    pub desired_count: usize,
-
     /// The max number of slots for the connection set
     pub max_count: usize,
 
@@ -200,7 +211,6 @@ pub struct SetConfig {
 impl Default for SetConfig {
     fn default() -> Self {
         Self {
-            desired_count: 8,
             max_count: 16,
             min_connection_backoff: Duration::from_millis(20),
             max_connection_backoff: Duration::from_secs(30),
@@ -210,12 +220,68 @@ impl Default for SetConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Stats {
-    connecting_slots: usize,
-    unclaimed_slots: usize,
-    checking_slots: usize,
-    claimed_slots: usize,
+/// Describes the state of connections to this backend.
+#[derive(Clone, Debug)]
+pub(crate) struct Stats {
+    pub(crate) connecting_slots: usize,
+    pub(crate) unclaimed_slots: usize,
+    pub(crate) checking_slots: usize,
+    pub(crate) claimed_slots: usize,
+}
+
+impl std::ops::Add for Stats {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        Self {
+            connecting_slots: self.connecting_slots + other.connecting_slots,
+            unclaimed_slots: self.unclaimed_slots + other.unclaimed_slots,
+            checking_slots: self.checking_slots + other.checking_slots,
+            claimed_slots: self.claimed_slots + other.claimed_slots,
+        }
+    }
+}
+
+impl Stats {
+    pub(crate) fn all_slots(&self) -> usize {
+        self.connecting_slots + self.unclaimed_slots + self.checking_slots + self.claimed_slots
+    }
+
+    pub(crate) fn spares(&self) -> usize {
+        self.unclaimed_slots + self.checking_slots
+    }
+
+    fn slot_created(&mut self) {
+        self.connecting_slots += 1;
+    }
+
+    fn exit_state<Conn: Connection>(&mut self, state: &State<Conn>) {
+        match state {
+            State::Connecting => self.connecting_slots -= 1,
+            State::ConnectedUnclaimed(_) => self.unclaimed_slots -= 1,
+            State::ConnectedChecking => self.checking_slots -= 1,
+            State::ConnectedClaimed => self.claimed_slots -= 1,
+        };
+    }
+
+    fn enter_state<Conn: Connection>(&mut self, state: &State<Conn>) {
+        match state {
+            State::Connecting => self.connecting_slots += 1,
+            State::ConnectedUnclaimed(_) => self.unclaimed_slots += 1,
+            State::ConnectedChecking => self.checking_slots += 1,
+            State::ConnectedClaimed => self.claimed_slots += 1,
+        };
+    }
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            connecting_slots: 0,
+            unclaimed_slots: 0,
+            checking_slots: 0,
+            claimed_slots: 0,
+        }
+    }
 }
 
 enum SetRequest<Conn: Connection> {
@@ -225,15 +291,13 @@ enum SetRequest<Conn: Connection> {
     SetWantedCount {
         count: usize,
     },
-    #[allow(dead_code)]
-    GetStats {
-        tx: oneshot::Sender<Stats>,
-    },
 }
 
 struct SetWorker<Conn: Connection> {
     backend: Backend,
     config: SetConfig,
+
+    wanted_count: usize,
 
     // Interface for actually connecting to backends
     backend_connector: SharedConnector<Conn>,
@@ -251,6 +315,11 @@ struct SetWorker<Conn: Connection> {
     // The actual slots themselves.
     slots: BTreeMap<SlotId, Slot<Conn>>,
 
+    // Summary information about the health of all slots.
+    //
+    // Must be kept in lockstep with "Self::slots"
+    stats: Arc<Mutex<Stats>>,
+
     failure_window: Arc<WindowedCounter>,
 
     next_slot_id: SlotId,
@@ -260,15 +329,19 @@ impl<Conn: Connection> SetWorker<Conn> {
     fn new(
         rx: mpsc::Receiver<SetRequest<Conn>>,
         config: SetConfig,
+        wanted_count: usize,
         backend: Backend,
         backend_connector: SharedConnector<Conn>,
+        stats: Arc<Mutex<Stats>>,
         failure_window: Arc<WindowedCounter>,
     ) -> Self {
         let (slot_tx, slot_rx) = mpsc::channel(config.max_count);
         let mut set = Self {
             backend,
             config,
+            wanted_count,
             backend_connector,
+            stats,
             failure_window,
             rx,
             slot_tx,
@@ -276,7 +349,7 @@ impl<Conn: Connection> SetWorker<Conn> {
             slots: BTreeMap::new(),
             next_slot_id: 0,
         };
-        set.set_wanted_count(set.config.desired_count);
+        set.set_wanted_count(wanted_count);
         set
     }
 
@@ -287,10 +360,12 @@ impl<Conn: Connection> SetWorker<Conn> {
             failure_window: self.failure_window.clone(),
             inner: Arc::new(Mutex::new(SlotInner {
                 state: State::Connecting,
+                stats: self.stats.clone(),
                 handle: None,
             })),
         };
         let slot = self.slots.entry(slot_id).or_insert(slot).clone();
+        self.stats.lock().unwrap().slot_created();
 
         slot.inner.lock().unwrap().handle = Some(
             tokio::task::spawn({
@@ -328,20 +403,30 @@ impl<Conn: Connection> SetWorker<Conn> {
 
                         match work {
                             Work::DoConnect => {
-                                span!(Level::TRACE, "Slot worker connecting", slot_id);
-                                slot.loop_until_connected(&config, &connector, &backend)
-                                    .await;
-                                monitor_interval.reset();
+                                let span = span!(Level::TRACE, "Slot worker connecting", slot_id);
+                                async {
+                                    slot.loop_until_connected(&config, &connector, &backend)
+                                        .await;
+                                    monitor_interval.reset();
+                                }
+                                .instrument(span)
+                                .await;
                             }
                             Work::DoMonitor => {
                                 // TODO: What if this task is super long?
                                 // TODO: Do we need a way to "kick back to
                                 // connecting" if a client connects, and sees an
                                 // issue on setup/teardown?
-                                span!(Level::TRACE, "Slot worker monitoring", slot_id);
-                                monitor_interval.tick().await;
-                                slot.validate_health_if_connected(&connector).await;
-                                monitor_interval.reset();
+                                // TODO: What if "health_interval" is not
+                                // actually supplied?
+                                let span = span!(Level::TRACE, "Slot worker monitoring", slot_id);
+                                async {
+                                    monitor_interval.tick().await;
+                                    slot.validate_health_if_connected(&connector).await;
+                                    monitor_interval.reset();
+                                }
+                                .instrument(span)
+                                .await;
                             }
                         }
                     }
@@ -361,14 +446,16 @@ impl<Conn: Connection> SetWorker<Conn> {
     ) -> Option<claim::Handle<Conn>> {
         for (id, slot) in &mut self.slots {
             let mut slot = slot.inner.lock().unwrap();
+            event!(Level::TRACE, id = id, state = ?slot.state, "Considering slot");
             if matches!(slot.state, State::ConnectedUnclaimed(_)) {
+                event!(Level::TRACE, id = id, "Found unclaimed slot");
                 // We intentionally "take the connection out" of the slot and
                 // "place it into a claim::Handle" in the same method.
                 //
                 // This makes it difficult to leak a connection, unless the drop
                 // method of the claim::Handle is skipped.
                 let State::ConnectedUnclaimed(DebugIgnore(conn)) =
-                    std::mem::replace(&mut slot.state, State::ConnectedClaimed)
+                    slot.state_transition(State::ConnectedClaimed)
                 else {
                     panic!(
                         "We just matched this type before replacing it; this should be impossible"
@@ -387,7 +474,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     }
 
     // Takes back borrowed slots from clients who dropped their claim handles.
-    #[instrument(level = "trace", skip(self, borrowed_conn))]
+    #[instrument(level = "trace", skip(self, borrowed_conn), fields(slot_id = borrowed_conn.id))]
     fn recycle_connection(&mut self, borrowed_conn: BorrowedConnection<Conn>) {
         let slot_id = borrowed_conn.id;
         let slot = self
@@ -407,7 +494,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                 "Unexpected slot state {:?}",
                 slot.state
             );
-            slot.state = State::ConnectedUnclaimed(DebugIgnore(borrowed_conn.conn));
+            slot.state_transition(State::ConnectedUnclaimed(DebugIgnore(borrowed_conn.conn)));
         }
 
         // If we tried to shrink the slot count while too many connections were
@@ -417,14 +504,14 @@ impl<Conn: Connection> SetWorker<Conn> {
     }
 
     fn set_wanted_count(&mut self, count: usize) {
-        self.config.desired_count = std::cmp::min(count, self.config.max_count);
+        self.wanted_count = std::cmp::min(count, self.config.max_count);
         self.conform_slot_count();
     }
 
     // Makes the number of slots as close to "desired_count" as we can get.
-    #[instrument(level = "trace", skip(self))]
+    #[instrument(level = "trace", skip(self), fields(wanted_count = self.wanted_count))]
     fn conform_slot_count(&mut self) {
-        let desired = self.config.desired_count;
+        let desired = self.wanted_count;
 
         use std::cmp::Ordering::*;
         match desired.cmp(&self.slots.len()) {
@@ -450,6 +537,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                     let slot = slot.inner.lock().unwrap();
                     if slot.state.removable() {
                         to_remove.push(*key);
+                        slot.stats.lock().unwrap().exit_state(&slot.state);
                     }
                 }
 
@@ -481,39 +569,18 @@ impl<Conn: Connection> SetWorker<Conn> {
         // Before we vend out the slot's connection to a client, make sure that
         // we have space to take it back once they're done with it.
         let Ok(permit) = self.slot_tx.clone().try_reserve_owned() else {
+            event!(Level::TRACE, "Could not reserve slot_tx permit");
             // This is more of an "all slots in-use" error,
             // but it should look the same to clients.
             return Err(Error::NoSlotsReady);
         };
 
         let Some(handle) = self.take_connected_unclaimed_slot(permit) else {
+            event!(Level::TRACE, "Failed to take unclaimed slot");
             return Err(Error::NoSlotsReady);
         };
 
         Ok(handle)
-    }
-
-    #[instrument(level = "trace", skip(self))]
-    #[allow(dead_code)]
-    fn get_stats(&mut self) -> Stats {
-        let mut stats = Stats {
-            connecting_slots: 0,
-            unclaimed_slots: 0,
-            checking_slots: 0,
-            claimed_slots: 0,
-        };
-
-        for slot in self.slots.values() {
-            let slot = slot.inner.lock().unwrap();
-            match slot.state {
-                State::Connecting => stats.connecting_slots += 1,
-                State::ConnectedUnclaimed(_) => stats.unclaimed_slots += 1,
-                State::ConnectedChecking => stats.checking_slots += 1,
-                State::ConnectedClaimed => stats.claimed_slots += 1,
-            }
-        }
-
-        stats
     }
 
     #[instrument(level = "trace", skip(self), name = "SetWorker::run")]
@@ -537,9 +604,6 @@ impl<Conn: Connection> SetWorker<Conn> {
                         Some(SetRequest::SetWantedCount { count }) => {
                             self.set_wanted_count(count);
                         },
-                        Some(SetRequest::GetStats { tx }) => {
-                            let _ = tx.send(self.get_stats());
-                        },
                         None => {
                             return;
                         }
@@ -554,6 +618,7 @@ impl<Conn: Connection> SetWorker<Conn> {
 pub(crate) struct Set<Conn: Connection> {
     tx: mpsc::Sender<SetRequest<Conn>>,
 
+    stats: Arc<Mutex<Stats>>,
     failure_window: Arc<WindowedCounter>,
 
     handle: JoinHandle<()>,
@@ -568,23 +633,34 @@ impl<Conn: Connection> Set<Conn> {
     /// These tasks are stopped when [Set] is dropped.
     pub(crate) fn new(
         config: SetConfig,
+        wanted_count: usize,
         backend: Backend,
         backend_connector: SharedConnector<Conn>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1);
         let failure_duration = config.max_connection_backoff * 2;
+        let stats = Arc::new(Mutex::new(Stats::default()));
         let failure_window = Arc::new(WindowedCounter::new(failure_duration));
         let handle = tokio::task::spawn({
+            let stats = stats.clone();
             let failure_window = failure_window.clone();
             async move {
-                let mut worker =
-                    SetWorker::new(rx, config, backend, backend_connector, failure_window);
+                let mut worker = SetWorker::new(
+                    rx,
+                    config,
+                    wanted_count,
+                    backend,
+                    backend_connector,
+                    stats,
+                    failure_window,
+                );
                 worker.run().await;
             }
         });
 
         Self {
             tx,
+            stats,
             failure_window,
             handle,
         }
@@ -627,20 +703,14 @@ impl<Conn: Connection> Set<Conn> {
         self.failure_window.sum()
     }
 
-    // Collect statistics about the number of slots within each respective
-    // state.
-    //
-    // Calling this function is racy, so its usage is recommended only for
-    // test environments and visibility.
-    #[instrument(skip(self), name = "Set::get_stats")]
-    async fn get_stats(&mut self) -> Result<Stats, Error> {
-        let (tx, rx) = oneshot::channel();
-
-        self.tx
-            .send(SetRequest::GetStats { tx })
-            .await
-            .map_err(|_| Error::SlotWorkerTerminated)?;
-        Ok(rx.await.map_err(|_| Error::SlotWorkerTerminated)?)
+    /// Collect statistics about the number of slots within each respective
+    /// state.
+    ///
+    /// Calling this function is racy, so its usage is recommended only for
+    /// test environments and approximate heuristics.
+    #[instrument(skip(self), ret, name = "Set::get_stats")]
+    pub(crate) fn get_stats(&self) -> Stats {
+        self.stats.lock().unwrap().clone()
     }
 }
 
@@ -680,9 +750,10 @@ mod test {
     const BACKEND: SocketAddr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0));
 
     fn setup_tracing_subscriber() {
+        use tracing_subscriber::fmt::format::FmtSpan;
         tracing_subscriber::fmt()
             .with_thread_names(true)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ENTER)
+            .with_span_events(FmtSpan::ENTER)
             .with_max_level(tracing::Level::TRACE)
             .with_test_writer()
             .init();
@@ -692,17 +763,48 @@ mod test {
     async fn test_one_claim() {
         setup_tracing_subscriber();
         let mut set = Set::new(
-            SetConfig {
-                desired_count: 5,
-                ..Default::default()
-            },
+            SetConfig::default(),
+            5,
             backend::Backend { address: BACKEND },
             Arc::new(TestConnector {}),
         );
 
         // Let the connections fill up
         loop {
-            let stats = set.get_stats().await.unwrap();
+            let stats = set.get_stats();
+            if stats.unclaimed_slots == 0 {
+                event!(Level::WARN, "No unclaimed slots");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                break;
+            }
+        }
+
+        let _conn = set.claim().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_no_slots_add_some_later() {
+        setup_tracing_subscriber();
+        let mut set = Set::new(
+            SetConfig::default(),
+            0,
+            backend::Backend { address: BACKEND },
+            Arc::new(TestConnector {}),
+        );
+
+        // We start with nothing available
+        set.claim()
+            .await
+            .map(|_| ())
+            .expect_err("Should not be able to get claims yet");
+
+        // We can later adjust the count of desired slots
+        set.set_wanted_count(3).await.unwrap();
+
+        // Let the connections fill up
+        loop {
+            let stats = set.get_stats();
             if stats.unclaimed_slots == 0 {
                 event!(Level::WARN, "No unclaimed slots");
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -718,18 +820,15 @@ mod test {
     async fn test_all_claims() {
         setup_tracing_subscriber();
         let mut set = Set::new(
-            SetConfig {
-                desired_count: 3,
-                max_count: 10,
-                ..Default::default()
-            },
+            SetConfig::default(),
+            3,
             backend::Backend { address: BACKEND },
             Arc::new(TestConnector {}),
         );
 
         // Let the connections fill up
         loop {
-            let stats = set.get_stats().await.unwrap();
+            let stats = set.get_stats();
             if stats.unclaimed_slots < 3 {
                 event!(Level::WARN, "Not enough unclaimed slots");
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -742,17 +841,21 @@ mod test {
         let _conn2 = set.claim().await.unwrap();
         let conn3 = set.claim().await.unwrap();
 
-        set.claim().await.map(|_| ()).unwrap_err();
+        set.claim()
+            .await
+            .map(|_| ())
+            .expect_err("We should fail to acquire a 4th claim from 3 slot set");
 
         drop(conn3);
 
         // Let the connection be recycled
         loop {
-            let stats = set.get_stats().await.unwrap();
+            let stats = set.get_stats();
             if stats.unclaimed_slots < 1 {
                 event!(Level::WARN, "Not enough unclaimed slots");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             } else {
+                event!(Level::INFO, "Observed Slots: {:?}", stats);
                 break;
             }
         }
