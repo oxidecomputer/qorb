@@ -242,6 +242,15 @@ impl std::ops::Add for Stats {
 }
 
 impl Stats {
+    /// Returns true if the number of connecting slots is non-zero,
+    /// but no other types of slots.
+    pub(crate) fn has_only_connecting_slots(&self) -> bool {
+        self.connecting_slots != 0
+            && self.unclaimed_slots == 0
+            && self.checking_slots == 0
+            && self.claimed_slots == 0
+    }
+
     pub(crate) fn all_slots(&self) -> usize {
         self.connecting_slots + self.unclaimed_slots + self.checking_slots + self.claimed_slots
     }

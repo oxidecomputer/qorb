@@ -88,13 +88,6 @@ impl<Conn: Connection> PoolInner<Conn> {
                 let total_spares = stats.spares();
                 let total_slots = stats.all_slots();
 
-                // We attempt to spread all remaining spares across the backends
-                // we see. This assumes that it's desirable to provision spares
-                // to backends as soon as they're seen from the resolver.
-                //
-                // This has the side effect that late-arriving backends won't
-                // have space for spares. This is okay -- we'll wait to use them
-                // until the next time rebalancing occurs.
                 let mut new_spares = if self.policy.spares_wanted > total_spares {
                     self.policy.spares_wanted - total_spares
                 } else {
@@ -156,14 +149,45 @@ impl<Conn: Connection> PoolInner<Conn> {
                     }
                 }
                 _ = rebalance_interval.tick() => {
-                    self.rebalance();
+                    self.rebalance().await;
                 },
             }
         }
     }
 
-    fn rebalance(&mut self) {
-        let stats = self.stats_summary();
+    async fn rebalance(&mut self) {
+        let mut questionable_backend_count = 0;
+        let mut usable_backends = vec![];
+
+        // Pass 1: Limit spares from backends that might not be functioning
+        while let Some((name, slot_set)) = self.slots.iter_mut().next() {
+            let stats = slot_set.get_stats();
+            if stats.has_only_connecting_slots() {
+                // TODO: Do we care about synchronization here, for stats
+                // purposes?
+                let _ = slot_set.set_wanted_count(1).await;
+                questionable_backend_count += 1;
+            } else {
+                usable_backends.push(name.clone());
+            }
+        }
+
+        // Each "questionable" backend uses one slot. Among the remaining
+        // backends, attempt to evenly distribute all wanted slots.
+        let total_slots_wanted = std::cmp::min(
+            self.stats_summary().claimed_slots + self.policy.spares_wanted,
+            self.policy.max_slots,
+        )
+        .saturating_sub(questionable_backend_count);
+        let slots_wanted_per_backend = total_slots_wanted.div_ceil(usable_backends.len());
+
+        // Pass 2: Provision spares equitably among the functioning backends
+        for name in usable_backends {
+            let Some(slot_set) = self.slots.get_mut(&name) else {
+                continue;
+            };
+            let _ = slot_set.set_wanted_count(slots_wanted_per_backend).await;
+        }
 
         let mut iter = std::mem::take(&mut self.priority_list).into_iter();
         let mut new_priority_list = PriorityList::new();
