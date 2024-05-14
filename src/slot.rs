@@ -212,6 +212,9 @@ impl<Conn: Connection> BorrowedConnection<Conn> {
     }
 }
 
+/// Configuration options for "Slot Sets".
+///
+/// Slot sets are groups of slots which all are connected to the same backend.
 #[derive(Clone, Debug)]
 pub struct SetConfig {
     /// The max number of slots for the connection set
@@ -223,13 +226,16 @@ pub struct SetConfig {
     /// The maximum time to backoff between connection requests
     pub max_connection_backoff: Duration,
 
-    /// When retrying a connection, add a random amount of delay between [0, spread)
+    /// When retrying a connection, add a random amount of delay between [0, spread).
+    ///
+    /// If "Duration::ZERO" is used, no spread is added.
     pub spread: Duration,
 
     /// How long to wait before checking on the health of a connection.
     ///
-    /// This has no backoff - on success, we wait this same period, and
-    /// on failure, we use the "connection_backoff" configs.
+    /// This has no backoff - on success, we wait this same period, and on
+    /// failure, we reconnect, which uses the normal "connection_backoff"
+    /// configs.
     ///
     /// If "None", no periodic checks are performed.
     pub health_interval: Option<Duration>,
@@ -307,6 +313,7 @@ enum SetRequest<Conn: Connection> {
     },
 }
 
+// Owns and runs work on behalf of a [Set].
 struct SetWorker<Conn: Connection> {
     backend: Backend,
     config: SetConfig,
@@ -553,6 +560,9 @@ impl<Conn: Connection> SetWorker<Conn> {
                 //
                 // If there are many non-removable slots, it's possible
                 // we don't immediately quiesce to this smaller requested count.
+                //
+                // TODO: As an optimization, it would be nice to remove
+                // "Connecting" slots before "Connected" slots.
                 for (key, slot) in &self.slots {
                     if to_remove.len() >= count_to_remove {
                         break;
@@ -610,6 +620,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     async fn run(&mut self) {
         loop {
             tokio::select! {
+                // Recycle old requests
                 request = self.slot_rx.recv() => {
                     match request {
                         Some(borrowed_conn) => self.recycle_connection(borrowed_conn),
@@ -618,6 +629,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                         },
                     }
                 },
+                // Handle requests from clients
                 request = self.rx.recv() => {
                     match request {
                         Some(SetRequest::Claim { tx }) => {
