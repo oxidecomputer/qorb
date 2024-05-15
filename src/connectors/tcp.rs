@@ -1,4 +1,4 @@
-//! Implementation of [Connector] for TCP.
+//! Implementation of [backend::Connector] for [TcpStream].
 
 use crate::backend::{self, Backend, Error};
 

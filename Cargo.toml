@@ -10,6 +10,7 @@ license = "MPL-2.0"
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+async-bb8-diesel = { version = "0.2", optional = true }
 diesel = { version = "2.1", optional = true, features = [ "postgres", "r2d2" ] }
 debug-ignore = "1.0"
 derive-where = "1.2"
@@ -28,4 +29,4 @@ tracing-subscriber = "0.3"
 [features]
 all = [ "diesel_pg" ]
 default = []
-diesel_pg = ["dep:diesel"]
+diesel_pg = ["dep:diesel", "dep:async-bb8-diesel"]
