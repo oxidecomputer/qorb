@@ -903,15 +903,10 @@ mod test {
         );
 
         // Let the connections fill up
-        loop {
-            let stats = set.get_stats();
-            if stats.unclaimed_slots == 0 {
-                event!(Level::WARN, "No unclaimed slots");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            } else {
-                break;
-            }
-        }
+        set.monitor()
+            .wait_for(|state| matches!(state, SetState::Online))
+            .await
+            .unwrap();
 
         // Grab a connection, then set the "Wanted" count to zero.
         let conn = set.claim().await.unwrap();
@@ -928,6 +923,7 @@ mod test {
             }
         }
 
+        assert_eq!(set.get_state(), SetState::Online);
         assert_eq!(set.get_stats().claimed_slots, 1);
         drop(conn);
 
@@ -953,21 +949,18 @@ mod test {
             .await
             .map(|_| ())
             .expect_err("Should not be able to get claims yet");
+        assert_eq!(set.get_state(), SetState::Offline);
 
         // We can later adjust the count of desired slots
         set.set_wanted_count(3).await.unwrap();
 
         // Let the connections fill up
-        loop {
-            let stats = set.get_stats();
-            if stats.unclaimed_slots == 0 {
-                event!(Level::WARN, "No unclaimed slots");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            } else {
-                break;
-            }
-        }
+        set.monitor()
+            .wait_for(|state| matches!(state, SetState::Online))
+            .await
+            .unwrap();
 
+        // When this completes, the connections may be claimed
         let _conn = set.claim().await.unwrap();
     }
 
@@ -1042,7 +1035,7 @@ mod test {
 
         // The set should initialize as "Offline", since nothing can connect.
         assert_eq!(set.get_state(), SetState::Offline);
-        let monitor = set.monitor();
+        let mut monitor = set.monitor();
         assert_eq!(*monitor.borrow(), SetState::Offline);
 
         // Enable connections, and let the pool fill up
@@ -1059,7 +1052,7 @@ mod test {
             }
         }
 
-        assert_eq!(*monitor.borrow(), SetState::Online);
+        assert_eq!(*monitor.borrow_and_update(), SetState::Online);
         assert_eq!(set.get_state(), SetState::Online);
 
         // Disable connections, rely on health monitoring to disable them once
@@ -1067,14 +1060,10 @@ mod test {
         connector.set_connectable(false);
 
         // Let the connections die as their health checks fail
-        loop {
-            let stats = set.get_stats();
-            if stats.connecting_slots < 3 {
-                event!(Level::WARN, "Not enough connecting slots");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            } else {
-                break;
-            }
-        }
+        monitor.changed().await.unwrap();
+        assert_eq!(*monitor.borrow_and_update(), SetState::Offline);
+        let stats = set.get_stats();
+        assert_eq!(stats.all_slots(), 3);
+        assert_eq!(stats.connecting_slots, 3);
     }
 }
