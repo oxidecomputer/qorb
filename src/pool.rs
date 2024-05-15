@@ -1,8 +1,8 @@
 //! A pool which uses a [resolver] to find a [backend], and vend out a [claim]
 
 use crate::backend;
+use crate::backend::Connection;
 use crate::claim;
-use crate::connection::Connection;
 use crate::policy::Policy;
 use crate::priority_list::PriorityList;
 use crate::rebalancer;

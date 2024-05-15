@@ -18,7 +18,6 @@
 // Public API
 pub mod backend;
 pub mod claim;
-pub mod connection;
 pub mod policy;
 pub mod pool;
 pub mod resolver;
@@ -33,4 +32,5 @@ mod slot;
 mod window_counter;
 
 // Default implementations of generic interfaces
+pub mod connectors;
 pub mod resolvers;

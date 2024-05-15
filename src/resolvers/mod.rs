@@ -1,3 +1,3 @@
-//! Default implementations for common resolvers
+//! Default implementations of [crate::resolver::Resolver]
 
 pub mod dns;

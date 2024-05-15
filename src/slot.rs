@@ -1,7 +1,7 @@
+use crate::backend::Connection;
 use crate::backend::{Backend, SharedConnector};
 use crate::backoff::ExponentialBackoff;
 use crate::claim;
-use crate::connection::Connection;
 use crate::policy::SetConfig;
 use crate::window_counter::WindowedCounter;
 
@@ -808,7 +808,7 @@ mod test {
 
     struct TestConnection {}
 
-    impl crate::connection::Connection for TestConnection {}
+    impl crate::backend::Connection for TestConnection {}
 
     struct TestConnector {
         can_connect: AtomicBool,

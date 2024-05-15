@@ -1,6 +1,6 @@
 //! Connections which are borrowed from the connection pool.
 
-use crate::connection::Connection;
+use crate::backend::Connection;
 use crate::slot::BorrowedConnection;
 use tokio::sync::mpsc::OwnedPermit;
 
