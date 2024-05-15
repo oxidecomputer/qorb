@@ -179,7 +179,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                     self.rebalance().await;
                 }
                 // If any of the slots change state, update their allocations.
-                Some((_name, _status)) = &mut backend_status_stream.next() => {
+                Some((_name, _status)) = &mut backend_status_stream.next(), if !backend_status_stream.is_empty() => {
                     rebalance_interval.reset();
                     self.rebalance().await;
                 },

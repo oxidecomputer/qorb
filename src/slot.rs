@@ -47,6 +47,9 @@ enum State<Conn: Connection> {
     //
     // - (When claim dropped) State becomes ConnectedClaimed
     ConnectedClaimed,
+
+    // Final state, when the slot is no longer in-use.
+    Terminated,
 }
 
 impl<Conn: Connection> State<Conn> {
@@ -90,9 +93,11 @@ impl<Conn: Connection> SlotInner<Conn> {
         // the number of slots provisioned to this set.
         match (before_no_connected, after_no_connected) {
             (true, false) => {
+                event!(Level::INFO, "state_transition: Set Online");
                 self.status_tx.send_replace(SetState::Online);
             }
             (false, true) => {
+                event!(Level::INFO, "state_transition: Set Offline");
                 self.status_tx.send_replace(SetState::Offline);
             }
             _ => (),
@@ -104,7 +109,7 @@ impl<Conn: Connection> SlotInner<Conn> {
 
 impl<Conn: Connection> Drop for SlotInner<Conn> {
     fn drop(&mut self) {
-        if let Some(handle) = &self.handle {
+        if let Some(handle) = self.handle.take() {
             handle.abort();
         }
     }
@@ -179,7 +184,7 @@ impl<Conn: Connection> Slot<Conn> {
         //
         // This actually makes the connection unavailable to clients
         // while we're performing the health checks. It's important
-        // that we put the state back after the check succeed!
+        // that we put the state back after the check succeeds!
         let result = connector.is_valid(&mut conn).await;
 
         let mut slot = self.inner.lock().unwrap();
@@ -293,6 +298,7 @@ impl Stats {
             State::ConnectedUnclaimed(_) => self.unclaimed_slots += 1,
             State::ConnectedChecking => self.checking_slots += 1,
             State::ConnectedClaimed => self.claimed_slots += 1,
+            State::Terminated => (),
         };
     }
 
@@ -302,6 +308,7 @@ impl Stats {
             State::ConnectedUnclaimed(_) => self.unclaimed_slots -= 1,
             State::ConnectedChecking => self.checking_slots -= 1,
             State::ConnectedClaimed => self.claimed_slots -= 1,
+            State::Terminated => panic!("Should not leave terminated state"),
         };
     }
 }
@@ -430,6 +437,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                                 State::ConnectedUnclaimed(_)
                                 | State::ConnectedChecking
                                 | State::ConnectedClaimed => Work::DoMonitor,
+                                State::Terminated => return,
                             }
                         };
 
@@ -551,7 +559,6 @@ impl<Conn: Connection> SetWorker<Conn> {
                 // Fewer slots wanted. Remove as many as we can.
                 event!(
                     Level::TRACE,
-                    desired = desired,
                     current = self.slots.len(),
                     "Reducing slot count"
                 );
@@ -569,15 +576,23 @@ impl<Conn: Connection> SetWorker<Conn> {
                     if to_remove.len() >= count_to_remove {
                         break;
                     }
-                    let slot = slot.inner.lock().unwrap();
+                    let mut slot = slot.inner.lock().unwrap();
                     if slot.state.removable() {
                         to_remove.push(*key);
-                        slot.stats.lock().unwrap().exit_state(&slot.state);
+                        slot.state_transition(State::Terminated);
                     }
                 }
 
                 for key in to_remove {
-                    self.slots.remove(&key);
+                    event!(Level::TRACE, slot_id = key, "Removing slot");
+                    let Some(slot) = self.slots.remove(&key) else {
+                        continue;
+                    };
+                    let Some(handle) = slot.inner.lock().unwrap().handle.take() else {
+                        continue;
+                    };
+                    event!(Level::TRACE, slot_id = key, "Aborting task");
+                    handle.abort();
                 }
             }
             Greater => {
@@ -585,7 +600,6 @@ impl<Conn: Connection> SetWorker<Conn> {
                 // in "connecting" slots immediately.
                 event!(
                     Level::TRACE,
-                    desired = desired,
                     current = self.slots.len(),
                     "Increasing slot count"
                 );
@@ -876,6 +890,52 @@ mod test {
         }
 
         let _conn = set.claim().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_drain_slots() {
+        setup_tracing_subscriber();
+        let mut set = Set::new(
+            SetConfig::default(),
+            3,
+            backend::Backend { address: BACKEND },
+            Arc::new(TestConnector::new()),
+        );
+
+        // Let the connections fill up
+        loop {
+            let stats = set.get_stats();
+            if stats.unclaimed_slots == 0 {
+                event!(Level::WARN, "No unclaimed slots");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                break;
+            }
+        }
+
+        // Grab a connection, then set the "Wanted" count to zero.
+        let conn = set.claim().await.unwrap();
+        set.set_wanted_count(0).await.unwrap();
+
+        // Let the connections drain
+        loop {
+            let stats = set.get_stats();
+            if stats.unclaimed_slots > 0 {
+                event!(Level::WARN, "Should be no unclaimed slots");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(set.get_stats().claimed_slots, 1);
+        drop(conn);
+
+        set.monitor()
+            .wait_for(|state| matches!(state, SetState::Offline))
+            .await
+            .unwrap();
+        assert_eq!(set.get_stats().all_slots(), 0);
     }
 
     #[tokio::test]
