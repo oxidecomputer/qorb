@@ -9,7 +9,12 @@ pub trait ExponentialBackoff: Sized {
 impl ExponentialBackoff for Duration {
     fn add_spread(&self, spread: Duration) -> Self {
         let mut rng = thread_rng();
-        let spread = rng.gen_range(0..spread.as_nanos());
+        let nanos = spread.as_nanos();
+        let spread = if nanos == 0 {
+            0
+        } else {
+            rng.gen_range(0..spread.as_nanos())
+        };
         self.saturating_add(Duration::from_nanos(spread.try_into().unwrap()))
     }
 
