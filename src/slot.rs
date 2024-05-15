@@ -57,6 +57,15 @@ impl<Conn: Connection> State<Conn> {
     fn removable(&self) -> bool {
         !matches!(self, State::ConnectedClaimed)
     }
+
+    fn connected(&self) -> bool {
+        match self {
+            State::Connecting | State::Terminated => false,
+            State::ConnectedUnclaimed(_) | State::ConnectedChecking | State::ConnectedClaimed => {
+                true
+            }
+        }
+    }
 }
 
 struct SlotInner<Conn: Connection> {
@@ -539,24 +548,38 @@ impl<Conn: Connection> SetWorker<Conn> {
                     current = self.slots.len(),
                     "Reducing slot count"
                 );
-                let count_to_remove = self.slots.len() - desired;
-                let mut to_remove = Vec::with_capacity(count_to_remove);
 
                 // Gather all the keys we are trying to remove.
                 //
                 // If there are many non-removable slots, it's possible
                 // we don't immediately quiesce to this smaller requested count.
+                let count_to_remove = self.slots.len() - desired;
+                let mut to_remove = Vec::with_capacity(count_to_remove);
+
+                // We iterate through all slots twice:
+                // - First, we try to remove unconnected slots
+                // - Then we remove any removable slots remaining
                 //
-                // TODO: As an optimization, it would be nice to remove
-                // "Connecting" slots before "Connected" slots.
-                for (key, slot) in &self.slots {
-                    if to_remove.len() >= count_to_remove {
-                        break;
-                    }
-                    let mut slot = slot.inner.lock().unwrap();
-                    if slot.state.removable() {
-                        to_remove.push(*key);
-                        slot.state_transition(State::Terminated);
+                // This is a minor optimization that avoids tearing down a
+                // connected spare while also trying to create a new one.
+                let filters = [
+                    |slot: &SlotInner<Conn>| !slot.state.connected() && slot.state.removable(),
+                    |slot: &SlotInner<Conn>| slot.state.removable(),
+                ];
+                for filter in filters {
+                    for (key, slot) in &self.slots {
+                        if to_remove.len() >= count_to_remove {
+                            break;
+                        }
+                        let mut slot = slot.inner.lock().unwrap();
+                        if filter(&*slot) {
+                            to_remove.push(*key);
+
+                            // It's important that we terminate the slot
+                            // immediately, so the task which manages the slot
+                            // will not continue modifying the state.
+                            slot.state_transition(State::Terminated);
+                        }
                     }
                 }
 
