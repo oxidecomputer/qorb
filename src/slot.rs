@@ -76,6 +76,10 @@ impl<Conn: Connection> SlotInner<Conn> {
     // Additionally, if this updates the state of the whole backend,
     // emits a SetState on [Self::status_tx].
     fn state_transition(&mut self, new: State<Conn>) -> State<Conn> {
+        if matches!(self.state, State::Terminated) {
+            return State::Terminated;
+        }
+
         let old = std::mem::replace(&mut self.state, new);
 
         let mut stats = self.stats.lock().unwrap();
@@ -413,7 +417,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                 let connector = self.backend_connector.clone();
                 let backend = self.backend.clone();
                 async move {
-                    let mut monitor_interval =
+                    let mut interval =
                         interval(config.health_interval.unwrap_or(Duration::MAX));
 
                     loop {
@@ -447,13 +451,14 @@ impl<Conn: Connection> SetWorker<Conn> {
                                 async {
                                     slot.loop_until_connected(&config, &connector, &backend)
                                         .await;
-                                    monitor_interval.reset();
+                                    interval.reset_after(interval.period().add_spread(config.spread));
                                 }
                                 .instrument(span)
                                 .await;
                             }
                             Work::DoMonitor => {
-                                // TODO: What if this task is super long?
+                                // TODO: What if this task is super long? Would we benefit
+                                // from a timeout?
                                 // TODO: Do we need a way to "kick back to
                                 // connecting" if a client connects, and sees an
                                 // issue on setup/teardown?
@@ -461,9 +466,9 @@ impl<Conn: Connection> SetWorker<Conn> {
                                 // actually supplied?
                                 let span = span!(Level::TRACE, "Slot worker monitoring", slot_id);
                                 async {
-                                    monitor_interval.tick().await;
+                                    interval.tick().await;
                                     slot.validate_health_if_connected(&connector).await;
-                                    monitor_interval.reset();
+                                    interval.reset_after(interval.period().add_spread(config.spread));
                                 }
                                 .instrument(span)
                                 .await;
