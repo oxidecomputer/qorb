@@ -185,9 +185,11 @@ impl<Conn: Connection> Slot<Conn> {
         let mut slot = self.inner.lock().unwrap();
         match result {
             Ok(()) => {
+                event!(Level::TRACE, "Connection remains healthy");
                 slot.state_transition(State::ConnectedUnclaimed(DebugIgnore(conn)));
             }
-            Err(_) => {
+            Err(err) => {
+                event!(Level::WARN, err = ?err, "Connection failed during health check");
                 self.failure_window.add(1);
                 slot.state_transition(State::Connecting);
             }
@@ -650,7 +652,7 @@ impl<Conn: Connection> SetWorker<Conn> {
 }
 
 /// Describes the overall status of the backend.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum SetState {
     /// At least one slot is connected to the backend.
     Online,
@@ -788,25 +790,55 @@ mod test {
     use super::*;
     use crate::backend;
     use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct TestConnection {}
 
     impl crate::connection::Connection for TestConnection {}
 
-    struct TestConnector {}
+    struct TestConnector {
+        can_connect: AtomicBool,
+    }
+
+    impl TestConnector {
+        fn new() -> TestConnector {
+            Self {
+                can_connect: AtomicBool::new(true),
+            }
+        }
+
+        #[instrument(level = "trace", skip(self))]
+        fn set_connectable(&self, can_connect: bool) {
+            self.can_connect.store(can_connect, Ordering::SeqCst);
+        }
+    }
 
     #[async_trait::async_trait]
     impl backend::Connector for TestConnector {
         type Connection = TestConnection;
 
         /// Creates a connection to a backend.
-        async fn connect(&self, _backend: &Backend) -> Result<Self::Connection, backend::Error> {
-            Ok(TestConnection {})
+        async fn connect(&self, backend: &Backend) -> Result<Self::Connection, backend::Error> {
+            assert_eq!(backend, &backend::Backend { address: BACKEND });
+
+            if self.can_connect.load(Ordering::SeqCst) {
+                event!(Level::INFO, "TestConnector::Connect - OK");
+                Ok(TestConnection {})
+            } else {
+                event!(Level::WARN, "TestConnector::Connect - FAIL");
+                Err(backend::Error::Other(anyhow::anyhow!("Failed")))
+            }
         }
 
         /// Determines if the connection to a backend is still valid.
         async fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), backend::Error> {
-            Ok(())
+            if self.can_connect.load(Ordering::SeqCst) {
+                event!(Level::INFO, "TestConnector::is_valid - OK");
+                Ok(())
+            } else {
+                event!(Level::WARN, "TestConnector::is_valid - FAIL");
+                Err(backend::Error::Other(anyhow::anyhow!("Failed")))
+            }
         }
     }
 
@@ -829,7 +861,7 @@ mod test {
             SetConfig::default(),
             5,
             backend::Backend { address: BACKEND },
-            Arc::new(TestConnector {}),
+            Arc::new(TestConnector::new()),
         );
 
         // Let the connections fill up
@@ -853,7 +885,7 @@ mod test {
             SetConfig::default(),
             0,
             backend::Backend { address: BACKEND },
-            Arc::new(TestConnector {}),
+            Arc::new(TestConnector::new()),
         );
 
         // We start with nothing available
@@ -886,7 +918,7 @@ mod test {
             SetConfig::default(),
             3,
             backend::Backend { address: BACKEND },
-            Arc::new(TestConnector {}),
+            Arc::new(TestConnector::new()),
         );
 
         // Let the connections fill up
@@ -924,5 +956,64 @@ mod test {
         }
 
         let _conn4 = set.claim().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_monitor_state() {
+        setup_tracing_subscriber();
+
+        // Make sure that when we start, no connections can actually succeed.
+        let connector = Arc::new(TestConnector::new());
+        connector.set_connectable(false);
+
+        let set = Set::new(
+            SetConfig {
+                max_count: 3,
+                min_connection_backoff: Duration::from_millis(1),
+                max_connection_backoff: Duration::from_millis(10),
+                spread: Duration::ZERO,
+                health_interval: Some(Duration::from_millis(1)),
+            },
+            3,
+            backend::Backend { address: BACKEND },
+            connector.clone(),
+        );
+
+        // The set should initialize as "Offline", since nothing can connect.
+        assert_eq!(set.get_state(), SetState::Offline);
+        let monitor = set.monitor();
+        assert_eq!(*monitor.borrow(), SetState::Offline);
+
+        // Enable connections, and let the pool fill up
+        connector.set_connectable(true);
+
+        // Let the connections fill up
+        loop {
+            let stats = set.get_stats();
+            if stats.unclaimed_slots < 3 {
+                event!(Level::WARN, "Not enough unclaimed slots");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(*monitor.borrow(), SetState::Online);
+        assert_eq!(set.get_state(), SetState::Online);
+
+        // Disable connections, rely on health monitoring to disable them once
+        // more.
+        connector.set_connectable(false);
+
+        // Let the connections die as their health checks fail
+        loop {
+            let stats = set.get_stats();
+            if stats.connecting_slots < 3 {
+                event!(Level::WARN, "Not enough connecting slots");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                break;
+            }
+        }
     }
 }

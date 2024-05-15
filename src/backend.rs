@@ -8,7 +8,10 @@ use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum Error {}
+pub enum Error {
+    #[error(transparent)]
+    Other(anyhow::Error),
+}
 
 /// Describes the name of a backend.
 #[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Debug, Hash)]
