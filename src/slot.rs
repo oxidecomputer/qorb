@@ -2,6 +2,7 @@ use crate::backend::{Backend, SharedConnector};
 use crate::backoff::ExponentialBackoff;
 use crate::claim;
 use crate::connection::Connection;
+use crate::policy::SetConfig;
 use crate::window_counter::WindowedCounter;
 
 use debug_ignore::DebugIgnore;
@@ -59,8 +60,12 @@ impl<Conn: Connection> State<Conn> {
 }
 
 struct SlotInner<Conn: Connection> {
+    // The state of this individual connection.
     state: State<Conn>,
+
+    // This is wrapped in an "Arc" because it's shared with all slots in the slot set.
     stats: Arc<Mutex<Stats>>,
+
     status_tx: watch::Sender<SetState>,
 
     // A task which may may be monitoring the slot.
@@ -124,6 +129,7 @@ impl<Conn: Connection> Drop for SlotInner<Conn> {
 //
 // Slots scale up and down in quantity at the request of the rebalancer.
 struct Slot<Conn: Connection> {
+    // This "failure_window" is shared with all slots in the slot set.
     failure_window: Arc<WindowedCounter>,
     inner: Arc<Mutex<SlotInner<Conn>>>,
 }
@@ -165,7 +171,11 @@ impl<Conn: Connection> Slot<Conn> {
     }
 
     #[instrument(level = "trace", skip(self, connector))]
-    async fn validate_health_if_connected(&self, connector: &SharedConnector<Conn>) {
+    async fn validate_health_if_connected(
+        &self,
+        connector: &SharedConnector<Conn>,
+        timeout: Duration,
+    ) {
         // Grab the connection, if and only if it's idle in the pool.
         let mut conn = {
             let mut slot = self.inner.lock().unwrap();
@@ -189,16 +199,21 @@ impl<Conn: Connection> Slot<Conn> {
         // This actually makes the connection unavailable to clients
         // while we're performing the health checks. It's important
         // that we put the state back after the check succeeds!
-        let result = connector.is_valid(&mut conn).await;
+        let result = tokio::time::timeout(timeout, connector.is_valid(&mut conn)).await;
 
         let mut slot = self.inner.lock().unwrap();
         match result {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 event!(Level::TRACE, "Connection remains healthy");
                 slot.state_transition(State::ConnectedUnclaimed(DebugIgnore(conn)));
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 event!(Level::WARN, err = ?err, "Connection failed during health check");
+                self.failure_window.add(1);
+                slot.state_transition(State::Connecting);
+            }
+            Err(_) => {
+                event!(Level::WARN, "Connection timed out during health check");
                 self.failure_window.add(1);
                 slot.state_transition(State::Connecting);
             }
@@ -220,47 +235,6 @@ pub(crate) struct BorrowedConnection<Conn: Connection> {
 impl<Conn: Connection> BorrowedConnection<Conn> {
     pub(crate) fn new(conn: Conn, id: SlotId) -> Self {
         Self { conn, id }
-    }
-}
-
-/// Configuration options for "Slot Sets".
-///
-/// Slot sets are groups of slots which all are connected to the same backend.
-#[derive(Clone, Debug)]
-pub struct SetConfig {
-    /// The max number of slots for the connection set
-    pub max_count: usize,
-
-    /// The minimum time before retrying connection requests
-    pub min_connection_backoff: Duration,
-
-    /// The maximum time to backoff between connection requests
-    pub max_connection_backoff: Duration,
-
-    /// When retrying a connection, add a random amount of delay between [0, spread).
-    ///
-    /// If "Duration::ZERO" is used, no spread is added.
-    pub spread: Duration,
-
-    /// How long to wait before checking on the health of a connection.
-    ///
-    /// This has no backoff - on success, we wait this same period, and on
-    /// failure, we reconnect, which uses the normal "connection_backoff"
-    /// configs.
-    ///
-    /// If "None", no periodic checks are performed.
-    pub health_interval: Option<Duration>,
-}
-
-impl Default for SetConfig {
-    fn default() -> Self {
-        Self {
-            max_count: 16,
-            min_connection_backoff: Duration::from_millis(20),
-            max_connection_backoff: Duration::from_secs(30),
-            spread: Duration::from_millis(20),
-            health_interval: Some(Duration::from_secs(30)),
-        }
     }
 }
 
@@ -417,8 +391,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                 let connector = self.backend_connector.clone();
                 let backend = self.backend.clone();
                 async move {
-                    let mut interval =
-                        interval(config.health_interval.unwrap_or(Duration::MAX));
+                    let mut interval = interval(config.health_interval);
 
                     loop {
                         event!(Level::TRACE, slot_id = slot_id, "Starting Slot work loop");
@@ -451,24 +424,23 @@ impl<Conn: Connection> SetWorker<Conn> {
                                 async {
                                     slot.loop_until_connected(&config, &connector, &backend)
                                         .await;
-                                    interval.reset_after(interval.period().add_spread(config.spread));
+                                    interval
+                                        .reset_after(interval.period().add_spread(config.spread));
                                 }
                                 .instrument(span)
                                 .await;
                             }
                             Work::DoMonitor => {
-                                // TODO: What if this task is super long? Would we benefit
-                                // from a timeout?
-                                // TODO: Do we need a way to "kick back to
-                                // connecting" if a client connects, and sees an
-                                // issue on setup/teardown?
-                                // TODO: What if "health_interval" is not
-                                // actually supplied?
                                 let span = span!(Level::TRACE, "Slot worker monitoring", slot_id);
                                 async {
                                     interval.tick().await;
-                                    slot.validate_health_if_connected(&connector).await;
-                                    interval.reset_after(interval.period().add_spread(config.spread));
+                                    slot.validate_health_if_connected(
+                                        &connector,
+                                        config.health_check_timeout,
+                                    )
+                                    .await;
+                                    interval
+                                        .reset_after(interval.period().add_spread(config.spread));
                                 }
                                 .instrument(span)
                                 .await;
@@ -1037,7 +1009,8 @@ mod test {
                 min_connection_backoff: Duration::from_millis(1),
                 max_connection_backoff: Duration::from_millis(10),
                 spread: Duration::ZERO,
-                health_interval: Some(Duration::from_millis(1)),
+                health_interval: Duration::from_millis(1),
+                ..Default::default()
             },
             3,
             backend::Backend { address: BACKEND },
