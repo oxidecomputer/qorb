@@ -53,10 +53,11 @@ impl backend::Connector for DieselPgConnector {
         let url = self.to_url(backend.address);
 
         tokio::task::spawn_blocking(move || {
-            let pg_conn = PgConnection::establish(&url)
-                .map_err(|e| Error::Other(anyhow!(e)))?;
+            let pg_conn = PgConnection::establish(&url).map_err(|e| Error::Other(anyhow!(e)))?;
             Ok(async_bb8_diesel::Connection::new(pg_conn))
-        }).await.expect("Task panicked establishing connection")
+        })
+        .await
+        .expect("Task panicked establishing connection")
     }
 
     async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Error> {
@@ -64,6 +65,8 @@ impl backend::Connector for DieselPgConnector {
         if is_broken {
             return Err(Error::Other(anyhow!("Connection broken")));
         }
-        conn.ping_async().await.map_err(|e| Error::Other(anyhow!(e)))
+        conn.ping_async()
+            .await
+            .map_err(|e| Error::Other(anyhow!(e)))
     }
 }

@@ -14,6 +14,5 @@ It is not yet functional, but this space will be updated when it's ready for usa
 Things I'd like to do before getting more eyes on this:
 
 * Add dtrace probes
-* Build out the Postgres connector
-* Build out the TCP connector
 * Add a baseline test suite
+

@@ -808,8 +808,6 @@ mod test {
 
     struct TestConnection {}
 
-    impl crate::backend::Connection for TestConnection {}
-
     struct TestConnector {
         can_connect: AtomicBool,
     }
