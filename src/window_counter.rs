@@ -52,7 +52,7 @@ impl WindowedCounter {
             epoch: AtomicU64::new(0),
             epoch_index: Mutex::new(0),
             buckets: [ATOMIC_USIZE_ZERO; NUM_BUCKETS],
-            bucket_window_ms: (window / (NUM_BUCKETS) as u32).as_millis() as u64,
+            bucket_window_ms: std::cmp::max(1, (window / (NUM_BUCKETS) as u32).as_millis() as u64),
             current: AtomicUsize::new(0),
         }
     }
@@ -133,6 +133,18 @@ mod tests {
 
     fn counter() -> WindowedCounter {
         WindowedCounter::new(time::Duration::from_secs(3))
+    }
+
+    #[tokio::test]
+    async fn small_window_big_step() {
+        time::pause();
+        let ctr = WindowedCounter::new(time::Duration::from_millis(1));
+        ctr.add(1);
+        assert_eq!(1, ctr.sum());
+
+        time::advance(Duration::from_secs(1)).await;
+        ctr.add(1);
+        assert_eq!(1, ctr.sum());
     }
 
     #[tokio::test]
