@@ -19,7 +19,7 @@ pub enum Error {
 pub struct Name(pub String);
 
 /// A single instance of a service.
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash, Ord, PartialOrd)]
 pub struct Backend {
     pub address: SocketAddr,
 }
