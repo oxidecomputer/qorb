@@ -9,7 +9,7 @@ use thiserror::Error;
 pub enum Error {}
 
 /// Events sent to the connection pool from the resolver
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Event {
     /// One or more backends have been added
     Added(Vec<(backend::Name, Backend)>),

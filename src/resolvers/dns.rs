@@ -20,6 +20,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::time::timeout;
+use tracing::{event, instrument, Level};
 
 #[derive(Clone)]
 struct BackendRecord {
@@ -38,6 +39,8 @@ struct Client {
     //
     // This number will go up when the DNS client cannot access the server, but
     // this is but one of many signals.
+    //
+    // TODO: Maybe use the failure window here too?
     missed_requests_count: usize,
 }
 
@@ -63,12 +66,15 @@ impl Client {
         self.missed_requests_count += 1;
     }
 
+    #[instrument(skip(self))]
     async fn lookup_socket_v6(
         &self,
         name: &service::Name,
     ) -> Result<HashMap<backend::Name, BackendRecord>, anyhow::Error> {
         // Look up all the SRV records for this particular name.
         let srv = self.resolver.srv_lookup(&name.0).await?;
+        event!(Level::DEBUG, srv = ?srv, "Successfully looked up SRV record");
+
         let futures = std::iter::repeat(self.resolver.clone())
             .zip(srv.into_iter())
             .map(|(resolver, srv)| async move {
@@ -87,6 +93,7 @@ impl Client {
             .into_iter()
             .flat_map(move |target| match target {
                 Ok((target, aaaa, port)) => {
+                    event!(Level::DEBUG, aaaa = ?aaaa, "Successfully looked up AAAA record");
                     let expires_at = match self.hardcoded_ttl {
                         Some(duration) => Instant::now().checked_add(duration),
                         None => Some(aaaa.valid_until()),

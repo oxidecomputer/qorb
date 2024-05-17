@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::interval;
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::StreamMap;
-use tracing::{instrument, span, Level};
+use tracing::{event, instrument, span, Level};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -81,6 +81,7 @@ impl<Conn: Connection> PoolInner<Conn> {
     // the resolver.
     //
     // Returns the newly added backends, if any.
+    #[instrument(skip(self))]
     fn handle_resolve_event(
         &mut self,
         event: resolver::Event,
@@ -179,7 +180,8 @@ impl<Conn: Connection> PoolInner<Conn> {
                     self.rebalance().await;
                 }
                 // If any of the slots change state, update their allocations.
-                Some((_name, _status)) = &mut backend_status_stream.next(), if !backend_status_stream.is_empty() => {
+                Some((name, _status)) = &mut backend_status_stream.next(), if !backend_status_stream.is_empty() => {
+                    event!(Level::DEBUG, name = ?name, "Backend just came online");
                     rebalance_interval.reset();
                     self.rebalance().await;
                 },
@@ -187,12 +189,14 @@ impl<Conn: Connection> PoolInner<Conn> {
         }
     }
 
+    #[instrument(skip(self))]
     async fn rebalance(&mut self) {
         let mut questionable_backend_count = 0;
         let mut usable_backends = vec![];
 
         // Pass 1: Limit spares from backends that might not be functioning
-        while let Some((name, slot_set)) = self.slots.iter_mut().next() {
+        let mut iter = self.slots.iter_mut();
+        while let Some((name, slot_set)) = iter.next() {
             match slot_set.get_state() {
                 slot::SetState::Offline => {
                     let _ = slot_set.set_wanted_count(1).await;
@@ -203,6 +207,13 @@ impl<Conn: Connection> PoolInner<Conn> {
                 }
             }
         }
+
+        if usable_backends.is_empty() {
+            event!(Level::DEBUG, "No observed usable backends");
+            return;
+        }
+
+        event!(Level::DEBUG, backends = ?usable_backends, "Observed usable backends");
 
         // Each "questionable" backend uses one slot. Among the remaining
         // backends, attempt to evenly distribute all wanted slots.
@@ -221,11 +232,12 @@ impl<Conn: Connection> PoolInner<Conn> {
             let _ = slot_set.set_wanted_count(slots_wanted_per_backend).await;
         }
 
-        let iter = std::mem::take(&mut self.priority_list).into_iter();
         let mut new_priority_list = PriorityList::new();
+        let iter = std::mem::take(&mut self.priority_list).into_iter();
         for std::cmp::Reverse(mut weighted_backend) in iter {
             // If the backend no longer exists, drop it from the priority list.
             let Some(slot) = self.slots.get(&weighted_backend.value) else {
+                event!(Level::DEBUG, backend = ?weighted_backend.value, "Dropping backend");
                 continue;
             };
 
@@ -235,6 +247,13 @@ impl<Conn: Connection> PoolInner<Conn> {
 
             // TODO: Is this randomness actually necessary?
             rebalancer::add_random_jitter(&mut weighted_backend);
+
+            event!(
+                Level::DEBUG,
+                backend = ?weighted_backend.value,
+                score = ?weighted_backend.score,
+                "Rebalancing backend with score (lower preferred)"
+            );
             new_priority_list.push(weighted_backend);
         }
         self.priority_list = new_priority_list;
@@ -251,6 +270,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             // priority list before returning, but we don't want to
             // re-consider the same backend twice for this request.
             let Some(mut weighted_backend) = self.priority_list.pop() else {
+                event!(Level::DEBUG, "No backends left to consider");
                 break;
             };
 
@@ -261,6 +281,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             // This will also happen when we periodically rebalance
             // the priority list.
             let Some(set) = self.slots.get_mut(&weighted_backend.value) else {
+                event!(Level::DEBUG, "Saw backend in priority list without set");
                 continue;
             };
 
@@ -269,6 +290,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             // Either way, put this backend back in the priority list after
             // we're done with it.
             let Ok(claim) = set.claim().await else {
+                event!(Level::DEBUG, "Failed to actually get claim for backend");
                 rebalancer::claimed_err(&mut weighted_backend);
                 attempted_backend.push(weighted_backend);
                 continue;

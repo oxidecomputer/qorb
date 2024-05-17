@@ -7,7 +7,7 @@ async fn main() {
     let args: Vec<String> = env::args().collect();
 
     let bind_address = if args.len() == 1 {
-        "127.0.0.1:0"
+        "[::1]:0"
     } else if args.len() == 2 {
         &args[1]
     } else {

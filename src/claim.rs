@@ -9,9 +9,6 @@ pub struct Handle<Conn: Connection> {
     permit: Option<OwnedPermit<BorrowedConnection<Conn>>>,
 }
 
-// TODO: Should this impl deref?
-//
-// The handle basically wants to be treated like a Connection.
 impl<Conn: Connection> Handle<Conn> {
     pub(crate) fn new(
         conn: BorrowedConnection<Conn>,
@@ -22,9 +19,24 @@ impl<Conn: Connection> Handle<Conn> {
             permit: Some(permit),
         }
     }
+}
 
-    pub fn connection(&self) -> &Conn {
+impl<Conn> std::ops::Deref for Handle<Conn>
+where
+    Conn: Send + 'static,
+{
+    type Target = Conn;
+    fn deref(&self) -> &Self::Target {
         self.inner.as_ref().map(|inner| &inner.conn).unwrap()
+    }
+}
+
+impl<Conn> std::ops::DerefMut for Handle<Conn>
+where
+    Conn: Send + 'static,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.as_mut().map(|inner| &mut inner.conn).unwrap()
     }
 }
 

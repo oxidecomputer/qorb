@@ -1,0 +1,16 @@
+@   IN          SOA     test.com. root.test.com. (
+                                199609203 ; Serial
+                                8h        ; Refresh
+                                120m      ; Retry
+                                7d        ; Expire
+                                24h)      ; Minimum TTL
+
+; name                ttl  class  rr     ipv6
+echo001                    IN     AAAA   ::1
+echo002                    IN     AAAA   ::1
+echo003                    IN     AAAA   ::1
+
+; name                ttl  class  rr    Priority Weight Port   Target
+_echo._tcp.test.com.       IN     SRV   1        1      33483  echo001
+_echo._tcp.test.com.       IN     SRV   1        1      35937  echo002
+_echo._tcp.test.com.       IN     SRV   1        1      34431  echo003

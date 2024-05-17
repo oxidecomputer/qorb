@@ -1,0 +1,24 @@
+
+
+[source, bash]
+----
+# Install a working, out-of-the-box, DNS server
+cargo install hickory-dns
+
+# Start an echo server
+cargo run --example tcp_echo_server
+
+# Update 'examples/dns_server/test.com.zone' to reference the echo server
+# which was just created.
+
+# Start a DNS server, referencing the echo server
+hickory-dns -c examples/dns_server/config.toml -z examples/dns_server -p <PORT>
+
+# Confirm your DNS server is working
+dig -6 @::1 -p 1234  _echo._tcp.test.com  -t SRV
+
+# Run a connection pool, which uses the DNS server to find the echo servers.
+cargo run --example tcp_echo_workload
+----
+
+
