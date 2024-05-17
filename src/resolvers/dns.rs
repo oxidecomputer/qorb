@@ -218,11 +218,11 @@ impl DnsResolver {
                             first_result.lock().unwrap().get_or_insert(backends);
                         }
                         Ok(Err(err)) => {
-                            eprintln!("DNS request failed: {err}");
+                            event!(Level::ERROR, err = ?err, "DNS request failed");
                             client.mark_error();
                         }
                         Err(err) => {
-                            eprintln!("DNS request timed out: {err}");
+                            event!(Level::ERROR, err = ?err, "DNS request timed out");
                             client.mark_error();
                         }
                     }
@@ -298,6 +298,7 @@ impl DnsResolver {
 #[async_trait]
 impl Resolver for DnsResolver {
     async fn step(&mut self) -> Vec<resolver::Event> {
+        // TODO: I'm pretty sure this is getting dropped?
         let mut query_interval = tokio::time::interval(self.config.query_interval);
         loop {
             let next_tick = query_interval.tick();

@@ -1,5 +1,5 @@
 use crate::backend::Connection;
-use crate::backend::{Backend, SharedConnector};
+use crate::backend::{self, Backend, SharedConnector};
 use crate::backoff::ExponentialBackoff;
 use crate::claim;
 use crate::policy::SetConfig;
@@ -311,6 +311,7 @@ enum SetRequest<Conn: Connection> {
 
 // Owns and runs work on behalf of a [Set].
 struct SetWorker<Conn: Connection> {
+    name: backend::Name,
     backend: Backend,
     config: SetConfig,
 
@@ -347,6 +348,7 @@ struct SetWorker<Conn: Connection> {
 
 impl<Conn: Connection> SetWorker<Conn> {
     fn new(
+        name: backend::Name,
         rx: mpsc::Receiver<SetRequest<Conn>>,
         status_tx: watch::Sender<SetState>,
         config: SetConfig,
@@ -358,6 +360,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     ) -> Self {
         let (slot_tx, slot_rx) = mpsc::channel(config.max_count);
         let mut set = Self {
+            name,
             backend,
             config,
             wanted_count,
@@ -613,7 +616,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         }
     }
 
-    #[instrument(level = "trace", skip(self), err)]
+    #[instrument(level = "trace", skip(self), err, name = "SetWorker::claim")]
     fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         // Before we vend out the slot's connection to a client, make sure that
         // we have space to take it back once they're done with it.
@@ -632,7 +635,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         Ok(handle)
     }
 
-    #[instrument(level = "trace", skip(self), name = "SetWorker::run")]
+    #[instrument(level = "trace", skip(self), name = "SetWorker::run", fields(name = ?self.name))]
     async fn run(&mut self) {
         loop {
             tokio::select! {
@@ -696,6 +699,7 @@ impl<Conn: Connection> Set<Conn> {
     pub(crate) fn new(
         config: SetConfig,
         wanted_count: usize,
+        name: backend::Name,
         backend: Backend,
         backend_connector: SharedConnector<Conn>,
     ) -> Self {
@@ -709,6 +713,7 @@ impl<Conn: Connection> Set<Conn> {
             let failure_window = failure_window.clone();
             async move {
                 let mut worker = SetWorker::new(
+                    name,
                     rx,
                     status_tx,
                     config,
@@ -740,7 +745,7 @@ impl<Conn: Connection> Set<Conn> {
     }
 
     /// Returns the last-known [SetState].
-    #[instrument(skip(self), ret, name = "Set::get_state")]
+    #[instrument(level = "trace", skip(self), ret, name = "Set::get_state")]
     pub(crate) fn get_state(&self) -> SetState {
         *self.status_rx.borrow()
     }
@@ -777,7 +782,7 @@ impl<Conn: Connection> Set<Conn> {
     /// Returns the number of failures encountered over a window of time.
     ///
     /// This acts as a proxy for backend health.
-    #[instrument(skip(self), ret, name = "Set::failure_count")]
+    #[instrument(level = "trace", skip(self), ret, name = "Set::failure_count")]
     pub(crate) fn failure_count(&self) -> usize {
         self.failure_window.sum()
     }

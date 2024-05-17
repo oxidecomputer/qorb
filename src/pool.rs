@@ -121,6 +121,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                         let set = slot::Set::new(
                             self.policy.set_config.clone(),
                             initial_slot_count,
+                            name.clone(),
                             backend.clone(),
                             self.backend_connector.clone(),
                         );

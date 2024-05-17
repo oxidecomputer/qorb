@@ -24,21 +24,7 @@ listen_addrs_ipv6 = ["::1"]
 ## listen_port: port on which to list, default 53
 # listen_port = 53
 
-# port on which to listen, default 853 (should not be 53)
-# tls_listen_port = 853
-
-## directory: path on the host filesystem to where zone files are stored.
-# directory = "/var/named"
-
-## Default zones, these should be present on all nameservers, except in rare
-##  configuration cases
 [[zones]]
-zone = "localhost"
-zone_type = "Primary"
-file = "localhost.zone"
-
-[[zones]]
-## zone: this is the ORIGIN of the zone, aka the base name, '.' is implied on the end
 zone = "test.com"
 zone_type = "Primary"
 file = "test.com.zone"
