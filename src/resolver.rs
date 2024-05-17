@@ -2,8 +2,10 @@
 
 use crate::backend::{self, Backend};
 
-use async_trait::async_trait;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::watch;
 
 #[derive(Error, Clone, Debug)]
 pub enum Error {}
@@ -18,16 +20,18 @@ pub enum Event {
     Removed(Vec<backend::Name>),
 }
 
+pub type AllBackends = Arc<BTreeMap<backend::Name, Backend>>;
+
 /// Translates a service name into a set of backends.
 ///
 /// The resolver is responsible for knowing which [crate::service::Name]
 /// it is resolving. It is responsible for reporting the set of
 /// all possible backends, but not reporting nor tracking their health.
-#[async_trait]
 pub trait Resolver: Send + Sync {
-    /// Monitors for new backends, and returns information about the health
-    /// of the resolver.
-    async fn step(&mut self) -> Vec<Event>;
+    /// Start running a resolver.
+    ///
+    /// Returns a receiver to track ongoing activity.
+    fn monitor(&mut self) -> watch::Receiver<AllBackends>;
 }
 
 /// Helper type for anything that implements the Resolver interface.

@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::interval;
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::StreamMap;
-use tracing::{event, instrument, span, Level};
+use tracing::{event, instrument, Level};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -84,59 +84,57 @@ impl<Conn: Connection> PoolInner<Conn> {
     #[instrument(skip(self), target = "qorb::pool::PoolInner::handle_resolve_event")]
     fn handle_resolve_event(
         &mut self,
-        event: resolver::Event,
+        all_backends: resolver::AllBackends,
     ) -> Vec<(backend::Name, watch::Receiver<slot::SetState>)> {
-        use resolver::Event::*;
-
         let mut new_backends = vec![];
-        match event {
-            Added(backends) => {
-                let _span = span!(Level::TRACE, "Adding slots for backends").entered();
-                if backends.is_empty() {
-                    return vec![];
-                }
 
-                // Gather information from all backends to make sure we don't provision
-                // more slots than the maximum indicated by our policy.
-                let stats = self.stats_summary();
-                let mut slots_left = self.policy.max_slots.saturating_sub(stats.all_slots());
+        // Gather information from all backends to make sure we don't provision
+        // more slots than the maximum indicated by our policy.
+        let stats = self.stats_summary();
+        let mut slots_left = self.policy.max_slots.saturating_sub(stats.all_slots());
 
-                for (name, backend) in backends {
-                    let _slot_set = self.slots.entry(name.clone()).or_insert_with(|| {
-                        self.priority_list
-                            .push(rebalancer::new_backend(name.clone()));
+        // Add all new backends first
+        for (name, backend) in all_backends.iter() {
+            let std::collections::hash_map::Entry::Vacant(entry) = self.slots.entry(name.clone())
+            else {
+                continue;
+            };
+            self.priority_list
+                .push(rebalancer::new_backend(name.clone()));
 
-                        // If we provision zero slots: We'll provision one later during
-                        // rebalancing, if we can.
-                        //
-                        // If we provision one slot: Once it connects, and the backend looks
-                        // viable, we'll provision more slots, if we can.
-                        let initial_slot_count = if slots_left > 0 {
-                            slots_left -= 1;
-                            1
-                        } else {
-                            0
-                        };
+            // If we provision zero slots: We'll provision one later during
+            // rebalancing, if we can.
+            //
+            // If we provision one slot: Once it connects, and the backend looks
+            // viable, we'll provision more slots, if we can.
+            let initial_slot_count = if slots_left > 0 {
+                slots_left -= 1;
+                1
+            } else {
+                0
+            };
 
-                        let set = slot::Set::new(
-                            self.policy.set_config.clone(),
-                            initial_slot_count,
-                            name.clone(),
-                            backend.clone(),
-                            self.backend_connector.clone(),
-                        );
-                        new_backends.push((name, set.monitor()));
-                        set
-                    });
-                }
+            let set = slot::Set::new(
+                self.policy.set_config.clone(),
+                initial_slot_count,
+                name.clone(),
+                backend.clone(),
+                self.backend_connector.clone(),
+            );
+            new_backends.push((name.clone(), set.monitor()));
+            entry.insert(set);
+        }
+
+        let mut to_remove = vec![];
+        for name in self.slots.keys() {
+            if !all_backends.contains_key(&name) {
+                to_remove.push(name.clone());
             }
-            Removed(backend_names) => {
-                let _span = span!(Level::TRACE, "Removing slots for backends").entered();
-                for name in backend_names {
-                    self.slots.remove(&name);
-                }
-            }
-        };
+        }
+
+        for name in &to_remove {
+            self.slots.remove(&name);
+        }
 
         new_backends
     }
@@ -147,6 +145,7 @@ impl<Conn: Connection> PoolInner<Conn> {
 
         let mut new_backends = vec![];
         let mut backend_status_stream = StreamMap::new();
+        let mut resolver_stream = WatchStream::new(self.resolver.monitor());
         loop {
             tokio::select! {
                 // Handle requests from clients
@@ -160,13 +159,11 @@ impl<Conn: Connection> PoolInner<Conn> {
                     }
                 }
                 // Handle updates from the resolver
-                // TODO: Do we want this to just happen in a bg task?
-                events = self.resolver.step() => {
+                Some(all_backends) = resolver_stream.next() => {
+                    event!(Level::INFO, "Resolver updated known backends");
                     // Update the set of backends we know about,
                     // and gather the list of all "new" backends.
-                    for event in events {
-                        new_backends.extend(self.handle_resolve_event(event));
-                    }
+                    new_backends.extend(self.handle_resolve_event(all_backends));
 
                     // Monitor all the new backends for changes
                     for (name, receiver) in new_backends.drain(..) {

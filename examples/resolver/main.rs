@@ -1,13 +1,11 @@
 use std::io::{self, stdout};
 
-use async_trait::async_trait;
 use crossterm::{
     event::{self, Event, KeyCode},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
 use qorb::backend;
-use qorb::resolver::{self, Resolver};
 use ratatui::{prelude::*, widgets::*};
 use std::collections::BTreeSet;
 
@@ -240,39 +238,6 @@ impl App {
                 self.backends.remove(&backend);
             }
         }
-    }
-}
-
-#[async_trait]
-impl Resolver for App {
-    async fn step(&mut self) -> Vec<resolver::Event> {
-        let mut events = vec![];
-        if !self.added_backends.is_empty() {
-            events.push(resolver::Event::Added(
-                self.added_backends
-                    .iter()
-                    .map(|backend| (backend::Name(backend.address.to_string()), backend.clone()))
-                    .collect(),
-            ));
-        }
-        for b in &self.added_backends {
-            self.backends.insert(b.clone());
-        }
-        self.added_backends.clear();
-
-        if !self.removed_backends.is_empty() {
-            events.push(resolver::Event::Removed(
-                self.removed_backends
-                    .iter()
-                    .map(|backend| backend::Name(backend.address.to_string()))
-                    .collect(),
-            ));
-        }
-        for b in &self.removed_backends {
-            self.backends.remove(&b);
-        }
-        self.removed_backends.clear();
-        events
     }
 }
 
