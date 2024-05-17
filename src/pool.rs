@@ -11,6 +11,10 @@ use crate::slot;
 
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::interval;
@@ -39,6 +43,9 @@ enum Request<Conn: Connection> {
     },
 }
 
+#[derive(Clone)]
+pub(crate) struct SerializeStats(pub(crate) Arc<Mutex<slot::Stats>>);
+
 struct PoolInner<Conn: Connection> {
     backend_connector: backend::SharedConnector<Conn>,
 
@@ -47,6 +54,7 @@ struct PoolInner<Conn: Connection> {
     priority_list: PriorityList<backend::Name>,
 
     policy: Policy,
+    stats_tx: watch::Sender<HashMap<backend::Name, SerializeStats>>,
 
     rx: mpsc::Receiver<Request<Conn>>,
 }
@@ -57,6 +65,7 @@ impl<Conn: Connection> PoolInner<Conn> {
         backend_connector: backend::SharedConnector<Conn>,
         policy: Policy,
         rx: mpsc::Receiver<Request<Conn>>,
+        stats_tx: watch::Sender<HashMap<backend::Name, SerializeStats>>,
     ) -> Self {
         Self {
             backend_connector,
@@ -64,6 +73,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             slots: HashMap::new(),
             priority_list: PriorityList::new(),
             policy,
+            stats_tx,
             rx,
         }
     }
@@ -100,7 +110,6 @@ impl<Conn: Connection> PoolInner<Conn> {
                 // more slots than the maximum indicated by our policy.
                 let stats = self.stats_summary();
                 let mut slots_left = self.policy.max_slots.saturating_sub(stats.all_slots());
-
                 for (name, backend) in backends {
                     let _slot_set = self.slots.entry(name.clone()).or_insert_with(|| {
                         self.priority_list
@@ -125,6 +134,10 @@ impl<Conn: Connection> PoolInner<Conn> {
                             backend.clone(),
                             self.backend_connector.clone(),
                         );
+
+                        self.stats_tx.send_modify(|map| {
+                            map.insert(name.clone(), SerializeStats(set.stats.clone()));
+                        });
                         new_backends.push((name, set.monitor()));
                         set
                     });
@@ -134,6 +147,8 @@ impl<Conn: Connection> PoolInner<Conn> {
                 let _span = span!(Level::TRACE, "Removing slots for backends").entered();
                 for name in backend_names {
                     self.slots.remove(&name);
+                    self.stats_tx
+                        .send_if_modified(|stats| stats.remove(&name).is_some());
                 }
             }
         };
@@ -312,6 +327,13 @@ impl<Conn: Connection> PoolInner<Conn> {
 pub struct Pool<Conn: Connection> {
     handle: tokio::task::JoinHandle<()>,
     tx: mpsc::Sender<Request<Conn>>,
+    stats: Stats,
+}
+
+#[derive(Clone)]
+pub struct Stats {
+    pub(crate) rx: watch::Receiver<HashMap<backend::Name, SerializeStats>>,
+    pub(crate) claims: Arc<AtomicUsize>,
 }
 
 impl<Conn: Connection + Send + 'static> Pool<Conn> {
@@ -327,13 +349,24 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
         policy: Policy,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1);
-
+        let (stats_tx, stats_rx) = watch::channel(HashMap::default());
         let handle = tokio::task::spawn(async move {
-            let worker = PoolInner::new(resolver, backend_connector, policy, rx);
+            let worker = PoolInner::new(resolver, backend_connector, policy, rx, stats_tx);
             worker.run().await;
         });
 
-        Self { handle, tx }
+        Self {
+            handle,
+            tx,
+            stats: Stats {
+                rx: stats_rx,
+                claims: Arc::new(AtomicUsize::new(0)),
+            },
+        }
+    }
+
+    pub fn stats(&self) -> &Stats {
+        &self.stats
     }
 
     /// Acquires a handle to a connection within the connection pool.
@@ -345,7 +378,9 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
             .send(Request::Claim { tx })
             .await
             .map_err(|_| Error::Terminated)?;
-        rx.await.map_err(|_| Error::Terminated)?
+        let claim = rx.await.map_err(|_| Error::Terminated)?;
+        self.stats.claims.fetch_add(1, Ordering::Relaxed);
+        claim
     }
 }
 

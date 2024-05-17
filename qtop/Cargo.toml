@@ -1,0 +1,23 @@
+[package]
+name = "qtop"
+version = "0.0.0"
+edition = "2021"
+description = "qorbtop"
+license = "MPL-2.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "qtop"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"]}
+crossterm = { workspace = true }
+http = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"]}
+serde_json = { workspace = true }
+ratatui = { workspace = true }
+tokio = { workspace = true, features = ["macros", "full"]}
+tokio-tungstenite = { workspace = true }

@@ -253,6 +253,7 @@ impl<Conn: Connection> BorrowedConnection<Conn> {
 
 /// Describes the state of connections to this backend.
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub(crate) struct Stats {
     pub(crate) connecting_slots: usize,
     pub(crate) unclaimed_slots: usize,
@@ -715,7 +716,7 @@ pub(crate) struct Set<Conn: Connection> {
     status_rx: watch::Receiver<SetState>,
 
     name: backend::Name,
-    stats: Arc<Mutex<Stats>>,
+    pub(crate) stats: Arc<Mutex<Stats>>,
     failure_window: Arc<WindowedCounter>,
 
     handle: JoinHandle<()>,
