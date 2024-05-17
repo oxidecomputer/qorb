@@ -259,6 +259,7 @@ pub(crate) struct Stats {
     pub(crate) unclaimed_slots: usize,
     pub(crate) checking_slots: usize,
     pub(crate) claimed_slots: usize,
+    pub(crate) total_claims: usize,
 }
 
 impl std::ops::Add for Stats {
@@ -269,6 +270,7 @@ impl std::ops::Add for Stats {
             unclaimed_slots: self.unclaimed_slots + other.unclaimed_slots,
             checking_slots: self.checking_slots + other.checking_slots,
             claimed_slots: self.claimed_slots + other.claimed_slots,
+            total_claims: self.total_claims + other.total_claims,
         }
     }
 }
@@ -289,7 +291,10 @@ impl Stats {
             State::Connecting => self.connecting_slots += 1,
             State::ConnectedUnclaimed(_) => self.unclaimed_slots += 1,
             State::ConnectedChecking => self.checking_slots += 1,
-            State::ConnectedClaimed => self.claimed_slots += 1,
+            State::ConnectedClaimed => {
+                self.claimed_slots += 1;
+                self.total_claims += 1;
+            }
             State::Terminated => (),
         };
     }

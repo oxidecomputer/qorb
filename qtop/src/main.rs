@@ -7,6 +7,7 @@ use crossterm::{
 };
 use futures::stream::StreamExt;
 use ratatui::{prelude::*, widgets::*};
+use std::collections::HashMap;
 use tokio_tungstenite::tungstenite;
 
 #[derive(Debug, Clone, Parser)]
@@ -30,10 +31,11 @@ struct SetStats {
     unclaimed_slots: usize,
     checking_slots: usize,
     claimed_slots: usize,
+    total_claims: usize,
 }
 
 impl Update {
-    fn render(self, frame: &mut Frame, uri: &http::Uri) {
+    fn render(self, frame: &mut Frame, uri: &http::Uri, total_claims: &mut HashMap<String, usize>) {
         let main_layout = Layout::new(
             Direction::Vertical,
             [
@@ -44,14 +46,20 @@ impl Update {
         )
         .split(frame.size());
         const NAME: &str = "NAME";
+        const CPS: &str = "CLAIMS/s";
         const CONNECTING: &str = "CONNECTING";
         const UNCLAIMED: &str = "UNCLAIMED";
         const CLAIMED: &str = "CLAIMED";
         const CHECKING: &str = "CHECKING";
+        const TOTAL: &str = "TOTAL";
+
         let longest_name = self.sets.keys().map(String::len).max().unwrap_or(0);
         let rows = self.sets.iter().map(|(name, stats)| {
+            let claims_sec = stats.total_claims - total_claims.get(name).unwrap_or(&0);
+            total_claims.insert(name.clone(), stats.total_claims);
             Row::new(vec![
                 Cell::from(name.clone()),
+                Cell::from(Text::from(claims_sec.to_string()).alignment(Alignment::Right)),
                 Cell::from(
                     Text::from(stats.connecting_slots.to_string()).alignment(Alignment::Right),
                 ),
@@ -62,16 +70,19 @@ impl Update {
                     Text::from(stats.checking_slots.to_string()).alignment(Alignment::Right),
                 ),
                 Cell::from(Text::from(stats.claimed_slots.to_string()).alignment(Alignment::Right)),
+                Cell::from(Text::from(stats.total_claims.to_string()).alignment(Alignment::Right)),
             ])
         });
         let table = Table::new(
             rows,
             [
                 Constraint::Min(longest_name as u16),
+                Constraint::Length(CPS.len() as u16),
                 Constraint::Length(CONNECTING.len() as u16),
                 Constraint::Length(UNCLAIMED.len() as u16),
                 Constraint::Length(CHECKING.len() as u16),
                 Constraint::Length(CLAIMED.len() as u16),
+                Constraint::Length(TOTAL.len() as u16),
             ],
         )
         .block(Block::default().borders(Borders::ALL).title(
@@ -80,10 +91,12 @@ impl Update {
         .header(
             Row::new(vec![
                 Cell::from(NAME),
-                Cell::from(CONNECTING),
-                Cell::from(UNCLAIMED),
-                Cell::from(CHECKING),
-                Cell::from(CLAIMED),
+                Cell::from(Text::from(CPS).alignment(Alignment::Right)),
+                Cell::from(Text::from(CONNECTING).alignment(Alignment::Right)),
+                Cell::from(Text::from(UNCLAIMED).alignment(Alignment::Right)),
+                Cell::from(Text::from(CHECKING).alignment(Alignment::Right)),
+                Cell::from(Text::from(CLAIMED).alignment(Alignment::Right)),
+                Cell::from(Text::from(TOTAL).alignment(Alignment::Right)),
             ])
             .set_style(Style::default().bold()),
         );
@@ -99,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
+    let mut total_claims = HashMap::new();
     while let Some(wsmsg) = ws.next().await {
         let stats: Update = match wsmsg? {
             tungstenite::Message::Text(txt) => serde_json::from_str(&txt)?,
@@ -109,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
             }
             _ => continue,
         };
-        terminal.draw(|f| stats.render(f, &args.url))?;
+        terminal.draw(|f| stats.render(f, &args.url, &mut total_claims))?;
     }
 
     stdout().execute(LeaveAlternateScreen)?;
