@@ -179,7 +179,11 @@ impl<Conn: Connection> Slot<Conn> {
         }
     }
 
-    #[instrument(level = "trace", skip(self, connector))]
+    #[instrument(
+        level = "trace",
+        skip(self, connector),
+        target = "qorb::slot::Slot::validate_health_if_connected"
+    )]
     async fn validate_health_if_connected(
         &self,
         connector: &SharedConnector<Conn>,
@@ -503,7 +507,15 @@ impl<Conn: Connection> SetWorker<Conn> {
     }
 
     // Takes back borrowed slots from clients who dropped their claim handles.
-    #[instrument(level = "trace", skip(self, borrowed_conn), fields(slot_id = borrowed_conn.id))]
+    #[instrument(
+        level = "trace",
+        skip(self, borrowed_conn),
+        fields(
+            slot_id = borrowed_conn.id,
+            name = ?self.name,
+        ),
+        target = "qorb::slot::SetWorker::recycle_connection"
+    )]
     fn recycle_connection(&mut self, borrowed_conn: BorrowedConnection<Conn>) {
         let slot_id = borrowed_conn.id;
         let slot = self
@@ -538,7 +550,15 @@ impl<Conn: Connection> SetWorker<Conn> {
     }
 
     // Makes the number of slots as close to "desired_count" as we can get.
-    #[instrument(level = "trace", skip(self), fields(wanted_count = self.wanted_count))]
+    #[instrument(
+        level = "trace",
+        skip(self),
+        fields(
+            wanted_count = self.wanted_count,
+            name = ?self.name,
+        ),
+        target = "qorb::slot::SetWorker::conform_slot_count"
+    )]
     fn conform_slot_count(&mut self) {
         let desired = self.wanted_count;
 
@@ -616,7 +636,13 @@ impl<Conn: Connection> SetWorker<Conn> {
         }
     }
 
-    #[instrument(level = "trace", skip(self), err, name = "SetWorker::claim")]
+    #[instrument(
+        level = "trace",
+        skip(self),
+        err,
+        target = "qorb::slot::SetWorker::claim",
+        fields(name = ?self.name),
+    )]
     fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         // Before we vend out the slot's connection to a client, make sure that
         // we have space to take it back once they're done with it.
@@ -635,7 +661,12 @@ impl<Conn: Connection> SetWorker<Conn> {
         Ok(handle)
     }
 
-    #[instrument(level = "trace", skip(self), name = "SetWorker::run", fields(name = ?self.name))]
+    #[instrument(
+        level = "trace",
+        skip(self),
+        fields(name = ?self.name),
+        target = "qorb::slot::SetWorker::run"
+    )]
     async fn run(&mut self) {
         loop {
             tokio::select! {
@@ -683,6 +714,7 @@ pub(crate) struct Set<Conn: Connection> {
     tx: mpsc::Sender<SetRequest<Conn>>,
     status_rx: watch::Receiver<SetState>,
 
+    name: backend::Name,
     stats: Arc<Mutex<Stats>>,
     failure_window: Arc<WindowedCounter>,
 
@@ -711,6 +743,7 @@ impl<Conn: Connection> Set<Conn> {
         let handle = tokio::task::spawn({
             let stats = stats.clone();
             let failure_window = failure_window.clone();
+            let name = name.clone();
             async move {
                 let mut worker = SetWorker::new(
                     name,
@@ -730,6 +763,7 @@ impl<Conn: Connection> Set<Conn> {
         Self {
             tx,
             status_rx,
+            name,
             stats,
             failure_window,
             handle,
@@ -739,13 +773,23 @@ impl<Conn: Connection> Set<Conn> {
     /// Returns a [tokio::mpsc::watch::Receiver] emitting the last-known [SetState].
     ///
     /// This provides an interface for the pool to use to monitor slot health.
-    #[instrument(skip(self), name = "Set::monitor")]
+    #[instrument(
+        skip(self),
+        target = "qorb::slot::Set::monitor",
+        fields(name = ?self.name),
+    )]
     pub(crate) fn monitor(&self) -> watch::Receiver<SetState> {
         self.status_rx.clone()
     }
 
     /// Returns the last-known [SetState].
-    #[instrument(level = "trace", skip(self), ret, name = "Set::get_state")]
+    #[instrument(
+        level = "trace",
+        skip(self),
+        ret,
+        target = "qorb::slot::Set::get_state"
+        fields(name = ?self.name),
+    )]
     pub(crate) fn get_state(&self) -> SetState {
         *self.status_rx.borrow()
     }
@@ -753,7 +797,11 @@ impl<Conn: Connection> Set<Conn> {
     /// Returns a claim from the slot set, if one is connected.
     ///
     /// If no unclaimed slots are connected, an error is returned.
-    #[instrument(skip(self), name = "Set::claim")]
+    #[instrument(
+        skip(self),
+        target = "qorb::slot::Set::claim",
+        fields(name = ?self.name),
+    )]
     pub(crate) async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
 
@@ -770,7 +818,11 @@ impl<Conn: Connection> Set<Conn> {
     /// This will eventually update the number of slots being used by the slot
     /// set, though it may take a moment to propagate if many slots are
     /// currently claimed by clients.
-    #[instrument(skip(self), name = "Set::set_wanted_count")]
+    #[instrument(
+        skip(self),
+        target = "qorb::slot::Set::set_wanted_count",
+        fields(name = ?self.name),
+    )]
     pub(crate) async fn set_wanted_count(&mut self, count: usize) -> Result<(), Error> {
         self.tx
             .send(SetRequest::SetWantedCount { count })
@@ -782,7 +834,13 @@ impl<Conn: Connection> Set<Conn> {
     /// Returns the number of failures encountered over a window of time.
     ///
     /// This acts as a proxy for backend health.
-    #[instrument(level = "trace", skip(self), ret, name = "Set::failure_count")]
+    #[instrument(
+        level = "trace",
+        skip(self),
+        ret,
+        target = "qorb::slot::Set::failure_count",
+        fields(name = ?self.name),
+    )]
     pub(crate) fn failure_count(&self) -> usize {
         self.failure_window.sum()
     }
@@ -792,7 +850,12 @@ impl<Conn: Connection> Set<Conn> {
     ///
     /// Calling this function is racy, so its usage is recommended only for
     /// test environments and approximate heuristics.
-    #[instrument(skip(self), ret, name = "Set::get_stats")]
+    #[instrument(
+        skip(self),
+        ret,
+        target = "qorb::slot::Set::get_stats",
+        fields(name = ?self.name),
+    )]
     pub(crate) fn get_stats(&self) -> Stats {
         self.stats.lock().unwrap().clone()
     }
@@ -877,6 +940,7 @@ mod test {
         let mut set = Set::new(
             SetConfig::default(),
             5,
+            backend::Name("Test set".to_string()),
             backend::Backend { address: BACKEND },
             Arc::new(TestConnector::new()),
         );
@@ -901,6 +965,7 @@ mod test {
         let mut set = Set::new(
             SetConfig::default(),
             3,
+            backend::Name("Test set".to_string()),
             backend::Backend { address: BACKEND },
             Arc::new(TestConnector::new()),
         );
@@ -943,6 +1008,7 @@ mod test {
         let mut set = Set::new(
             SetConfig::default(),
             0,
+            backend::Name("Test set".to_string()),
             backend::Backend { address: BACKEND },
             Arc::new(TestConnector::new()),
         );
@@ -973,6 +1039,7 @@ mod test {
         let mut set = Set::new(
             SetConfig::default(),
             3,
+            backend::Name("Test set".to_string()),
             backend::Backend { address: BACKEND },
             Arc::new(TestConnector::new()),
         );
@@ -1032,6 +1099,7 @@ mod test {
                 ..Default::default()
             },
             3,
+            backend::Name("Test set".to_string()),
             backend::Backend { address: BACKEND },
             connector.clone(),
         );

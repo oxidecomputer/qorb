@@ -66,7 +66,7 @@ impl Client {
         self.missed_requests_count += 1;
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), target = "qorb::resolvers::dns::Client::lookup_socket_v6")]
     async fn lookup_socket_v6(
         &self,
         name: &service::Name,

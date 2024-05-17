@@ -81,7 +81,7 @@ impl<Conn: Connection> PoolInner<Conn> {
     // the resolver.
     //
     // Returns the newly added backends, if any.
-    #[instrument(skip(self))]
+    #[instrument(skip(self), target = "qorb::pool::PoolInner::handle_resolve_event")]
     fn handle_resolve_event(
         &mut self,
         event: resolver::Event,
@@ -178,11 +178,12 @@ impl<Conn: Connection> PoolInner<Conn> {
                 }
                 // Periodically rebalance the allocation of slots to backends
                 _ = rebalance_interval.tick() => {
+                    event!(Level::INFO, "Rebalancing: timer tick");
                     self.rebalance().await;
                 }
                 // If any of the slots change state, update their allocations.
-                Some((name, _status)) = &mut backend_status_stream.next(), if !backend_status_stream.is_empty() => {
-                    event!(Level::DEBUG, name = ?name, "Backend just came online");
+                Some((name, status)) = &mut backend_status_stream.next(), if !backend_status_stream.is_empty() => {
+                    event!(Level::INFO, name = ?name, status = ?status, "Rebalancing: Backend has new status");
                     rebalance_interval.reset();
                     self.rebalance().await;
                 },
@@ -190,7 +191,7 @@ impl<Conn: Connection> PoolInner<Conn> {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), target = "qorb::pool::PoolInner::rebalance")]
     async fn rebalance(&mut self) {
         let mut questionable_backend_count = 0;
         let mut usable_backends = vec![];
@@ -260,7 +261,6 @@ impl<Conn: Connection> PoolInner<Conn> {
         self.priority_list = new_priority_list;
     }
 
-    #[instrument(skip(self), err, name = "PoolInner::claim")]
     async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
         let mut attempted_backend = vec![];
         let mut result = Err(Error::NoBackends);
@@ -320,7 +320,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     /// - resolver: Describes how backends should be found for the service.
     /// - backend_connector: Describes how the connections to a specific
     /// backend should be made.
-    #[instrument(skip(resolver, backend_connector), name = "Pool::new")]
+    #[instrument(skip(resolver, backend_connector), target = "qorb::pool::Pool::new")]
     pub fn new(
         resolver: resolver::BoxedResolver,
         backend_connector: backend::SharedConnector<Conn>,
@@ -337,7 +337,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     }
 
     /// Acquires a handle to a connection within the connection pool.
-    #[instrument(level = "debug", skip(self), err, name = "Pool::claim")]
+    #[instrument(level = "debug", skip(self), err, target = "qorb::pool::Pool::claim")]
     pub async fn claim(&self) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
 
