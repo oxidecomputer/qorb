@@ -169,7 +169,7 @@ impl<Conn: Connection> Slot<Conn> {
                     return;
                 }
                 Err(err) => {
-                    event!(Level::WARN, err = ?err, backend = ?backend, "Failed to connect");
+                    event!(Level::WARN, ?err, ?backend, "Failed to connect");
                     self.failure_window.add(1);
                     retry_duration =
                         retry_duration.exponential_backoff(config.max_connection_backoff);
@@ -182,7 +182,7 @@ impl<Conn: Connection> Slot<Conn> {
     #[instrument(
         level = "trace",
         skip(self, connector),
-        target = "qorb::slot::Slot::validate_health_if_connected"
+        name = "Slot::validate_health_if_connected"
     )]
     async fn validate_health_if_connected(
         &self,
@@ -221,7 +221,7 @@ impl<Conn: Connection> Slot<Conn> {
                 slot.state_transition(State::ConnectedUnclaimed(DebugIgnore(conn)));
             }
             Ok(Err(err)) => {
-                event!(Level::WARN, err = ?err, "Connection failed during health check");
+                event!(Level::WARN, ?err, "Connection failed during health check");
                 self.failure_window.add(1);
                 slot.state_transition(State::Connecting);
             }
@@ -410,7 +410,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                     let mut interval = interval(config.health_interval);
 
                     loop {
-                        event!(Level::TRACE, slot_id = slot_id, "Starting Slot work loop");
+                        event!(Level::TRACE, slot_id, "Starting Slot work loop");
                         enum Work {
                             DoConnect,
                             DoMonitor,
@@ -479,9 +479,9 @@ impl<Conn: Connection> SetWorker<Conn> {
     ) -> Option<claim::Handle<Conn>> {
         for (id, slot) in &mut self.slots {
             let mut slot = slot.inner.lock().unwrap();
-            event!(Level::TRACE, id = id, state = ?slot.state, "Considering slot");
+            event!(Level::TRACE, id, state = ?slot.state, "Considering slot");
             if matches!(slot.state, State::ConnectedUnclaimed(_)) {
-                event!(Level::TRACE, id = id, "Found unclaimed slot");
+                event!(Level::TRACE, id, "Found unclaimed slot");
                 // We intentionally "take the connection out" of the slot and
                 // "place it into a claim::Handle" in the same method.
                 //
@@ -514,7 +514,7 @@ impl<Conn: Connection> SetWorker<Conn> {
             slot_id = borrowed_conn.id,
             name = ?self.name,
         ),
-        target = "qorb::slot::SetWorker::recycle_connection"
+        name = "SetWorker::recycle_connection"
     )]
     fn recycle_connection(&mut self, borrowed_conn: BorrowedConnection<Conn>) {
         let slot_id = borrowed_conn.id;
@@ -557,7 +557,7 @@ impl<Conn: Connection> SetWorker<Conn> {
             wanted_count = self.wanted_count,
             name = ?self.name,
         ),
-        target = "qorb::slot::SetWorker::conform_slot_count"
+        name = "SetWorker::conform_slot_count"
     )]
     fn conform_slot_count(&mut self) {
         let desired = self.wanted_count;
@@ -640,7 +640,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         level = "trace",
         skip(self),
         err,
-        target = "qorb::slot::SetWorker::claim",
+        name = ":SetWorker::claim",
         fields(name = ?self.name),
     )]
     fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
@@ -665,7 +665,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         level = "trace",
         skip(self),
         fields(name = ?self.name),
-        target = "qorb::slot::SetWorker::run"
+        name = "SetWorker::run"
     )]
     async fn run(&mut self) {
         loop {
@@ -775,7 +775,7 @@ impl<Conn: Connection> Set<Conn> {
     /// This provides an interface for the pool to use to monitor slot health.
     #[instrument(
         skip(self),
-        target = "qorb::slot::Set::monitor",
+        name = "Set::monitor",
         fields(name = ?self.name),
     )]
     pub(crate) fn monitor(&self) -> watch::Receiver<SetState> {
@@ -787,7 +787,7 @@ impl<Conn: Connection> Set<Conn> {
         level = "trace",
         skip(self),
         ret,
-        target = "qorb::slot::Set::get_state"
+        name = "Set::get_state"
         fields(name = ?self.name),
     )]
     pub(crate) fn get_state(&self) -> SetState {
@@ -799,7 +799,7 @@ impl<Conn: Connection> Set<Conn> {
     /// If no unclaimed slots are connected, an error is returned.
     #[instrument(
         skip(self),
-        target = "qorb::slot::Set::claim",
+        name = "Set::claim",
         fields(name = ?self.name),
     )]
     pub(crate) async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
@@ -820,7 +820,7 @@ impl<Conn: Connection> Set<Conn> {
     /// currently claimed by clients.
     #[instrument(
         skip(self),
-        target = "qorb::slot::Set::set_wanted_count",
+        name = "Set::set_wanted_count",
         fields(name = ?self.name),
     )]
     pub(crate) async fn set_wanted_count(&mut self, count: usize) -> Result<(), Error> {
@@ -838,7 +838,7 @@ impl<Conn: Connection> Set<Conn> {
         level = "trace",
         skip(self),
         ret,
-        target = "qorb::slot::Set::failure_count",
+        name = "Set::failure_count",
         fields(name = ?self.name),
     )]
     pub(crate) fn failure_count(&self) -> usize {
@@ -853,7 +853,7 @@ impl<Conn: Connection> Set<Conn> {
     #[instrument(
         skip(self),
         ret,
-        target = "qorb::slot::Set::get_stats",
+        name = "Set::get_stats",
         fields(name = ?self.name),
     )]
     pub(crate) fn get_stats(&self) -> Stats {
