@@ -20,6 +20,8 @@ pub mod backend;
 pub mod claim;
 pub mod policy;
 pub mod pool;
+#[cfg(feature = "qtop")]
+pub mod qtop;
 pub mod resolver;
 pub mod service;
 

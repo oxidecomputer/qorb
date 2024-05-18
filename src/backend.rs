@@ -16,6 +16,7 @@ pub enum Error {
 
 /// Describes the name of a backend.
 #[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Debug, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Name(pub String);
 
 /// A single instance of a service.
