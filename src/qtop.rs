@@ -1,3 +1,5 @@
+//! Optional module for exporting stats via dropshot
+
 use crate::pool;
 use dropshot::channel;
 use dropshot::Query;
@@ -7,20 +9,10 @@ use futures::SinkExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::{atomic::Ordering, Arc, Mutex};
-use tokio::{
-    sync::watch,
-    time::{self, Duration},
-};
+use std::sync::atomic::Ordering;
+use tokio::time::{self, Duration};
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message;
-
-impl serde::Serialize for pool::SerializeStats {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let inner = self.0.lock().unwrap();
-        inner.serialize(serializer)
-    }
-}
 
 impl pool::Stats {
     pub async fn serve_ws(
@@ -65,6 +57,7 @@ struct QueryParams {
     update_secs: Option<u8>,
 }
 
+///
 /// An eternally-increasing sequence of bytes, wrapping on overflow, starting
 /// from the value given for the query parameter "start."
 #[channel {

@@ -43,8 +43,24 @@ enum Request<Conn: Connection> {
     },
 }
 
+/// A shared reference to backend stats
 #[derive(Clone)]
-pub(crate) struct SerializeStats(pub(crate) Arc<Mutex<slot::Stats>>);
+pub struct BackendStats(Arc<Mutex<slot::Stats>>);
+
+impl BackendStats {
+    /// Samples stats from a backend at a single point-in-time
+    pub fn get(&self) -> slot::Stats {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for BackendStats {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let inner = self.0.lock().unwrap();
+        inner.serialize(serializer)
+    }
+}
 
 struct PoolInner<Conn: Connection> {
     backend_connector: backend::SharedConnector<Conn>,
@@ -58,7 +74,7 @@ struct PoolInner<Conn: Connection> {
     // Tracks stats for each backend.
     //
     // Should be kept in lockstep with "Self::slots".
-    stats_tx: watch::Sender<HashMap<backend::Name, SerializeStats>>,
+    stats_tx: watch::Sender<HashMap<backend::Name, BackendStats>>,
 
     rx: mpsc::Receiver<Request<Conn>>,
 }
@@ -69,7 +85,7 @@ impl<Conn: Connection> PoolInner<Conn> {
         backend_connector: backend::SharedConnector<Conn>,
         policy: Policy,
         rx: mpsc::Receiver<Request<Conn>>,
-        stats_tx: watch::Sender<HashMap<backend::Name, SerializeStats>>,
+        stats_tx: watch::Sender<HashMap<backend::Name, BackendStats>>,
     ) -> Self {
         Self {
             backend_connector,
@@ -136,7 +152,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                 self.backend_connector.clone(),
             );
             self.stats_tx.send_modify(|map| {
-                map.insert(name.clone(), SerializeStats(set.stats.clone()));
+                map.insert(name.clone(), BackendStats(set.stats.clone()));
             });
             new_backends.push((name.clone(), set.monitor()));
             entry.insert(set);
@@ -332,8 +348,8 @@ pub struct Pool<Conn: Connection> {
 
 #[derive(Clone)]
 pub struct Stats {
-    pub(crate) rx: watch::Receiver<HashMap<backend::Name, SerializeStats>>,
-    pub(crate) claims: Arc<AtomicUsize>,
+    pub rx: watch::Receiver<HashMap<backend::Name, BackendStats>>,
+    pub claims: Arc<AtomicUsize>,
 }
 
 impl<Conn: Connection + Send + 'static> Pool<Conn> {

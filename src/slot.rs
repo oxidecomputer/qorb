@@ -254,12 +254,12 @@ impl<Conn: Connection> BorrowedConnection<Conn> {
 /// Describes the state of connections to this backend.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
-pub(crate) struct Stats {
-    pub(crate) connecting_slots: usize,
-    pub(crate) unclaimed_slots: usize,
-    pub(crate) checking_slots: usize,
-    pub(crate) claimed_slots: usize,
-    pub(crate) total_claims: usize,
+pub struct Stats {
+    pub connecting_slots: usize,
+    pub unclaimed_slots: usize,
+    pub checking_slots: usize,
+    pub claimed_slots: usize,
+    pub total_claims: usize,
 }
 
 impl std::ops::Add for Stats {

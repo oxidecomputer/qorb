@@ -72,7 +72,7 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "test-ut
 tracing-subscriber = "0.3"
 
 [features]
-all = [ "diesel_pg" ]
+all = [ "diesel_pg", "qtop" ]
 default = []
 diesel_pg = ["dep:diesel", "dep:async-bb8-diesel"]
 qtop = ["dep:dropshot", "dep:tokio-tungstenite", "serde", "dep:serde_json", "dep:schemars"]
