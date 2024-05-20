@@ -66,14 +66,14 @@ impl Client {
         self.missed_requests_count += 1;
     }
 
-    #[instrument(skip(self), target = "qorb::resolvers::dns::Client::lookup_socket_v6")]
+    #[instrument(skip(self), name = "Client::lookup_socket_v6")]
     async fn lookup_socket_v6(
         &self,
         name: &service::Name,
     ) -> Result<HashMap<backend::Name, BackendRecord>, anyhow::Error> {
         // Look up all the SRV records for this particular name.
         let srv = self.resolver.srv_lookup(&name.0).await?;
-        event!(Level::DEBUG, srv = ?srv, "Successfully looked up SRV record");
+        event!(Level::DEBUG, ?srv, "Successfully looked up SRV record");
 
         let futures = std::iter::repeat(self.resolver.clone())
             .zip(srv.into_iter())
@@ -93,15 +93,15 @@ impl Client {
             .into_iter()
             .flat_map(move |target| match target {
                 Ok((target, aaaa, port)) => {
-                    event!(Level::DEBUG, aaaa = ?aaaa, "Successfully looked up AAAA record");
+                    event!(Level::DEBUG, ?aaaa, "Successfully looked up AAAA record");
                     let expires_at = match self.hardcoded_ttl {
                         Some(duration) => Instant::now().checked_add(duration),
                         None => Some(aaaa.valid_until()),
                     };
-
+                    let name = backend::Name::from(target);
                     Some(aaaa.into_iter().map(move |ip| {
                         (
-                            backend::Name(target.clone()),
+                            name.clone(),
                             BackendRecord {
                                 backend: backend::Backend {
                                     address: SocketAddr::V6(SocketAddrV6::new(*ip, port, 0, 0)),
@@ -211,11 +211,11 @@ impl DnsResolverWorker {
                             first_result.lock().unwrap().get_or_insert(backends);
                         }
                         Ok(Err(err)) => {
-                            event!(Level::ERROR, err = ?err, "DNS request failed");
+                            event!(Level::ERROR, ?err, "DNS request failed");
                             client.mark_error();
                         }
                         Err(err) => {
-                            event!(Level::ERROR, err = ?err, "DNS request timed out");
+                            event!(Level::ERROR, ?err, "DNS request timed out");
                             client.mark_error();
                         }
                     }

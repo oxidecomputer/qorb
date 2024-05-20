@@ -134,12 +134,15 @@ async fn main() {
     // Actually make the pool!
     let pool = Pool::new(resolver, backend_connector, policy);
 
+    #[cfg(feature = "qtop")]
+    tokio::spawn(qtop(pool.stats().clone()));
+
     // In a loop:
     //
     // - Grab a connection from the pool
     // - Try to use it
     loop {
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(250)).await;
 
         match pool.claim().await {
             Ok(mut stream) => {
@@ -161,4 +164,29 @@ async fn main() {
             }
         }
     }
+}
+
+#[cfg(feature = "qtop")]
+async fn qtop(stats: qorb::pool::Stats) {
+    // Build a description of the API.
+    let mut api = dropshot::ApiDescription::new();
+    api.register(qorb::qtop::serve_stats).unwrap();
+    let log = dropshot::ConfigLogging::StderrTerminal {
+        level: dropshot::ConfigLoggingLevel::Info,
+    };
+    // Set up the server.
+    let server = dropshot::HttpServerStarter::new(
+        &dropshot::ConfigDropshot {
+            bind_address: "127.0.0.1:42069".parse().unwrap(),
+            ..Default::default()
+        },
+        api,
+        stats,
+        &log.to_logger("qtop").unwrap(),
+    )
+    .map_err(|error| format!("failed to create server: {}", error))
+    .unwrap()
+    .start()
+    .await
+    .unwrap();
 }

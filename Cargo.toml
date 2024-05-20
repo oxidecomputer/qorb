@@ -1,3 +1,35 @@
+[workspace]
+members = [".", "qtop"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+async-bb8-diesel = "0.2"
+clap = "4.0"
+diesel = { version = "2.1", features = [ "postgres", "r2d2" ] }
+debug-ignore = "1.0"
+derive-where = "1.2"
+dropshot = "0.10"
+futures = "0.3"
+hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
+http = "1.1.0"
+rand = "0.8"
+schemars = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+thiserror = "1.0"
+tokio = { version = "1.37.0"}
+tokio-stream = { version = "0.1", features = [ "sync" ] }
+tokio-tungstenite = "0.21.0"
+tracing = "0.1"
+crossterm = "0.27.0"
+hickory-client = { version = "0.24", default-features = false }
+hickory-server = { version = "0.24", default-features = false }
+progenitor = "0.7"
+ratatui = "0.26.2"
+reqwest = { version = "0.11", features = ["json", "stream"] }
+tracing-subscriber = "0.3"
+
 [package]
 name = "qorb"
 version = "0.0.0"
@@ -8,33 +40,39 @@ license = "MPL-2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0"
-async-trait = "0.1"
-async-bb8-diesel = { version = "0.2", optional = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+async-bb8-diesel = { workspace = true, optional = true }
 diesel = { version = "2.1", optional = true, features = [ "postgres", "r2d2" ] }
-debug-ignore = "1.0"
-derive-where = "1.2"
+debug-ignore = { workspace = true }
+derive-where = { workspace = true }
+dropshot = { workspace = true, optional = true }
 futures = "0.3"
 hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
 rand = "0.8"
-thiserror = "1.0"
-tokio = { version = "1.37.0", features = ["macros", "rt", "sync", "time"] }
-tokio-stream = { version = "0.1", features = [ "sync" ] }
+schemars = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-stream = { workspace = true, features = [ "sync" ] }
+tokio-tungstenite = { workspace = true, optional = true }
 tracing = "0.1"
 
 [dev-dependencies]
-crossterm = "0.27.0"
-dropshot = "0.10"
-hickory-client = { version = "0.24", default-features = false }
-hickory-server = { version = "0.24", default-features = false }
-progenitor = "0.7"
-ratatui = "0.26.2"
-reqwest = { version = "0.11", features = ["json", "stream"] }
-serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1.37.0", features = ["macros", "rt", "sync", "time", "test-util"] }
+crossterm = { workspace = true }
+dropshot = { workspace = true }
+hickory-client = { workspace = true, default-features = false }
+hickory-server = { workspace = true, default-features = false }
+progenitor = { workspace = true }
+ratatui = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "test-util"] }
 tracing-subscriber = "0.3"
 
 [features]
 all = [ "diesel_pg" ]
 default = []
 diesel_pg = ["dep:diesel", "dep:async-bb8-diesel"]
+qtop = ["dep:dropshot", "dep:tokio-tungstenite", "serde", "dep:serde_json", "dep:schemars"]

@@ -11,6 +11,10 @@ use crate::slot;
 
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::interval;
@@ -39,6 +43,9 @@ enum Request<Conn: Connection> {
     },
 }
 
+#[derive(Clone)]
+pub(crate) struct SerializeStats(pub(crate) Arc<Mutex<slot::Stats>>);
+
 struct PoolInner<Conn: Connection> {
     backend_connector: backend::SharedConnector<Conn>,
 
@@ -47,6 +54,11 @@ struct PoolInner<Conn: Connection> {
     priority_list: PriorityList<backend::Name>,
 
     policy: Policy,
+
+    // Tracks stats for each backend.
+    //
+    // Should be kept in lockstep with "Self::slots".
+    stats_tx: watch::Sender<HashMap<backend::Name, SerializeStats>>,
 
     rx: mpsc::Receiver<Request<Conn>>,
 }
@@ -57,6 +69,7 @@ impl<Conn: Connection> PoolInner<Conn> {
         backend_connector: backend::SharedConnector<Conn>,
         policy: Policy,
         rx: mpsc::Receiver<Request<Conn>>,
+        stats_tx: watch::Sender<HashMap<backend::Name, SerializeStats>>,
     ) -> Self {
         Self {
             backend_connector,
@@ -64,6 +77,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             slots: HashMap::new(),
             priority_list: PriorityList::new(),
             policy,
+            stats_tx,
             rx,
         }
     }
@@ -81,7 +95,7 @@ impl<Conn: Connection> PoolInner<Conn> {
     // the resolver.
     //
     // Returns the newly added backends, if any.
-    #[instrument(skip(self), target = "qorb::pool::PoolInner::handle_resolve_event")]
+    #[instrument(skip(self), name = "PoolInner::handle_resolve_event")]
     fn handle_resolve_event(
         &mut self,
         all_backends: resolver::AllBackends,
@@ -121,21 +135,25 @@ impl<Conn: Connection> PoolInner<Conn> {
                 backend.clone(),
                 self.backend_connector.clone(),
             );
+            self.stats_tx.send_modify(|map| {
+                map.insert(name.clone(), SerializeStats(set.stats.clone()));
+            });
             new_backends.push((name.clone(), set.monitor()));
             entry.insert(set);
         }
 
         let mut to_remove = vec![];
         for name in self.slots.keys() {
-            if !all_backends.contains_key(&name) {
+            if !all_backends.contains_key(name) {
                 to_remove.push(name.clone());
             }
         }
 
         for name in &to_remove {
-            self.slots.remove(&name);
+            self.slots.remove(name);
+            self.stats_tx
+                .send_if_modified(|stats| stats.remove(name).is_some());
         }
-
         new_backends
     }
 
@@ -188,7 +206,7 @@ impl<Conn: Connection> PoolInner<Conn> {
         }
     }
 
-    #[instrument(skip(self), target = "qorb::pool::PoolInner::rebalance")]
+    #[instrument(skip(self), name = "PoolInner::rebalance")]
     async fn rebalance(&mut self) {
         let mut questionable_backend_count = 0;
         let mut usable_backends = vec![];
@@ -309,6 +327,13 @@ impl<Conn: Connection> PoolInner<Conn> {
 pub struct Pool<Conn: Connection> {
     handle: tokio::task::JoinHandle<()>,
     tx: mpsc::Sender<Request<Conn>>,
+    stats: Stats,
+}
+
+#[derive(Clone)]
+pub struct Stats {
+    pub(crate) rx: watch::Receiver<HashMap<backend::Name, SerializeStats>>,
+    pub(crate) claims: Arc<AtomicUsize>,
 }
 
 impl<Conn: Connection + Send + 'static> Pool<Conn> {
@@ -317,24 +342,35 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     /// - resolver: Describes how backends should be found for the service.
     /// - backend_connector: Describes how the connections to a specific
     /// backend should be made.
-    #[instrument(skip(resolver, backend_connector), target = "qorb::pool::Pool::new")]
+    #[instrument(skip(resolver, backend_connector), name = "Pool::new")]
     pub fn new(
         resolver: resolver::BoxedResolver,
         backend_connector: backend::SharedConnector<Conn>,
         policy: Policy,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1);
-
+        let (stats_tx, stats_rx) = watch::channel(HashMap::default());
         let handle = tokio::task::spawn(async move {
-            let worker = PoolInner::new(resolver, backend_connector, policy, rx);
+            let worker = PoolInner::new(resolver, backend_connector, policy, rx, stats_tx);
             worker.run().await;
         });
 
-        Self { handle, tx }
+        Self {
+            handle,
+            tx,
+            stats: Stats {
+                rx: stats_rx,
+                claims: Arc::new(AtomicUsize::new(0)),
+            },
+        }
+    }
+
+    pub fn stats(&self) -> &Stats {
+        &self.stats
     }
 
     /// Acquires a handle to a connection within the connection pool.
-    #[instrument(level = "debug", skip(self), err, target = "qorb::pool::Pool::claim")]
+    #[instrument(level = "debug", skip(self), err, name = "Pool::claim")]
     pub async fn claim(&self) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
 
@@ -342,7 +378,9 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
             .send(Request::Claim { tx })
             .await
             .map_err(|_| Error::Terminated)?;
-        rx.await.map_err(|_| Error::Terminated)?
+        let claim = rx.await.map_err(|_| Error::Terminated)?;
+        self.stats.claims.fetch_add(1, Ordering::Relaxed);
+        claim
     }
 }
 

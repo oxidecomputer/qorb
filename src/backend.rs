@@ -16,7 +16,41 @@ pub enum Error {
 
 /// Describes the name of a backend.
 #[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Debug, Hash)]
-pub struct Name(pub String);
+pub struct Name(pub Arc<str>);
+
+impl Name {
+    pub fn new(name: impl ToString) -> Self {
+        Self(name.to_string().into())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Name {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl From<String> for Name {
+    fn from(s: String) -> Self {
+        Self(s.into())
+    }
+}
+
+impl From<&'_ str> for Name {
+    fn from(s: &'_ str) -> Self {
+        Self(s.into())
+    }
+}
+
+impl std::borrow::Borrow<str> for Name {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
 
 /// A single instance of a service.
 #[derive(Clone, PartialEq, Eq, Debug, Hash, Ord, PartialOrd)]
