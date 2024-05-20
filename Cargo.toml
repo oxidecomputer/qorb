@@ -75,4 +75,4 @@ tracing-subscriber = "0.3"
 all = [ "diesel_pg" ]
 default = []
 diesel_pg = ["dep:diesel", "dep:async-bb8-diesel"]
-qtop = ["dep:dropshot", "dep:tokio-tungstenite", "serde", "dep:serde_json", "dep:schemars"]
+qtop = ["dep:dropshot", "dep:tokio-tungstenite", "serde", "dep:serde_json", "schemars"]

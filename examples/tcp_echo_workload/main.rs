@@ -107,7 +107,7 @@ async fn main() {
     // This pool will try to lookup the echo server, using configuration
     // defined in "example/dns_server/test.com.zone".
     let resolver = Box::new(DnsResolver::new(
-        service::Name("_echo._tcp.test.com.".to_string()),
+        service::Name::from("_echo._tcp.test.com."),
         bootstrap_dns,
         DnsResolverConfig {
             query_interval: Duration::from_secs(5),
@@ -135,7 +135,7 @@ async fn main() {
     let pool = Pool::new(resolver, backend_connector, policy);
 
     #[cfg(feature = "qtop")]
-    tokio::spawn(qtop(pool.stats().clone()));
+    serve_qtop(&pool);
 
     // In a loop:
     //
@@ -167,26 +167,29 @@ async fn main() {
 }
 
 #[cfg(feature = "qtop")]
-async fn qtop(stats: qorb::pool::Stats) {
-    // Build a description of the API.
-    let mut api = dropshot::ApiDescription::new();
-    api.register(qorb::qtop::serve_stats).unwrap();
+fn serve_qtop(pool: &Pool<TcpStream>) {
+    use qorb::qtop::Qtop;
+    let qtop = Qtop::new();
+    qtop.add_pool(pool);
+
     let log = dropshot::ConfigLogging::StderrTerminal {
         level: dropshot::ConfigLoggingLevel::Info,
     };
-    // Set up the server.
-    let server = dropshot::HttpServerStarter::new(
-        &dropshot::ConfigDropshot {
-            bind_address: "127.0.0.1:42069".parse().unwrap(),
-            ..Default::default()
-        },
-        api,
-        stats,
-        &log.to_logger("qtop").unwrap(),
-    )
-    .map_err(|error| format!("failed to create server: {}", error))
-    .unwrap()
-    .start()
-    .await
-    .unwrap();
+    tokio::spawn(async move {
+        // Set up the server.
+        dropshot::HttpServerStarter::new(
+            &dropshot::ConfigDropshot {
+                bind_address: "127.0.0.1:42069".parse().unwrap(),
+                ..Default::default()
+            },
+            Qtop::api(),
+            qtop,
+            &log.to_logger("qtop").unwrap(),
+        )
+        .map_err(|error| format!("failed to create server: {}", error))
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    });
 }

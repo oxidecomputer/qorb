@@ -72,7 +72,7 @@ impl Client {
         name: &service::Name,
     ) -> Result<HashMap<backend::Name, BackendRecord>, anyhow::Error> {
         // Look up all the SRV records for this particular name.
-        let srv = self.resolver.srv_lookup(&name.0).await?;
+        let srv = self.resolver.srv_lookup(name.0.as_ref()).await?;
         event!(Level::DEBUG, ?srv, "Successfully looked up SRV record");
 
         let futures = std::iter::repeat(self.resolver.clone())
@@ -324,5 +324,9 @@ impl Resolver for DnsResolver {
                 // - Monitor the TTLs of our own DNS Servers
             }
         }
+    }
+
+    fn service_name(&self) -> &service::Name {
+        &self.service
     }
 }

@@ -28,6 +28,7 @@ pub trait Resolver: Send + Sync {
     /// Monitors for new backends, and returns information about the health
     /// of the resolver.
     async fn step(&mut self) -> Vec<Event>;
+    fn service_name(&self) -> &crate::service::Name;
 }
 
 /// Helper type for anything that implements the Resolver interface.

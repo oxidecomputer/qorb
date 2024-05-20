@@ -7,10 +7,11 @@ use crate::policy::Policy;
 use crate::priority_list::PriorityList;
 use crate::rebalancer;
 use crate::resolver;
+use crate::service;
 use crate::slot;
 
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -54,7 +55,7 @@ struct PoolInner<Conn: Connection> {
     priority_list: PriorityList<backend::Name>,
 
     policy: Policy,
-    stats_tx: watch::Sender<HashMap<backend::Name, SerializeStats>>,
+    stats_tx: watch::Sender<BTreeMap<backend::Name, SerializeStats>>,
 
     rx: mpsc::Receiver<Request<Conn>>,
 }
@@ -65,7 +66,7 @@ impl<Conn: Connection> PoolInner<Conn> {
         backend_connector: backend::SharedConnector<Conn>,
         policy: Policy,
         rx: mpsc::Receiver<Request<Conn>>,
-        stats_tx: watch::Sender<HashMap<backend::Name, SerializeStats>>,
+        stats_tx: watch::Sender<BTreeMap<backend::Name, SerializeStats>>,
     ) -> Self {
         Self {
             backend_connector,
@@ -325,6 +326,7 @@ impl<Conn: Connection> PoolInner<Conn> {
 
 /// Manages a set of connections to a service
 pub struct Pool<Conn: Connection> {
+    service_name: service::Name,
     handle: tokio::task::JoinHandle<()>,
     tx: mpsc::Sender<Request<Conn>>,
     stats: Stats,
@@ -332,14 +334,24 @@ pub struct Pool<Conn: Connection> {
 
 #[derive(Clone)]
 pub struct Stats {
-    pub(crate) rx: watch::Receiver<HashMap<backend::Name, SerializeStats>>,
+    pub(crate) rx: watch::Receiver<BTreeMap<backend::Name, SerializeStats>>,
     pub(crate) claims: Arc<AtomicUsize>,
+}
+
+impl<Conn: Connection> Pool<Conn> {
+    pub fn service_name(&self) -> &service::Name {
+        &self.service_name
+    }
+
+    pub fn stats(&self) -> &Stats {
+        &self.stats
+    }
 }
 
 impl<Conn: Connection + Send + 'static> Pool<Conn> {
     /// Creates a new connection pool.
     ///
-    /// - resolver: Describes how backends should be found for the service.
+    /// - resolver: Describes how backends should be found for the service.'
     /// - backend_connector: Describes how the connections to a specific
     /// backend should be made.
     #[instrument(skip(resolver, backend_connector), name = "Pool::new")]
@@ -348,8 +360,9 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
         backend_connector: backend::SharedConnector<Conn>,
         policy: Policy,
     ) -> Self {
+        let service_name = resolver.service_name().clone();
         let (tx, rx) = mpsc::channel(1);
-        let (stats_tx, stats_rx) = watch::channel(HashMap::default());
+        let (stats_tx, stats_rx) = watch::channel(BTreeMap::default());
         let handle = tokio::task::spawn(async move {
             let worker = PoolInner::new(resolver, backend_connector, policy, rx, stats_tx);
             worker.run().await;
@@ -357,16 +370,13 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
 
         Self {
             handle,
+            service_name,
             tx,
             stats: Stats {
                 rx: stats_rx,
                 claims: Arc::new(AtomicUsize::new(0)),
             },
         }
-    }
-
-    pub fn stats(&self) -> &Stats {
-        &self.stats
     }
 
     /// Acquires a handle to a connection within the connection pool.
@@ -387,5 +397,11 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
 impl<Conn: Connection> Drop for Pool<Conn> {
     fn drop(&mut self) {
         self.handle.abort()
+    }
+}
+
+impl Stats {
+    pub fn same_pool(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.claims, &other.claims)
     }
 }
