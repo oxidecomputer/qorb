@@ -946,7 +946,7 @@ mod test {
         let mut set = Set::new(
             SetConfig::default(),
             5,
-            backend::Name("Test set".to_string()),
+            backend::Name::new("Test set"),
             backend::Backend { address: BACKEND },
             Arc::new(TestConnector::new()),
         );
@@ -971,7 +971,7 @@ mod test {
         let mut set = Set::new(
             SetConfig::default(),
             3,
-            backend::Name("Test set".to_string()),
+            backend::Name::new("Test set"),
             backend::Backend { address: BACKEND },
             Arc::new(TestConnector::new()),
         );
@@ -1014,7 +1014,7 @@ mod test {
         let mut set = Set::new(
             SetConfig::default(),
             0,
-            backend::Name("Test set".to_string()),
+            backend::Name::new("Test set"),
             backend::Backend { address: BACKEND },
             Arc::new(TestConnector::new()),
         );
@@ -1045,7 +1045,7 @@ mod test {
         let mut set = Set::new(
             SetConfig::default(),
             3,
-            backend::Name("Test set".to_string()),
+            backend::Name::from("Test set"),
             backend::Backend { address: BACKEND },
             Arc::new(TestConnector::new()),
         );
@@ -1105,7 +1105,7 @@ mod test {
                 ..Default::default()
             },
             3,
-            backend::Name("Test set".to_string()),
+            backend::Name::new("Test set"),
             backend::Backend { address: BACKEND },
             connector.clone(),
         );

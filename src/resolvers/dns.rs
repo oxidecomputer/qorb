@@ -98,10 +98,10 @@ impl Client {
                         Some(duration) => Instant::now().checked_add(duration),
                         None => Some(aaaa.valid_until()),
                     };
-
+                    let name = backend::Name::from(target);
                     Some(aaaa.into_iter().map(move |ip| {
                         (
-                            backend::Name(target.clone()),
+                            name.clone(),
                             BackendRecord {
                                 backend: backend::Backend {
                                     address: SocketAddr::V6(SocketAddrV6::new(*ip, port, 0, 0)),

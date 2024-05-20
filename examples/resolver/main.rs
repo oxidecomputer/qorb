@@ -251,7 +251,7 @@ impl Resolver for App {
             events.push(resolver::Event::Added(
                 self.added_backends
                     .iter()
-                    .map(|backend| (backend::Name(backend.address.to_string()), backend.clone()))
+                    .map(|backend| (backend::Name::new(backend.address), backend.clone()))
                     .collect(),
             ));
         }
@@ -264,7 +264,7 @@ impl Resolver for App {
             events.push(resolver::Event::Removed(
                 self.removed_backends
                     .iter()
-                    .map(|backend| backend::Name(backend.address.to_string()))
+                    .map(|backend| backend::Name::new(backend.address))
                     .collect(),
             ));
         }
