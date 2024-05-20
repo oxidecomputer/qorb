@@ -357,6 +357,7 @@ struct SetWorker<Conn: Connection> {
 }
 
 impl<Conn: Connection> SetWorker<Conn> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         name: backend::Name,
         rx: mpsc::Receiver<SetRequest<Conn>>,

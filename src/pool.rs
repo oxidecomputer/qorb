@@ -228,8 +228,8 @@ impl<Conn: Connection> PoolInner<Conn> {
         let mut usable_backends = vec![];
 
         // Pass 1: Limit spares from backends that might not be functioning
-        let mut iter = self.slots.iter_mut();
-        while let Some((name, slot_set)) = iter.next() {
+        let iter = self.slots.iter_mut();
+        for (name, slot_set) in iter {
             match slot_set.get_state() {
                 slot::SetState::Offline => {
                     let _ = slot_set.set_wanted_count(1).await;

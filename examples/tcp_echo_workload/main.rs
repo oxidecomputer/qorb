@@ -63,7 +63,7 @@ fn tracing(t: Tracing) {
         .init();
 }
 
-fn usage(args: &Vec<String>) {
+fn usage(args: &[String]) {
     eprintln!("Usage: {} <options>", args[0]);
     eprintln!("Options may include: ");
     eprintln!("  --help: See this help message");
@@ -86,7 +86,7 @@ async fn main() {
                 usage(&args);
                 return;
             }
-            other => match other.split_once("=") {
+            other => match other.split_once('=') {
                 Some(("--bootstrap", address)) => {
                     bootstrap_address = address.parse().unwrap();
                 }

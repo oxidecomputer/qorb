@@ -167,8 +167,8 @@ impl DnsResolverWorker {
                 },
                 backend_name = next_backend_expiration => {
                     if self.backends.remove(&backend_name).is_some() {
-                        self.watch_tx.send_modify(|mut backends| {
-                            let backends = Arc::make_mut(&mut backends);
+                        self.watch_tx.send_modify(|backends| {
+                            let backends = Arc::make_mut(backends);
                             backends.remove(&backend_name);
                         });
                     }
@@ -251,8 +251,8 @@ impl DnsResolverWorker {
         }
 
         // Update the client-visible set of backends
-        self.watch_tx.send_modify(|mut backends| {
-            let backends = Arc::make_mut(&mut backends);
+        self.watch_tx.send_modify(|backends| {
+            let backends = Arc::make_mut(backends);
             for (name, backend) in added {
                 backends.insert(name, backend);
             }

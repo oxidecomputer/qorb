@@ -15,7 +15,7 @@ async fn main() {
     let args: Vec<String> = env::args().collect();
 
     let mut schema_path = None;
-    let mut iter = args[1..].into_iter();
+    let mut iter = args[1..].iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--help" => {

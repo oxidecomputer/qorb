@@ -13,15 +13,11 @@ use std::collections::BTreeSet;
 // USER INPUT
 //
 
+#[derive(Default)]
 enum Adding {
+    #[default]
     On,
     Off,
-}
-
-impl Default for Adding {
-    fn default() -> Self {
-        Adding::On
-    }
 }
 
 enum KeyReaction {
