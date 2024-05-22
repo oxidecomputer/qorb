@@ -1,4 +1,11 @@
+:showtitle:
+:toc: left
+:icons: font
 
+= Create some backends
+
+The following instructions set up some echo servers as a "backend",
+with a DNS server pointing to them.
 
 [source, bash]
 ----
@@ -7,8 +14,8 @@ cargo install hickory-dns
 
 # Start some echo servers
 cargo run --example tcp_echo_server [::1]:6001
-cargo run --example tcp_echo_server [::1]:6001
-cargo run --example tcp_echo_server [::1]:6001
+cargo run --example tcp_echo_server [::1]:6002
+cargo run --example tcp_echo_server [::1]:6003
 
 # Update 'examples/dns_server/test.com.zone' to reference the echo server
 # which was just created.
@@ -20,9 +27,24 @@ hickory-dns -c examples/dns_server/config.toml -z examples/dns_server -p 1234
 
 # Confirm your DNS server is working
 dig -6 @::1 -p 1234  _echo._tcp.test.com -t SRV
-
-# Run a connection pool, which uses the DNS server to find the echo servers.
-cargo run --example tcp_echo_workload
 ----
 
+= Run a Connection Pool
 
+Once you've set up the backends and a DNS server, it's possible to run
+a connection pool client (and workload generator) that reaches out to those backends.
+
+[source,bash]
+----
+# Run a connection pool, which uses the DNS server to find the echo servers.
+cargo run --example tcp_echo_workload --features qtop
+----
+
+The "--features qtop" flag is optional, but it allows us to inspect the
+connection pooling with "qtop", a tool for inspecting connection pool state.
+
+[source,bash]
+----
+# Run this command while the "tcp_echo_workload" is running.
+cargo run --bin qtop "ws://127.0.0.1:42069/qtop/stats"
+----
