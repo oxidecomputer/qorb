@@ -3,6 +3,7 @@
 use crate::backend;
 use crate::resolver::{AllBackends, Resolver};
 use crate::service;
+use crate::window_counter::WindowedCounter;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -41,11 +42,11 @@ struct Client {
     // this is but one of many signals.
     //
     // TODO: Maybe use the failure window here too?
-    missed_requests_count: usize,
+    failed_requests: WindowedCounter,
 }
 
 impl Client {
-    fn new(address: SocketAddr, hardcoded_ttl: Option<Duration>) -> Self {
+    fn new(address: SocketAddr, hardcoded_ttl: Option<Duration>, failure_window: Duration) -> Self {
         let mut rc = ResolverConfig::new();
         rc.add_name_server(NameServerConfig::new(address, Protocol::Udp));
         let mut opts = ResolverOpts::default();
@@ -54,16 +55,12 @@ impl Client {
         Self {
             resolver,
             hardcoded_ttl,
-            missed_requests_count: 0,
+            failed_requests: WindowedCounter::new(failure_window),
         }
     }
 
-    fn mark_ok(&mut self) {
-        self.missed_requests_count = 0;
-    }
-
-    fn mark_error(&mut self) {
-        self.missed_requests_count += 1;
+    fn mark_error(&self) {
+        self.failed_requests.add(1);
     }
 
     #[instrument(skip(self), name = "Client::lookup_socket_v6")]
@@ -128,7 +125,7 @@ struct DnsResolverWorker {
     service: service::Name,
 
     // What DNS servers are we actively contacting?
-    dns_servers: Vec<Client>,
+    dns_servers: HashMap<SocketAddr, Client>,
 
     // What backends do we think we've found so far?
     backends: HashMap<backend::Name, BackendRecord>,
@@ -143,16 +140,24 @@ impl DnsResolverWorker {
         bootstrap_servers: Vec<SocketAddr>,
         config: DnsResolverConfig,
     ) -> Self {
-        Self {
+        let mut result = Self {
             watch_tx,
             service,
-            dns_servers: bootstrap_servers
-                .into_iter()
-                .map(|address| Client::new(address, config.hardcoded_ttl))
-                .collect(),
+            dns_servers: HashMap::new(),
             backends: HashMap::new(),
             config,
+        };
+        for address in bootstrap_servers {
+            result.ensure_dns_server(address);
         }
+        result
+    }
+
+    fn ensure_dns_server(&mut self, address: SocketAddr) {
+        let failure_window = self.config.query_interval * 10;
+        self.dns_servers
+            .entry(address)
+            .or_insert_with(|| Client::new(address, self.config.hardcoded_ttl, failure_window));
     }
 
     async fn run(mut self) {
@@ -183,13 +188,18 @@ impl DnsResolverWorker {
         }
     }
 
-    // Queries DNS servers and updates our set of backends
-    async fn query_dns(&mut self) {
-        // Periodically query the backends from all our DNS servers
+    // Looks up a particular service across all known DNS servers.
+    //
+    // This is currently used to lookup both backends and DNS servers
+    // themselves, if dynamic resolution is enabled.
+    async fn dns_lookup(
+        &self,
+        service: &service::Name,
+    ) -> Option<HashMap<backend::Name, BackendRecord>> {
         let mut dns_lookup = FuturesUnordered::new();
-        dns_lookup.extend(self.dns_servers.iter_mut().map(|client| {
-            let service = &self.service;
+        dns_lookup.extend(self.dns_servers.values().map(|client| {
             let duration = self.config.query_timeout;
+            let service = &service;
             async move {
                 let result = timeout(duration, client.lookup_socket_v6(service)).await;
                 (client, result)
@@ -207,7 +217,6 @@ impl DnsResolverWorker {
                 async move {
                     match result {
                         Ok(Ok(backends)) => {
-                            client.mark_ok();
                             first_result.lock().unwrap().get_or_insert(backends);
                         }
                         Ok(Err(err)) => {
@@ -226,7 +235,36 @@ impl DnsResolverWorker {
         // TODO: As a policy choice, we could combine the results of
         // all DNS servers. At the moment, however, we're taking "whoever
         // returned results the fastest".
-        let Some(backends) = first_result.lock().unwrap().take() else {
+        let result = first_result.lock().unwrap().take();
+        result
+    }
+
+    async fn query_for_dns_servers(&mut self) {
+        let Some(resolver_service) = &self.config.resolver_service else {
+            return;
+        };
+        let Some(records) = self.dns_lookup(resolver_service).await else {
+            return;
+        };
+
+        for record in records.values() {
+            let address = record.backend.address;
+            self.ensure_dns_server(address);
+        }
+    }
+
+    // Queries DNS servers and updates our set of backends
+    async fn query_dns(&mut self) {
+        // If requested, update the set of DNS servers we're accessing.
+        //
+        // This is currently queried on the same interval as the backends
+        // we're trying to access, by virtue of just "happening before the
+        // backend lookup" within this function.
+        self.query_for_dns_servers().await;
+
+        // Query the set of backends for the service we're actually trying to
+        // contact.
+        let Some(backends) = self.dns_lookup(&self.service).await else {
             return;
         };
 
@@ -294,12 +332,22 @@ impl DnsResolverWorker {
     }
 }
 
+/// Implements [crate::resolver::Resolver] via UDP DNS lookup.
+///
+/// Currently only supports Ipv6 addresses.
 pub struct DnsResolver {
     handle: tokio::task::JoinHandle<()>,
     watch_rx: watch::Receiver<AllBackends>,
 }
 
 impl DnsResolver {
+    /// Creates a new DNS resolver which queries for backends.
+    ///
+    /// - `service`: The name of the SRV records to observe from DNS.
+    /// These are associated with AAAA records, and the SocketAddrs represented
+    /// by those records are returned through the [crate::resolver::Resolver] interface.
+    /// - `bootstrap_servers`: The initial list of DNS servers to query.
+    /// - `config`: Additional tweakable configuration options.
     pub fn new(
         service: service::Name,
         bootstrap_servers: Vec<SocketAddr>,
@@ -336,6 +384,11 @@ pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration options to tweak resolution behavior.
 pub struct DnsResolverConfig {
+    /// What SRV name should be used to find additional DNS servers?
+    ///
+    /// Default: None
+    pub resolver_service: Option<service::Name>,
+
     /// How many DNS servers should we query concurrently?
     ///
     /// Default: 5
@@ -360,6 +413,7 @@ pub struct DnsResolverConfig {
 impl Default for DnsResolverConfig {
     fn default() -> Self {
         Self {
+            resolver_service: None,
             max_dns_concurrency: 5,
             query_interval: DEFAULT_QUERY_INTERVAL,
             query_timeout: DEFAULT_QUERY_TIMEOUT,
@@ -560,4 +614,67 @@ mod test {
             SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1234, 0, 0))
         );
     }
+
+    // Tests that we can access our backend services at "test.example.com",
+    // when we use DNS resolution to find additional DNS servers at "dns.example.com".
+    #[tokio::test]
+    async fn dynamic_resolution() {
+        setup_tracing_subscriber();
+
+        // Start a DNS server which knows about the backend we're trying to contact.
+        //
+        // This server contains backend information that's actually useful to the resolver!
+        let dns_server_address = DnsServerBuilder::new("example.com", "test.example.com")
+            .add_backend(1234, "test001.example.com.")
+            .add_backend(5678, "test002.example.com.")
+            .run()
+            .await;
+
+        // Start another DNS server which knows about the first DNS server only.
+        //
+        // This server contains no backend information about the "test" service we're trying to
+        // reach.
+        let bootstrap_dns_server_address = DnsServerBuilder::new("example.com", "dns.example.com")
+            .add_backend(dns_server_address.port(), "dns001.example.com.")
+            .run()
+            .await;
+
+        // Start the resolver, but only with knowledge of the bootstrap server.
+        let service = service::Name("test.example.com".into());
+        let bootstrap_servers = vec![bootstrap_dns_server_address];
+        let config = DnsResolverConfig {
+            resolver_service: Some(service::Name("dns.example.com".into())),
+            ..Default::default()
+        };
+        let mut resolver = DnsResolver::new(service, bootstrap_servers, config);
+
+        // Wait until any number of backends appaer. For this to happen, we must have looked up
+        // the additional DNS server.
+        let mut monitor = resolver.monitor();
+        let backends = monitor
+            .wait_for(|all_backends| {
+                let some_backends = !all_backends.is_empty();
+                event!(
+                    Level::DEBUG,
+                    some_backends,
+                    "Waiting for some backends to appear"
+                );
+                some_backends
+            })
+            .await
+            .unwrap()
+            .clone();
+
+        assert_eq!(backends.len(), 2);
+        let (name, backend) = backends.iter().next().unwrap();
+        assert_eq!(name, &backend::Name::new("test001.example.com."));
+        assert_eq!(
+            backend.address,
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1234, 0, 0))
+        );
+    }
+
+    // TODO: Test TTLs?
+    // TODO: Test timeouts?
+    // TODO: Test health of failing DNS server?
 }
