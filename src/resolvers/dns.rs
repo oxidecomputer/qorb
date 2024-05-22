@@ -367,3 +367,197 @@ impl Default for DnsResolverConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use hickory_server::authority::{AuthorityObject, Catalog, ZoneType};
+    use hickory_server::proto::rr::{
+        rdata, LowerName, Name, RData, Record, RecordSet, RecordType, RrKey,
+    };
+    use hickory_server::server::ServerFuture;
+    use hickory_server::store::in_memory::InMemoryAuthority;
+    use std::collections::BTreeMap;
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    fn setup_tracing_subscriber() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        tracing_subscriber::fmt()
+            .with_thread_names(true)
+            .with_span_events(FmtSpan::ENTER)
+            .with_max_level(tracing::Level::TRACE)
+            .with_test_writer()
+            .init();
+    }
+
+    fn soa_record(name: &str) -> (RrKey, RecordSet) {
+        (
+            RrKey::new(LowerName::from_str(name).unwrap(), RecordType::SOA),
+            Record::from_rdata(
+                Name::from_utf8(name).unwrap(),
+                0,
+                RData::SOA(rdata::SOA::new(
+                    Name::from_utf8(name).unwrap(),
+                    Name::from_utf8(name).unwrap(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )),
+            )
+            .into(),
+        )
+    }
+
+    fn aaaa_record(name: &str, addr: Ipv6Addr) -> (RrKey, RecordSet) {
+        (
+            RrKey::new(LowerName::from_str(name).unwrap(), RecordType::AAAA),
+            Record::from_rdata(
+                Name::from_utf8(name).unwrap(),
+                0,
+                RData::AAAA(rdata::AAAA::from(addr)),
+            )
+            .into(),
+        )
+    }
+    fn srv_record(name: &str, aaaa_records: &[(u16, &str)]) -> (RrKey, RecordSet) {
+        let mut record_set = RecordSet::new(&Name::from_utf8(name).unwrap(), RecordType::SRV, 0);
+
+        for (port, aaaa_name) in aaaa_records {
+            record_set.insert(
+                Record::from_rdata(
+                    Name::from_utf8(name).unwrap(),
+                    0,
+                    RData::SRV(rdata::SRV::new(
+                        0,
+                        0,
+                        *port,
+                        Name::from_utf8(aaaa_name).unwrap(),
+                    )),
+                ),
+                0,
+            );
+        }
+
+        (
+            RrKey::new(LowerName::from_str(name).unwrap(), RecordType::SRV),
+            record_set,
+        )
+    }
+
+    // Configuring a DNS server with hickory is a mess of configuration options.
+    //
+    // This builder attempts to make that config slightly easier for tests.
+    struct DnsServerBuilder {
+        domain: String,
+        srv: String,
+        aaaa_records: Vec<(u16, String)>,
+    }
+
+    impl DnsServerBuilder {
+        fn new(domain: impl ToString, srv: impl ToString) -> Self {
+            Self {
+                domain: domain.to_string(),
+                srv: srv.to_string(),
+                aaaa_records: vec![],
+            }
+        }
+
+        fn add_backend(mut self, port: u16, name: impl ToString) -> Self {
+            self.aaaa_records.push((port, name.to_string()));
+            self
+        }
+
+        async fn run(self) -> SocketAddr {
+            let aaaa_records = self
+                .aaaa_records
+                .iter()
+                .map(|(_port, name)| aaaa_record(&name, Ipv6Addr::LOCALHOST));
+
+            let mut records = BTreeMap::from([
+                soa_record(&self.domain),
+                srv_record(
+                    &self.srv,
+                    self.aaaa_records
+                        .iter()
+                        .map(|(port, name)| (*port, name.as_ref()))
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                ),
+            ]);
+            records.extend(aaaa_records);
+
+            let authority = Box::new(Arc::new(
+                InMemoryAuthority::new(
+                    Name::from_utf8(&self.domain).unwrap(),
+                    records,
+                    ZoneType::Primary,
+                    true,
+                )
+                .unwrap(),
+            )) as Box<dyn AuthorityObject>;
+            let mut catalog = Catalog::new();
+            catalog.upsert(LowerName::from_str(&self.domain).unwrap(), authority);
+
+            let listener = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            event!(Level::DEBUG, ?addr, "New DNS server on address");
+
+            let mut server = ServerFuture::new(catalog);
+            server.register_socket(listener);
+
+            tokio::task::spawn(async move {
+                server.block_until_done().await.unwrap();
+            });
+
+            addr
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_from_one_dns_server() {
+        setup_tracing_subscriber();
+
+        // Start the DNS server, which runs independently of the resolver
+        let dns_server_address = DnsServerBuilder::new("example.com", "test.example.com")
+            .add_backend(1234, "test001.example.com.")
+            .add_backend(5678, "test002.example.com.")
+            .run()
+            .await;
+
+        // Start the resolver, which queries the DNS server
+        let service = service::Name("test.example.com".into());
+        let bootstrap_servers = vec![dns_server_address];
+        let config = DnsResolverConfig::default();
+        let mut resolver = DnsResolver::new(service, bootstrap_servers, config);
+
+        // Wait until any number of backends appaer
+        let mut monitor = resolver.monitor();
+        let backends = monitor
+            .wait_for(|all_backends| {
+                let some_backends = !all_backends.is_empty();
+                event!(
+                    Level::DEBUG,
+                    some_backends,
+                    "Waiting for some backends to appear"
+                );
+                some_backends
+            })
+            .await
+            .unwrap()
+            .clone();
+
+        assert_eq!(backends.len(), 2);
+        let (name, backend) = backends.iter().next().unwrap();
+        assert_eq!(name, &backend::Name::new("test001.example.com."));
+        assert_eq!(
+            backend.address,
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1234, 0, 0))
+        );
+    }
+}

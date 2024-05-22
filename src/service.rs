@@ -1,5 +1,5 @@
 //! Interface for services
 
 /// Describes the name of a service
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Name(pub String);
