@@ -2,10 +2,12 @@ use clap::Parser;
 use std::io::stdout;
 
 use crossterm::{
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+    event::{Event, EventStream, KeyCode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
 use futures::stream::StreamExt;
+use futures::FutureExt;
 use ratatui::{prelude::*, widgets::*};
 use std::collections::HashMap;
 use tokio_tungstenite::tungstenite;
@@ -107,25 +109,55 @@ impl Update {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Args = Args::parse();
-    let (mut ws, _) = tokio_tungstenite::connect_async(args.url.clone()).await?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(args.url.clone())
+        .await
+        .map_err(|err| {
+            eprintln!("Cannot connect; URL is usually: `ws://<address>:<port>/qtop/stats`");
+            err
+        })?;
+
+    enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    terminal.clear()?;
 
     let mut total_claims = HashMap::new();
-    while let Some(wsmsg) = ws.next().await {
-        let stats: Update = match wsmsg? {
-            tungstenite::Message::Text(txt) => serde_json::from_str(&txt)?,
-            tungstenite::Message::Binary(bin) => serde_json::from_slice(&bin)?,
-            tungstenite::Message::Close(_) => {
-                eprintln!("connection closed");
-                break;
+
+    let mut reader = EventStream::new();
+    let mut event_fut = reader.next().fuse();
+    let mut ws_fut = ws.next().fuse();
+
+    loop {
+        tokio::select! {
+            Some(Ok(Event::Key(event))) = &mut event_fut => {
+                event_fut = reader.next().fuse();
+                match event.code {
+                    KeyCode::Char('q') => break,
+                    _ => {},
+                }
             }
-            _ => continue,
-        };
-        terminal.draw(|f| stats.render(f, &args.url, &mut total_claims))?;
+            Some(wsmsg) = &mut ws_fut => {
+                ws_fut = ws.next().fuse();
+                let Ok(wsmsg) = wsmsg else {
+                    break;
+                };
+
+                let stats: Update = match wsmsg {
+                    tungstenite::Message::Text(txt) => serde_json::from_str(&txt)?,
+                    tungstenite::Message::Binary(bin) => serde_json::from_slice(&bin)?,
+                    tungstenite::Message::Close(_) => {
+                        eprintln!("connection closed");
+                        break;
+                    }
+                    _ => continue,
+                };
+                terminal.draw(|f| stats.render(f, &args.url, &mut total_claims))?;
+            }
+        }
     }
 
     stdout().execute(LeaveAlternateScreen)?;
+    disable_raw_mode()?;
     Ok(())
 }

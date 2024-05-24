@@ -13,7 +13,7 @@ name = "qtop"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"]}
-crossterm = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
 http = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true, features = ["derive"]}

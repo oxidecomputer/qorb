@@ -23,9 +23,7 @@ async fn main() {
         tokio::task::spawn(async move {
             let mut buf = vec![0; 1024];
             loop {
-                let Ok(n) = stream
-                    .read(&mut buf[0..])
-                    .await else {
+                let Ok(n) = stream.read(&mut buf[0..]).await else {
                     return;
                 };
 
@@ -33,9 +31,7 @@ async fn main() {
                     return;
                 }
 
-                let Ok(_) = stream
-                    .write_all(&buf[0..n])
-                    .await else {
+                let Ok(_) = stream.write_all(&buf[0..n]).await else {
                     return;
                 };
             }

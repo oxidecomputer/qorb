@@ -1,11 +1,8 @@
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use crossterm::{
-    event::{EventStream, Event, KeyCode},
-    terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen,
-        enable_raw_mode, disable_raw_mode,
-    },
+    event::{Event, EventStream, KeyCode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
 use futures::stream::StreamExt;
@@ -18,10 +15,13 @@ use qorb::service;
 use ratatui::{prelude::*, widgets::*};
 use std::env;
 use std::io::stdout;
-use std::sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{sleep, interval, Duration};
+use tokio::time::{interval, sleep, Duration};
 
 // This is almost identical to [qorb::connectors::tcp::TcpConnector], but it
 // actually has an "is_valid" implementation.
@@ -244,10 +244,7 @@ struct AllClaimers {
 impl AllClaimers {
     fn select_self(&mut self) {
         let old = self.table_state.selected().unwrap_or(0);
-        let new = std::cmp::min(
-            old,
-            self.claimers.len().saturating_sub(1)
-        );
+        let new = std::cmp::min(old, self.claimers.len().saturating_sub(1));
 
         self.table_state.select(Some(new));
     }
@@ -260,10 +257,7 @@ impl AllClaimers {
 
     fn select_down(&mut self) {
         let old = self.table_state.selected().unwrap_or(0);
-        let new = std::cmp::min(
-            old + 1,
-            self.claimers.len().saturating_sub(1),
-        );
+        let new = std::cmp::min(old + 1, self.claimers.len().saturating_sub(1));
         self.table_state.select(Some(new));
     }
 
@@ -288,29 +282,48 @@ impl AllClaimers {
             Row::new(vec![
                 Cell::from(idx.to_string().clone()),
                 Cell::from(
-                    Text::from(
-                        if claimer.inner.claimed.load(Ordering::SeqCst) {
-                            "✅"
-                        } else {
-                            ""
-                        }
-                    ).alignment(Alignment::Right),
+                    Text::from(if claimer.inner.claimed.load(Ordering::SeqCst) {
+                        "✅"
+                    } else {
+                        ""
+                    })
+                    .alignment(Alignment::Right),
                 ),
                 Cell::from(
-                    Text::from(claimer.inner.claim_duration.lock().unwrap().as_millis().to_string())
-                        .alignment(Alignment::Right),
+                    Text::from(
+                        claimer
+                            .inner
+                            .claim_duration
+                            .lock()
+                            .unwrap()
+                            .as_millis()
+                            .to_string(),
+                    )
+                    .alignment(Alignment::Right),
                 ),
                 Cell::from(
                     Text::from(claimer.inner.count_ok.load(Ordering::SeqCst).to_string())
                         .alignment(Alignment::Right),
                 ),
                 Cell::from(
-                    Text::from(claimer.inner.count_err_server.load(Ordering::SeqCst).to_string())
-                        .alignment(Alignment::Right),
+                    Text::from(
+                        claimer
+                            .inner
+                            .count_err_server
+                            .load(Ordering::SeqCst)
+                            .to_string(),
+                    )
+                    .alignment(Alignment::Right),
                 ),
                 Cell::from(
-                    Text::from(claimer.inner.count_err_claim.load(Ordering::SeqCst).to_string())
-                        .alignment(Alignment::Right),
+                    Text::from(
+                        claimer
+                            .inner
+                            .count_err_claim
+                            .load(Ordering::SeqCst)
+                            .to_string(),
+                    )
+                    .alignment(Alignment::Right),
                 ),
             ])
         });
@@ -325,12 +338,12 @@ impl AllClaimers {
                 Constraint::Length(FAIL_CLAIM.len() as u16),
             ],
         )
-        .block(Block::default().borders(Borders::ALL).title(
-            format!("Workload Generator").set_style(Style::default().bold()),
-        ))
-        .highlight_style(
-            Style::default().add_modifier(Modifier::REVERSED)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Workload Generator").set_style(Style::default().bold())),
         )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_spacing(HighlightSpacing::Always)
         .highlight_symbol(Text::from(">>>"))
         .header(
@@ -357,9 +370,13 @@ impl AllClaimers {
             .centered(),
             Line::from(vec![
                 "Press ".into(),
-                "UP".bold(), " or ".into(), "DOWN".bold(),
+                "UP".bold(),
+                " or ".into(),
+                "DOWN".bold(),
                 " to select a task, Press ".into(),
-                "LEFT".bold(), " or ".into(), "RIGHT".bold(),
+                "LEFT".bold(),
+                " or ".into(),
+                "RIGHT".bold(),
                 " to adjust claim duration".into(),
             ])
             .centered(),
@@ -367,15 +384,11 @@ impl AllClaimers {
         ];
         let style = Style::default();
         let text = Text::from(lines).patch_style(style);
-        let help_message = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL));
+        let help_message = Paragraph::new(text).block(Block::default().borders(Borders::ALL));
 
         let inner_layout = Layout::new(
             Direction::Vertical,
-            [
-                Constraint::Percentage(100),
-                Constraint::Length(5),
-            ],
+            [Constraint::Percentage(100), Constraint::Length(5)],
         )
         .split(main_layout[1]);
         frame.render_stateful_widget(table, inner_layout[0], &mut self.table_state);
@@ -398,10 +411,7 @@ impl Claimer {
             }
         });
 
-        Self {
-            inner,
-            handle,
-        }
+        Self { inner, handle }
     }
 }
 
