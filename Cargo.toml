@@ -5,6 +5,7 @@ members = [".", "qtop"]
 anyhow = "1.0"
 async-trait = "0.1"
 async-bb8-diesel = "0.2"
+camino = "1.1"
 clap = "4.0"
 diesel = { version = "2.1", features = [ "postgres", "r2d2" ] }
 debug-ignore = "1.0"
@@ -60,7 +61,8 @@ tokio-tungstenite = { workspace = true, optional = true }
 tracing = "0.1"
 
 [dev-dependencies]
-crossterm = { workspace = true }
+camino = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
 dropshot = { workspace = true }
 hickory-client = { workspace = true, default-features = false }
 hickory-server = { workspace = true, default-features = false }

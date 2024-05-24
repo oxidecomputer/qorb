@@ -23,19 +23,21 @@ async fn main() {
         tokio::task::spawn(async move {
             let mut buf = vec![0; 1024];
             loop {
-                let n = stream
-                    .read(&mut buf)
-                    .await
-                    .expect("failed to read data from stream");
+                let Ok(n) = stream
+                    .read(&mut buf[0..])
+                    .await else {
+                    return;
+                };
 
                 if n == 0 {
                     return;
                 }
 
-                stream
+                let Ok(_) = stream
                     .write_all(&buf[0..n])
-                    .await
-                    .expect("failed to write data to stream");
+                    .await else {
+                    return;
+                };
             }
         });
     }

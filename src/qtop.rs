@@ -57,9 +57,7 @@ struct QueryParams {
     update_secs: Option<u8>,
 }
 
-///
-/// An eternally-increasing sequence of bytes, wrapping on overflow, starting
-/// from the value given for the query parameter "start."
+/// Exports statistics from a connection pool at a regular interval.
 #[channel {
     protocol = WEBSOCKETS,
     path = "/qtop/stats",
