@@ -7,6 +7,30 @@
 Qorb is a work-in-progress Connection Pooling library, heavily inspired by
 the "Cueball" connection pooling library.
 
+== Overview
+
+Qorb's main interface is the link:https://docs.rs/qorb/latest/qorb/pool/struct.Pool.html[Pool] object.
+
+This pool relies on two interfaces that can be customized:
+
+* The link:https://docs.rs/qorb/latest/qorb/resolver/trait.Resolver.html[Resolver] interface identifies
+how to locate backend servers. link:https://docs.rs/qorb/latest/qorb/resolvers/dns/struct.DnsResolver.html[DnsResolver]
+provides a default implementation which queries DNS entries to access the set of backends.
+* The link:https://docs.rs/qorb/latest/qorb/backend/trait.Connector.html[Connector] interface identifies
+how to connect to a single backend. Within this method, the `connect` method is essential, but the `is_valid`
+and `on_recycle` methods can optionally be implemented to perform (respectively) health checks and perform cleanup actions
+before used connections are returned to the pool.
+
+== Examples
+
+To get up and running with a client, server, and DNS system, link:examples/README.adoc[refer to the README in the examples directory].
+
+In particular, the link:examples/tcp_echo_workload/main.rs[TCP echo workload] example demonstrates
+how to create a connection pool with a custom TCP connection.
+
+This provides a setup for generating a workload to an arbitrary number of
+backends, and then walks through the tools to inspect the connection pool.
+
 == TODO List
 
 Things I'd like to do before getting more eyes on this:
