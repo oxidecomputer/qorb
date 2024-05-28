@@ -4,6 +4,11 @@ use crate::backend::Connection;
 use crate::slot::BorrowedConnection;
 use tokio::sync::mpsc::OwnedPermit;
 
+/// A [Connection] which is returned to the pool when dropped.
+///
+/// Note that this method implements [std::ops::Deref] for the
+/// generic `Conn` type, and generally, clients should transparently
+/// use a handle as a connection.
 pub struct Handle<Conn: Connection> {
     inner: Option<BorrowedConnection<Conn>>,
     permit: Option<OwnedPermit<BorrowedConnection<Conn>>>,

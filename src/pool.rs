@@ -358,6 +358,41 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     /// - resolver: Describes how backends should be found for the service.
     /// - backend_connector: Describes how the connections to a specific
     /// backend should be made.
+    ///
+    /// ```no_run
+    /// use qorb::connectors::tcp::TcpConnector;
+    /// use qorb::pool::Pool;
+    /// use qorb::policy::Policy;
+    /// use qorb::resolvers::dns::{DnsResolver, DnsResolverConfig};
+    /// use qorb::service;
+    /// use std::sync::Arc;
+    ///
+    /// # async {
+    /// // Create the resolver -- here, we're using DNS
+    /// let bootstrap_dns = vec![ "[::1]:53".parse().unwrap() ];
+    /// let resolver = Box::new(DnsResolver::new(
+    ///     service::Name("_my_service._tcp.domain.com.".to_string()),
+    ///     bootstrap_dns,
+    ///     DnsResolverConfig::default(),
+    /// ));
+    ///
+    /// // Create the connector -- we're using a simple TCP connection
+    /// // with no health checks.
+    /// let connector = Arc::new(
+    ///     TcpConnector {}
+    /// );
+    ///
+    /// // Create the connection pool itself.
+    /// let policy = Policy::default();
+    /// let pool = Pool::new(resolver, connector, policy);
+    ///
+    /// // Grab a connection from the pool.
+    /// // Note that it may take a moment for the pool to create connections
+    /// // to backends, and those backends may also be offline.
+    /// let connection = pool.claim().await.unwrap();
+    ///
+    /// # };
+    /// ```
     #[instrument(skip(resolver, backend_connector), name = "Pool::new")]
     pub fn new(
         resolver: resolver::BoxedResolver,
