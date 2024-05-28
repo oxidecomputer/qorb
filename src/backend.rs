@@ -72,7 +72,24 @@ pub trait Connector: Send + Sync {
     async fn connect(&self, backend: &Backend) -> Result<Self::Connection, Error>;
 
     /// Determines if the connection to a backend is still valid.
-    async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Error>;
+    ///
+    /// This method is periodically called on connections within the pool
+    /// every [crate::policy::SetConfig::health_interval], and can run
+    /// for [crate::policy::SetConfig::health_check_timeout] before
+    /// timing out.
+    async fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Instructs the pool how to clean a connection before it is returned
+    /// to the connection pool.
+    ///
+    /// This method is called on connections within the pool before
+    /// they are can be used for new claims. This function can run for
+    /// [crate::policy::SetConfig::health_check_timeout] before timing out.
+    async fn on_recycle(&self, _conn: &mut Self::Connection) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 pub type SharedConnector<Conn> = Arc<dyn Connector<Connection = Conn>>;

@@ -10,7 +10,7 @@ use derive_where::derive_where;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{interval, Duration};
 use tracing::{event, instrument, span, Instrument, Level};
@@ -46,8 +46,15 @@ enum State<Conn: Connection> {
 
     // The slot has an active connection to a backend, and is claimed.
     //
-    // - (When claim dropped) State becomes ConnectedClaimed
+    // - (When claim dropped) State becomes ConnectedRecycling
     ConnectedClaimed,
+
+    // The slot was claimed, and needs recycling before it can become unclaimed
+    // once more.
+    //
+    // This is a temporary state before "ConnectedChecking",
+    // and is accounted the same way.
+    ConnectedRecycling(DebugIgnore<Conn>),
 
     // Final state, when the slot is no longer in-use.
     Terminated,
@@ -61,20 +68,22 @@ impl<Conn: Connection> State<Conn> {
     fn connected(&self) -> bool {
         match self {
             State::Connecting | State::Terminated => false,
-            State::ConnectedUnclaimed(_) | State::ConnectedChecking | State::ConnectedClaimed => {
-                true
-            }
+            State::ConnectedUnclaimed(_)
+            | State::ConnectedRecycling(_)
+            | State::ConnectedChecking
+            | State::ConnectedClaimed => true,
         }
     }
 }
 
-struct SlotInner<Conn: Connection> {
+struct SlotInnerGuarded<Conn: Connection> {
     // The state of this individual connection.
     state: State<Conn>,
 
-    // This is wrapped in an "Arc" because it's shared with all slots in the slot set.
-    stats: Arc<Mutex<Stats>>,
-
+    // A watch channel which is shared by all slots in the slot set, and can
+    // notify if the whole set has gone offline or online.
+    //
+    // Tightly coupled with `Self::stats`.
     status_tx: watch::Sender<SetState>,
 
     // A task which may may be monitoring the slot.
@@ -84,22 +93,40 @@ struct SlotInner<Conn: Connection> {
     handle: Option<AbortHandle>,
 }
 
+struct SlotInner<Conn: Connection> {
+    // All fields of the slot which need to be guarded behind a mutex
+    guarded: Mutex<SlotInnerGuarded<Conn>>,
+
+    // A notification channel indicating that the slot needs recyling
+    recycling_needed: Notify,
+
+    // This is wrapped in an "Arc" because it's shared with all slots in the slot set.
+    stats: Arc<Mutex<Stats>>,
+
+    // This "failure_window" is shared with all slots in the slot set.
+    failure_window: Arc<WindowedCounter>,
+}
+
 impl<Conn: Connection> SlotInner<Conn> {
     // Transitions to a new state, returning the old state.
     //
     // Additionally, if this updates the state of the whole backend,
     // emits a SetState on [Self::status_tx].
-    fn state_transition(&mut self, new: State<Conn>) -> State<Conn> {
-        if matches!(self.state, State::Terminated) {
+    fn state_transition(
+        &self,
+        mut inner: std::sync::MutexGuard<SlotInnerGuarded<Conn>>,
+        new: State<Conn>,
+    ) -> State<Conn> {
+        if matches!(inner.state, State::Terminated) {
             return State::Terminated;
         }
 
-        let old = std::mem::replace(&mut self.state, new);
+        let old = std::mem::replace(&mut inner.state, new);
 
         let mut stats = self.stats.lock().unwrap();
         let before_no_connected = stats.has_no_connected_slots();
         stats.exit_state(&old);
-        stats.enter_state(&self.state);
+        stats.enter_state(&inner.state);
         let after_no_connected = stats.has_no_connected_slots();
 
         // "Not connected" may mean:
@@ -112,11 +139,11 @@ impl<Conn: Connection> SlotInner<Conn> {
         match (before_no_connected, after_no_connected) {
             (true, false) => {
                 event!(Level::INFO, "state_transition: Set Online");
-                self.status_tx.send_replace(SetState::Online);
+                inner.status_tx.send_replace(SetState::Online);
             }
             (false, true) => {
                 event!(Level::INFO, "state_transition: Set Offline");
-                self.status_tx.send_replace(SetState::Offline);
+                inner.status_tx.send_replace(SetState::Offline);
             }
             _ => (),
         };
@@ -127,7 +154,7 @@ impl<Conn: Connection> SlotInner<Conn> {
 
 impl<Conn: Connection> Drop for SlotInner<Conn> {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.guarded.lock().unwrap().handle.take() {
             handle.abort();
         }
     }
@@ -138,15 +165,12 @@ impl<Conn: Connection> Drop for SlotInner<Conn> {
 //
 // Slots scale up and down in quantity at the request of the rebalancer.
 struct Slot<Conn: Connection> {
-    // This "failure_window" is shared with all slots in the slot set.
-    failure_window: Arc<WindowedCounter>,
-    inner: Arc<Mutex<SlotInner<Conn>>>,
+    inner: Arc<SlotInner<Conn>>,
 }
 
 impl<Conn: Connection> Clone for Slot<Conn> {
     fn clone(&self) -> Self {
         Self {
-            failure_window: self.failure_window.clone(),
             inner: self.inner.clone(),
         }
     }
@@ -164,17 +188,62 @@ impl<Conn: Connection> Slot<Conn> {
         loop {
             match connector.connect(backend).await {
                 Ok(conn) => {
-                    let mut slot = self.inner.lock().unwrap();
-                    slot.state_transition(State::ConnectedUnclaimed(DebugIgnore(conn)));
+                    self.inner.state_transition(
+                        self.inner.guarded.lock().unwrap(),
+                        State::ConnectedUnclaimed(DebugIgnore(conn)),
+                    );
                     return;
                 }
                 Err(err) => {
                     event!(Level::WARN, ?err, ?backend, "Failed to connect");
-                    self.failure_window.add(1);
+                    self.inner.failure_window.add(1);
                     retry_duration =
                         retry_duration.exponential_backoff(config.max_connection_backoff);
                     tokio::time::sleep(retry_duration).await;
                 }
+            }
+        }
+    }
+
+    #[instrument(
+        level = "trace",
+        skip(self, connector),
+        name = "Slot::recycle_if_needed"
+    )]
+    async fn recycle_if_needed(&self, connector: &SharedConnector<Conn>, timeout: Duration) {
+        // Grab the connection, if and only if it needs recycling
+        let mut conn = {
+            let slot = self.inner.guarded.lock().unwrap();
+            if !matches!(slot.state, State::ConnectedRecycling(_)) {
+                return;
+            }
+            let State::ConnectedRecycling(DebugIgnore(conn)) =
+                self.inner.state_transition(slot, State::ConnectedChecking)
+            else {
+                panic!("We just verified that the state was 'ConnectedRecycling'");
+            };
+
+            conn
+        };
+
+        let result = tokio::time::timeout(timeout, connector.on_recycle(&mut conn)).await;
+
+        let slot = self.inner.guarded.lock().unwrap();
+        match result {
+            Ok(Ok(())) => {
+                event!(Level::TRACE, "Connection recycled successfully");
+                self.inner
+                    .state_transition(slot, State::ConnectedUnclaimed(DebugIgnore(conn)));
+            }
+            Ok(Err(err)) => {
+                event!(Level::WARN, ?err, "Connection failed during recycle check");
+                self.inner.failure_window.add(1);
+                self.inner.state_transition(slot, State::Connecting);
+            }
+            Err(_) => {
+                event!(Level::WARN, "Connection timed out during recycle check");
+                self.inner.failure_window.add(1);
+                self.inner.state_transition(slot, State::Connecting);
             }
         }
     }
@@ -191,12 +260,12 @@ impl<Conn: Connection> Slot<Conn> {
     ) {
         // Grab the connection, if and only if it's idle in the pool.
         let mut conn = {
-            let mut slot = self.inner.lock().unwrap();
+            let slot = self.inner.guarded.lock().unwrap();
             if !matches!(slot.state, State::ConnectedUnclaimed(_)) {
                 return;
             }
             let State::ConnectedUnclaimed(DebugIgnore(conn)) =
-                slot.state_transition(State::ConnectedChecking)
+                self.inner.state_transition(slot, State::ConnectedChecking)
             else {
                 panic!("We just verified that the state was 'ConnectedUnclaimed'");
             };
@@ -214,21 +283,22 @@ impl<Conn: Connection> Slot<Conn> {
         // that we put the state back after the check succeeds!
         let result = tokio::time::timeout(timeout, connector.is_valid(&mut conn)).await;
 
-        let mut slot = self.inner.lock().unwrap();
+        let slot = self.inner.guarded.lock().unwrap();
         match result {
             Ok(Ok(())) => {
                 event!(Level::TRACE, "Connection remains healthy");
-                slot.state_transition(State::ConnectedUnclaimed(DebugIgnore(conn)));
+                self.inner
+                    .state_transition(slot, State::ConnectedUnclaimed(DebugIgnore(conn)));
             }
             Ok(Err(err)) => {
                 event!(Level::WARN, ?err, "Connection failed during health check");
-                self.failure_window.add(1);
-                slot.state_transition(State::Connecting);
+                self.inner.failure_window.add(1);
+                self.inner.state_transition(slot, State::Connecting);
             }
             Err(_) => {
                 event!(Level::WARN, "Connection timed out during health check");
-                self.failure_window.add(1);
-                slot.state_transition(State::Connecting);
+                self.inner.failure_window.add(1);
+                self.inner.state_transition(slot, State::Connecting);
             }
         }
     }
@@ -290,6 +360,7 @@ impl Stats {
         match state {
             State::Connecting => self.connecting_slots += 1,
             State::ConnectedUnclaimed(_) => self.unclaimed_slots += 1,
+            State::ConnectedRecycling(_) => self.checking_slots += 1,
             State::ConnectedChecking => self.checking_slots += 1,
             State::ConnectedClaimed => {
                 self.claimed_slots += 1;
@@ -303,6 +374,7 @@ impl Stats {
         match state {
             State::Connecting => self.connecting_slots -= 1,
             State::ConnectedUnclaimed(_) => self.unclaimed_slots -= 1,
+            State::ConnectedRecycling(_) => self.checking_slots -= 1,
             State::ConnectedChecking => self.checking_slots -= 1,
             State::ConnectedClaimed => self.claimed_slots -= 1,
             State::Terminated => panic!("Should not leave terminated state"),
@@ -393,13 +465,16 @@ impl<Conn: Connection> SetWorker<Conn> {
     // to actually connect to the backend and monitor slot health.
     fn create_slot(&mut self, slot_id: SlotId) {
         let slot = Slot {
-            failure_window: self.failure_window.clone(),
-            inner: Arc::new(Mutex::new(SlotInner {
-                state: State::Connecting,
+            inner: Arc::new(SlotInner {
+                guarded: Mutex::new(SlotInnerGuarded {
+                    state: State::Connecting,
+                    status_tx: self.status_tx.clone(),
+                    handle: None,
+                }),
+                recycling_needed: Notify::new(),
                 stats: self.stats.clone(),
-                status_tx: self.status_tx.clone(),
-                handle: None,
-            })),
+                failure_window: self.failure_window.clone(),
+            }),
         };
         let slot = self.slots.entry(slot_id).or_insert(slot).clone();
         self.stats
@@ -407,7 +482,7 @@ impl<Conn: Connection> SetWorker<Conn> {
             .unwrap()
             .enter_state(&State::<Conn>::Connecting);
 
-        slot.inner.lock().unwrap().handle = Some(
+        slot.inner.guarded.lock().unwrap().handle = Some(
             tokio::task::spawn({
                 let slot = slot.clone();
                 let config = self.config.clone();
@@ -431,10 +506,11 @@ impl<Conn: Connection> SetWorker<Conn> {
                         // rustc still sees something "non-Send" held across an
                         // `.await`.
                         let work = {
-                            let slot_inner = slot.inner.lock().unwrap();
-                            match &slot_inner.state {
+                            let guarded = slot.inner.guarded.lock().unwrap();
+                            match &guarded.state {
                                 State::Connecting => Work::DoConnect,
                                 State::ConnectedUnclaimed(_)
+                                | State::ConnectedRecycling(_)
                                 | State::ConnectedChecking
                                 | State::ConnectedClaimed => Work::DoMonitor,
                                 State::Terminated => return,
@@ -454,19 +530,23 @@ impl<Conn: Connection> SetWorker<Conn> {
                                 .await;
                             }
                             Work::DoMonitor => {
-                                let span = span!(Level::TRACE, "Slot worker monitoring", slot_id);
-                                async {
-                                    interval.tick().await;
-                                    slot.validate_health_if_connected(
-                                        &connector,
-                                        config.health_check_timeout,
-                                    )
-                                    .await;
-                                    interval
-                                        .reset_after(interval.period().add_spread(config.spread));
+                                tokio::select! {
+                                    _ = interval.tick() => {
+                                        slot.validate_health_if_connected(
+                                            &connector,
+                                            config.health_check_timeout,
+                                        )
+                                        .await;
+                                        interval
+                                            .reset_after(interval.period().add_spread(config.spread));
+                                    },
+                                    _ = slot.inner.recycling_needed.notified() => {
+                                        slot.recycle_if_needed(
+                                            &connector,
+                                            config.health_check_timeout,
+                                        ).await;
+                                    },
                                 }
-                                .instrument(span)
-                                .await;
                             }
                         }
                     }
@@ -485,17 +565,18 @@ impl<Conn: Connection> SetWorker<Conn> {
         permit: mpsc::OwnedPermit<BorrowedConnection<Conn>>,
     ) -> Option<claim::Handle<Conn>> {
         for (id, slot) in &mut self.slots {
-            let mut slot = slot.inner.lock().unwrap();
-            event!(Level::TRACE, id, state = ?slot.state, "Considering slot");
-            if matches!(slot.state, State::ConnectedUnclaimed(_)) {
+            let guarded = slot.inner.guarded.lock().unwrap();
+            event!(Level::TRACE, id, state = ?guarded.state, "Considering slot");
+            if matches!(guarded.state, State::ConnectedUnclaimed(_)) {
                 event!(Level::TRACE, id, "Found unclaimed slot");
                 // We intentionally "take the connection out" of the slot and
                 // "place it into a claim::Handle" in the same method.
                 //
                 // This makes it difficult to leak a connection, unless the drop
                 // method of the claim::Handle is skipped.
-                let State::ConnectedUnclaimed(DebugIgnore(conn)) =
-                    slot.state_transition(State::ConnectedClaimed)
+                let State::ConnectedUnclaimed(DebugIgnore(conn)) = slot
+                    .inner
+                    .state_transition(guarded, State::ConnectedClaimed)
                 else {
                     panic!(
                         "We just matched this type before replacing it; this should be impossible"
@@ -525,7 +606,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     )]
     fn recycle_connection(&mut self, borrowed_conn: BorrowedConnection<Conn>) {
         let slot_id = borrowed_conn.id;
-        let slot = self
+        let inner = self
             .slots
             .get_mut(&slot_id)
             .expect(
@@ -536,19 +617,24 @@ impl<Conn: Connection> SetWorker<Conn> {
             .inner
             .clone();
         {
-            let mut slot = slot.lock().unwrap();
+            let guarded = inner.guarded.lock().unwrap();
             assert!(
-                matches!(slot.state, State::ConnectedClaimed),
+                matches!(guarded.state, State::ConnectedClaimed),
                 "Unexpected slot state {:?}",
-                slot.state
+                guarded.state
             );
-            slot.state_transition(State::ConnectedUnclaimed(DebugIgnore(borrowed_conn.conn)));
+            inner.state_transition(
+                guarded,
+                State::ConnectedRecycling(DebugIgnore(borrowed_conn.conn)),
+            );
         }
 
         // If we tried to shrink the slot count while too many connections were
         // in-use, it's possible there's more work to do. Try to conform the
         // slot count after recycling each connection.
         self.conform_slot_count();
+
+        inner.recycling_needed.notify_one();
     }
 
     fn set_wanted_count(&mut self, count: usize) {
@@ -593,22 +679,24 @@ impl<Conn: Connection> SetWorker<Conn> {
                 // This is a minor optimization that avoids tearing down a
                 // connected spare while also trying to create a new one.
                 let filters = [
-                    |slot: &SlotInner<Conn>| !slot.state.connected() && slot.state.removable(),
-                    |slot: &SlotInner<Conn>| slot.state.removable(),
+                    |slot: &SlotInnerGuarded<Conn>| {
+                        !slot.state.connected() && slot.state.removable()
+                    },
+                    |slot: &SlotInnerGuarded<Conn>| slot.state.removable(),
                 ];
                 for filter in filters {
                     for (key, slot) in &self.slots {
                         if to_remove.len() >= count_to_remove {
                             break;
                         }
-                        let mut slot = slot.inner.lock().unwrap();
-                        if filter(&*slot) {
+                        let guarded = slot.inner.guarded.lock().unwrap();
+                        if filter(&*guarded) {
                             to_remove.push(*key);
 
                             // It's important that we terminate the slot
                             // immediately, so the task which manages the slot
                             // will not continue modifying the state.
-                            slot.state_transition(State::Terminated);
+                            slot.inner.state_transition(guarded, State::Terminated);
                         }
                     }
                 }
@@ -618,7 +706,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                     let Some(slot) = self.slots.remove(&key) else {
                         continue;
                     };
-                    let Some(handle) = slot.inner.lock().unwrap().handle.take() else {
+                    let Some(handle) = slot.inner.guarded.lock().unwrap().handle.take() else {
                         continue;
                     };
                     event!(Level::TRACE, slot_id = key, "Aborting task");
@@ -1144,4 +1232,7 @@ mod test {
         assert_eq!(stats.all_slots(), 3);
         assert_eq!(stats.connecting_slots, 3);
     }
+
+    // TODO: Add test for periodic health checking, "is_valid"
+    // TODO: Add test for recycling, "on_recycle"
 }
