@@ -968,17 +968,44 @@ mod test {
     use crate::backend;
     use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    struct TestConnection {}
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    enum TestConnectionState {
+        Connected,
+        Valid,
+        ValidFail,
+        Recycled,
+        RecycledFail,
+    }
+
+    #[derive(Clone)]
+    struct TestConnection(Arc<Mutex<TestConnectionState>>);
+
+    impl TestConnection {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(TestConnectionState::Connected)))
+        }
+
+        fn get_state(&self) -> TestConnectionState {
+            *self.0.lock().unwrap()
+        }
+
+        fn set_state(&self, state: TestConnectionState) {
+            *self.0.lock().unwrap() = state;
+        }
+    }
 
     struct TestConnector {
         can_connect: AtomicBool,
+        can_recycle: AtomicBool,
     }
 
     impl TestConnector {
         fn new() -> TestConnector {
             Self {
                 can_connect: AtomicBool::new(true),
+                can_recycle: AtomicBool::new(true),
             }
         }
 
@@ -986,32 +1013,49 @@ mod test {
         fn set_connectable(&self, can_connect: bool) {
             self.can_connect.store(can_connect, Ordering::SeqCst);
         }
+
+        #[instrument(level = "trace", skip(self))]
+        fn set_recyclable(&self, can_recycle: bool) {
+            self.can_recycle.store(can_recycle, Ordering::SeqCst);
+        }
     }
 
     #[async_trait::async_trait]
     impl backend::Connector for TestConnector {
         type Connection = TestConnection;
 
-        /// Creates a connection to a backend.
         async fn connect(&self, backend: &Backend) -> Result<Self::Connection, backend::Error> {
             assert_eq!(backend, &backend::Backend { address: BACKEND });
 
             if self.can_connect.load(Ordering::SeqCst) {
                 event!(Level::INFO, "TestConnector::Connect - OK");
-                Ok(TestConnection {})
+                Ok(TestConnection::new())
             } else {
                 event!(Level::WARN, "TestConnector::Connect - FAIL");
                 Err(backend::Error::Other(anyhow::anyhow!("Failed")))
             }
         }
 
-        /// Determines if the connection to a backend is still valid.
-        async fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), backend::Error> {
+        async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), backend::Error> {
             if self.can_connect.load(Ordering::SeqCst) {
                 event!(Level::INFO, "TestConnector::is_valid - OK");
+                conn.set_state(TestConnectionState::Valid);
                 Ok(())
             } else {
                 event!(Level::WARN, "TestConnector::is_valid - FAIL");
+                conn.set_state(TestConnectionState::ValidFail);
+                Err(backend::Error::Other(anyhow::anyhow!("Failed")))
+            }
+        }
+
+        async fn on_recycle(&self, conn: &mut Self::Connection) -> Result<(), backend::Error> {
+            if self.can_recycle.load(Ordering::SeqCst) {
+                event!(Level::INFO, "TestConnector::on_recycle - OK");
+                conn.set_state(TestConnectionState::Recycled);
+                Ok(())
+            } else {
+                event!(Level::INFO, "TestConnector::on_recycle - FAIL");
+                conn.set_state(TestConnectionState::RecycledFail);
                 Err(backend::Error::Other(anyhow::anyhow!("Failed")))
             }
         }
@@ -1041,15 +1085,10 @@ mod test {
         );
 
         // Let the connections fill up
-        loop {
-            let stats = set.get_stats();
-            if stats.unclaimed_slots == 0 {
-                event!(Level::WARN, "No unclaimed slots");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            } else {
-                break;
-            }
-        }
+        set.monitor()
+            .wait_for(|state| matches!(state, SetState::Online))
+            .await
+            .unwrap();
 
         let _conn = set.claim().await.unwrap();
     }
@@ -1233,6 +1272,79 @@ mod test {
         assert_eq!(stats.connecting_slots, 3);
     }
 
+    #[tokio::test]
+    async fn test_on_recycle() {
+        setup_tracing_subscriber();
+
+        let wanted_count = 5;
+        let connector = Arc::new(TestConnector::new());
+        let mut set = Set::new(
+            SetConfig::default(),
+            wanted_count,
+            backend::Name::new("Test set"),
+            backend::Backend { address: BACKEND },
+            connector.clone(),
+        );
+
+        // Wait for all slots to be ready
+        loop {
+            let stats = set.get_stats();
+            if stats.unclaimed_slots < wanted_count {
+                event!(Level::WARN, "Not enough unclaimed slots");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                break;
+            }
+        }
+
+        // Grab one of the slots. Inspect the state, validating it is connected.
+        let conn = set.claim().await.unwrap();
+        let raw_conn = conn.clone();
+        assert_eq!(raw_conn.get_state(), TestConnectionState::Connected);
+        drop(conn);
+
+        // Wait for all slots to be ready again
+        loop {
+            let stats = set.get_stats();
+            if stats.unclaimed_slots < wanted_count {
+                event!(Level::WARN, "Not enough unclaimed slots");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                break;
+            }
+        }
+
+        // When this connection handle was dropped, this should have kicked off
+        // a series of events leading to the "on_recycle" method being called on
+        // this connection.
+        assert_eq!(raw_conn.get_state(), TestConnectionState::Recycled);
+
+        connector.set_recyclable(false);
+        let conn = set.claim().await.unwrap();
+        let raw_conn = conn.clone();
+        assert_eq!(raw_conn.get_state(), TestConnectionState::Recycled);
+        drop(conn);
+
+        // Wait for all slots to be ready again (we expect the pathway for the
+        // recycled connection to be: "Claimed" -> "Recycled" -> "Unclaimed" ->
+        // "Connected").
+        //
+        // This happens because the slot set grabs a new connection after
+        // this slot fails during recycling.
+        loop {
+            let stats = set.get_stats();
+            if stats.unclaimed_slots < wanted_count {
+                event!(Level::WARN, "Not enough unclaimed slots");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                break;
+            }
+        }
+
+        // We called "set_recyclable(false)" earlier, so the recycled connection
+        // should have failed.
+        assert_eq!(raw_conn.get_state(), TestConnectionState::RecycledFail);
+    }
+
     // TODO: Add test for periodic health checking, "is_valid"
-    // TODO: Add test for recycling, "on_recycle"
 }
