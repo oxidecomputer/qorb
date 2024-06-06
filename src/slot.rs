@@ -325,10 +325,20 @@ impl<Conn: Connection> BorrowedConnection<Conn> {
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Stats {
+    /// Slots which are actively trying to form a connection.
     pub connecting_slots: usize,
+    /// Slots which are connected, but are not in-use.
     pub unclaimed_slots: usize,
+    /// Slots which are connected, but are undergoing a health check.
+    ///
+    /// This may be due to return-to-pool recycling checks, or
+    /// may be from a periodic timer.
     pub checking_slots: usize,
+    /// Slots which are currently in-use because they are claimed
+    /// by a client of qorb.
     pub claimed_slots: usize,
+
+    /// The sum of all claims which have been made, historically.
     pub total_claims: usize,
 }
 
@@ -998,6 +1008,7 @@ mod test {
 
     struct TestConnector {
         can_connect: AtomicBool,
+        can_validate: AtomicBool,
         can_recycle: AtomicBool,
     }
 
@@ -1005,6 +1016,7 @@ mod test {
         fn new() -> TestConnector {
             Self {
                 can_connect: AtomicBool::new(true),
+                can_validate: AtomicBool::new(true),
                 can_recycle: AtomicBool::new(true),
             }
         }
@@ -1012,6 +1024,11 @@ mod test {
         #[instrument(level = "trace", skip(self))]
         fn set_connectable(&self, can_connect: bool) {
             self.can_connect.store(can_connect, Ordering::SeqCst);
+        }
+
+        #[instrument(level = "trace", skip(self))]
+        fn set_valid(&self, can_validate: bool) {
+            self.can_validate.store(can_validate, Ordering::SeqCst);
         }
 
         #[instrument(level = "trace", skip(self))]
@@ -1037,7 +1054,7 @@ mod test {
         }
 
         async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), backend::Error> {
-            if self.can_connect.load(Ordering::SeqCst) {
+            if self.can_validate.load(Ordering::SeqCst) {
                 event!(Level::INFO, "TestConnector::is_valid - OK");
                 conn.set_state(TestConnectionState::Valid);
                 Ok(())
@@ -1263,6 +1280,7 @@ mod test {
         // Disable connections, rely on health monitoring to disable them once
         // more.
         connector.set_connectable(false);
+        connector.set_valid(false);
 
         // Let the connections die as their health checks fail
         monitor.changed().await.unwrap();
@@ -1346,5 +1364,48 @@ mod test {
         assert_eq!(raw_conn.get_state(), TestConnectionState::RecycledFail);
     }
 
-    // TODO: Add test for periodic health checking, "is_valid"
+    #[tokio::test]
+    async fn test_health_monitoring() {
+        setup_tracing_subscriber();
+        let wanted_count = 5;
+        let connector = Arc::new(TestConnector::new());
+        let health_interval = Duration::from_millis(1);
+        let mut set = Set::new(
+            SetConfig {
+                health_interval,
+                spread: Duration::ZERO,
+                ..Default::default()
+            },
+            wanted_count,
+            backend::Name::new("Test set"),
+            backend::Backend { address: BACKEND },
+            connector.clone(),
+        );
+
+        set.monitor()
+            .wait_for(|state| matches!(state, SetState::Online))
+            .await
+            .unwrap();
+
+        // Grab a connection, but then set "connectable" and "valid" to false.
+        //
+        // This means no new connections, and existing connections will die
+        // when health checked.
+        let conn = set.claim().await.unwrap();
+        connector.set_connectable(false);
+        connector.set_valid(false);
+        let raw_conn = conn.clone();
+        assert_eq!(raw_conn.get_state(), TestConnectionState::Connected);
+        drop(conn);
+
+        // Wait for all connections to depart.
+        set.monitor()
+            .wait_for(|state| matches!(state, SetState::Offline))
+            .await
+            .unwrap();
+
+        // Note that the connection we previously tried to access was marked
+        // as failed during validation.
+        assert_eq!(raw_conn.get_state(), TestConnectionState::ValidFail);
+    }
 }
