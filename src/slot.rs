@@ -1297,7 +1297,12 @@ mod test {
         let wanted_count = 5;
         let connector = Arc::new(TestConnector::new());
         let mut set = Set::new(
-            SetConfig::default(),
+            SetConfig {
+                // Make it significantly less likely to race with a health
+                // check.
+                health_interval: Duration::from_secs(10000),
+                ..Default::default()
+            },
             wanted_count,
             backend::Name::new("Test set"),
             backend::Backend { address: BACKEND },
@@ -1395,7 +1400,15 @@ mod test {
         connector.set_connectable(false);
         connector.set_valid(false);
         let raw_conn = conn.clone();
-        assert_eq!(raw_conn.get_state(), TestConnectionState::Connected);
+
+        // The state can be either connected (if we get a new connection)
+        // or valid (if we happened to perform our claim after a health check
+        // occurred).
+        let state = raw_conn.get_state();
+        assert!(
+            state == TestConnectionState::Connected || state == TestConnectionState::Valid,
+            "Unexpected state: {state:?}"
+        );
         drop(conn);
 
         // Wait for all connections to depart.
