@@ -31,6 +31,21 @@ how to create a connection pool with a custom TCP connection.
 This provides a setup for generating a workload to an arbitrary number of
 backends, and then walks through the tools to inspect the connection pool.
 
+== Terminology
+
+* **Service**: A named entity which refers to a program that is running with one or more instantiations
+as distinct backends.
+* **Backend**: An specific instance of a program running a service. Each backend should provide the same interface, such that a client can access any one of the backends implementing a service interchangeably.
+* **Resolver**: A client-side entity responsible for translating service name into backend location. A common
+example of a resolver is "DNS".
+* **Slot**: An allocated commitment to create a connection to a particular backend. A slot may be "connected"
+if the connection has been established, or "connecting" if the backend hasn't yet been reached.
+* **Slot Set**: A group of slots all attempting to access a particular backend. The number of slots
+which are allocated for each backend is controlled by qorb, but may be adjusted via user-configurable policy.
+* **Pool**: The a group of connections to one or more backends, from which a client of qorb can
+"claim" a connection. The pool manages resolvers, finds backends, creates slots for backends, and vends
+out connected slots to clients.
+
 == TODO List
 
 Things I'd like to do before getting more eyes on this:
