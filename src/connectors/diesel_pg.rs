@@ -4,9 +4,13 @@ use crate::backend::{self, Backend, Error};
 
 use anyhow::anyhow;
 use async_bb8_diesel::AsyncR2D2Connection;
+use async_bb8_diesel::AsyncSimpleConnection;
 use async_trait::async_trait;
 use diesel::pg::PgConnection;
 use diesel::Connection;
+use diesel_dtrace::DTraceConnection;
+
+type DbConnection = DTraceConnection<PgConnection>;
 
 /// A [backend::Connector] which provides access to [PgConnection].
 pub struct DieselPgConnector {
@@ -45,19 +49,28 @@ impl DieselPgConnector {
     }
 }
 
+pub const DISALLOW_FULL_TABLE_SCAN_SQL: &str =
+    "set disallow_full_table_scans = on; set large_full_scan_rows = 0;";
+
 #[async_trait]
 impl backend::Connector for DieselPgConnector {
-    type Connection = async_bb8_diesel::Connection<PgConnection>;
+    type Connection = async_bb8_diesel::Connection<DbConnection>;
 
     async fn connect(&self, backend: &Backend) -> Result<Self::Connection, Error> {
         let url = self.to_url(backend.address);
 
-        tokio::task::spawn_blocking(move || {
-            let pg_conn = PgConnection::establish(&url).map_err(|e| Error::Other(anyhow!(e)))?;
-            Ok(async_bb8_diesel::Connection::new(pg_conn))
+        let conn = tokio::task::spawn_blocking(move || {
+            let pg_conn = DbConnection::establish(&url).map_err(|e| Error::Other(anyhow!(e)))?;
+            Ok::<_, Error>(async_bb8_diesel::Connection::new(pg_conn))
         })
         .await
-        .expect("Task panicked establishing connection")
+        .expect("Task panicked establishing connection")?;
+
+        // TODO: This be a better fit with an "on_acquire" function?
+        conn.batch_execute_async(DISALLOW_FULL_TABLE_SCAN_SQL)
+            .await
+            .map_err(|e| Error::Other(anyhow!(e)))?;
+        Ok(conn)
     }
 
     async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Error> {

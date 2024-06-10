@@ -30,11 +30,17 @@ pub enum Error {
     #[error(transparent)]
     Slot(#[from] slot::Error),
 
-    #[error("Cannot resolve backend name for service")]
-    Resolve(#[from] resolver::Error),
-
     #[error("Pool terminated")]
     Terminated,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum PoolState {
+    /// At least one slot in one slot set is connected to the backend.
+    Online,
+
+    /// No slots are connected to any backends.
+    Offline,
 }
 
 enum Request<Conn: Connection> {
@@ -76,6 +82,9 @@ struct PoolInner<Conn: Connection> {
     // Should be kept in lockstep with "Self::slots".
     stats_tx: watch::Sender<HashMap<backend::Name, BackendStats>>,
 
+    // Identifies when the pool has changed state
+    status_tx: watch::Sender<PoolState>,
+
     rx: mpsc::Receiver<Request<Conn>>,
 }
 
@@ -86,6 +95,7 @@ impl<Conn: Connection> PoolInner<Conn> {
         policy: Policy,
         rx: mpsc::Receiver<Request<Conn>>,
         stats_tx: watch::Sender<HashMap<backend::Name, BackendStats>>,
+        status_tx: watch::Sender<PoolState>,
     ) -> Self {
         Self {
             backend_connector,
@@ -94,6 +104,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             priority_list: PriorityList::new(),
             policy,
             stats_tx,
+            status_tx,
             rx,
         }
     }
@@ -243,8 +254,10 @@ impl<Conn: Connection> PoolInner<Conn> {
 
         if usable_backends.is_empty() {
             event!(Level::DEBUG, "No observed usable backends");
+            self.status_tx.send_replace(PoolState::Offline);
             return;
         }
+        self.status_tx.send_replace(PoolState::Online);
 
         event!(Level::DEBUG, backends = ?usable_backends, "Observed usable backends");
 
@@ -343,6 +356,7 @@ impl<Conn: Connection> PoolInner<Conn> {
 pub struct Pool<Conn: Connection> {
     handle: tokio::task::JoinHandle<()>,
     tx: mpsc::Sender<Request<Conn>>,
+    status_rx: watch::Receiver<PoolState>,
     stats: Stats,
 }
 
@@ -401,14 +415,17 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     ) -> Self {
         let (tx, rx) = mpsc::channel(1);
         let (stats_tx, stats_rx) = watch::channel(HashMap::default());
+        let (status_tx, status_rx) = watch::channel(PoolState::Offline);
         let handle = tokio::task::spawn(async move {
-            let worker = PoolInner::new(resolver, backend_connector, policy, rx, stats_tx);
+            let worker =
+                PoolInner::new(resolver, backend_connector, policy, rx, stats_tx, status_tx);
             worker.run().await;
         });
 
         Self {
             handle,
             tx,
+            status_rx,
             stats: Stats {
                 rx: stats_rx,
                 claims: Arc::new(AtomicUsize::new(0)),
@@ -432,6 +449,19 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
         let claim = rx.await.map_err(|_| Error::Terminated)?;
         self.stats.claims.fetch_add(1, Ordering::Relaxed);
         claim
+    }
+
+    /// Waits until at least one handle has been created within the pool.
+    ///
+    /// This is primarily used for testing, and is otherwise not
+    /// recommended in an environment where backends are dynamic.
+    #[instrument(level = "debug", skip(self), name = "Pool::block_until_online")]
+    pub async fn block_until_online(&self) {
+        self.status_rx
+            .clone()
+            .wait_for(|state| *state == PoolState::Online)
+            .await
+            .expect("Pool dropped while waiting for it to become online");
     }
 }
 

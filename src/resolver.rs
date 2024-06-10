@@ -4,21 +4,7 @@ use crate::backend::{self, Backend};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use thiserror::Error;
 use tokio::sync::watch;
-
-#[derive(Error, Clone, Debug)]
-pub enum Error {}
-
-/// Events sent to the connection pool from the resolver
-#[derive(Clone, Debug)]
-pub enum Event {
-    /// One or more backends have been added
-    Added(Vec<(backend::Name, Backend)>),
-
-    /// One or more backends have been removed
-    Removed(Vec<backend::Name>),
-}
 
 pub type AllBackends = Arc<BTreeMap<backend::Name, Backend>>;
 

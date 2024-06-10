@@ -19,9 +19,9 @@ schemars = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 thiserror = "1.0"
-tokio = { version = "1.38.0"}
+tokio = { version = "1.38"}
 tokio-stream = { version = "0.1", features = [ "sync" ] }
-tokio-tungstenite = "0.23.0"
+tokio-tungstenite = "0.23"
 tracing = "0.1"
 crossterm = "0.27.0"
 hickory-client = { version = "0.24", default-features = false }
@@ -45,6 +45,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 async-bb8-diesel = { workspace = true, optional = true }
 diesel = { version = "2.1", optional = true, features = [ "postgres", "r2d2" ] }
+diesel-dtrace = { git = "https://github.com/oxidecomputer/diesel-dtrace", branch = "main", optional = true }
 debug-ignore = { workspace = true }
 derive-where = { workspace = true }
 dropshot = { workspace = true, optional = true }
@@ -76,5 +77,5 @@ tracing-subscriber = "0.3"
 [features]
 all = [ "diesel_pg", "qtop" ]
 default = []
-diesel_pg = ["dep:diesel", "dep:async-bb8-diesel"]
+diesel_pg = ["dep:diesel", "dep:diesel-dtrace", "dep:async-bb8-diesel"]
 qtop = ["dep:dropshot", "dep:tokio-tungstenite", "serde", "dep:serde_json", "dep:schemars"]
