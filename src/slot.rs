@@ -124,10 +124,10 @@ impl<Conn: Connection> SlotInner<Conn> {
         let old = std::mem::replace(&mut inner.state, new);
 
         let mut stats = self.stats.lock().unwrap();
-        let before_no_connected = stats.has_no_connected_slots();
         stats.exit_state(&old);
         stats.enter_state(&inner.state);
-        let after_no_connected = stats.has_no_connected_slots();
+        let is_connected = !stats.has_no_connected_slots();
+        let now_has_unclaimed_slots = stats.unclaimed_slots > 0;
 
         // "Not connected" may mean:
         // - We're still initializing the backend, or
@@ -136,17 +136,42 @@ impl<Conn: Connection> SlotInner<Conn> {
         // Either way, transitioning into or out of this state is
         // an important signal to the pool, which may want to tune
         // the number of slots provisioned to this set.
-        match (before_no_connected, after_no_connected) {
-            (true, false) => {
-                event!(Level::INFO, "state_transition: Set Online");
-                inner.status_tx.send_replace(SetState::Online);
-            }
-            (false, true) => {
-                event!(Level::INFO, "state_transition: Set Offline");
-                inner.status_tx.send_replace(SetState::Offline);
-            }
-            _ => (),
+        let set_online = || {
+            event!(Level::INFO, "state_transition: Set Online");
+            inner.status_tx.send_replace(SetState::Online {
+                has_unclaimed_slots: now_has_unclaimed_slots,
+            });
         };
+        let set_offline = || {
+            event!(Level::INFO, "state_transition: Set Offline");
+            inner.status_tx.send_replace(SetState::Offline);
+        };
+
+        let old_state = *inner.status_tx.borrow();
+        match (old_state, is_connected) {
+            // If we were offline, identify that the set is online
+            (SetState::Offline, true) => set_online(),
+            // If the status of unclaimed slots has changed, update it
+            (
+                SetState::Online {
+                    has_unclaimed_slots,
+                },
+                true,
+            ) if has_unclaimed_slots != now_has_unclaimed_slots => set_online(),
+            // If we were online, identify that the set is offline
+            (SetState::Online { .. }, false) => set_offline(),
+            // In all other cases (online -> online, offline -> offline), skip the update.
+            //
+            // We could send_replace here too, but avoiding it minimizes churn
+            // seen by the pool.
+            (
+                SetState::Online {
+                    has_unclaimed_slots: _,
+                },
+                true,
+            )
+            | (SetState::Offline, false) => (),
+        }
 
         old
     }
@@ -808,7 +833,10 @@ impl<Conn: Connection> SetWorker<Conn> {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum SetState {
     /// At least one slot is connected to the backend.
-    Online,
+    Online {
+        /// True if there are any unclaimed slots
+        has_unclaimed_slots: bool,
+    },
 
     /// No slots are known to be connected to the backend.
     Offline,
@@ -1103,7 +1131,7 @@ mod test {
 
         // Let the connections fill up
         set.monitor()
-            .wait_for(|state| matches!(state, SetState::Online))
+            .wait_for(|state| matches!(state, SetState::Online { .. }))
             .await
             .unwrap();
 
@@ -1123,7 +1151,7 @@ mod test {
 
         // Let the connections fill up
         set.monitor()
-            .wait_for(|state| matches!(state, SetState::Online))
+            .wait_for(|state| matches!(state, SetState::Online { .. }))
             .await
             .unwrap();
 
@@ -1142,7 +1170,7 @@ mod test {
             }
         }
 
-        assert_eq!(set.get_state(), SetState::Online);
+        assert!(matches!(set.get_state(), SetState::Online { .. }));
         assert_eq!(set.get_stats().claimed_slots, 1);
         drop(conn);
 
@@ -1176,7 +1204,7 @@ mod test {
 
         // Let the connections fill up
         set.monitor()
-            .wait_for(|state| matches!(state, SetState::Online))
+            .wait_for(|state| matches!(state, SetState::Online { .. }))
             .await
             .unwrap();
 
@@ -1274,8 +1302,11 @@ mod test {
             }
         }
 
-        assert_eq!(*monitor.borrow_and_update(), SetState::Online);
-        assert_eq!(set.get_state(), SetState::Online);
+        assert!(matches!(
+            *monitor.borrow_and_update(),
+            SetState::Online { .. }
+        ));
+        assert!(matches!(set.get_state(), SetState::Online { .. }));
 
         // Disable connections, rely on health monitoring to disable them once
         // more.
@@ -1388,7 +1419,7 @@ mod test {
         );
 
         set.monitor()
-            .wait_for(|state| matches!(state, SetState::Online))
+            .wait_for(|state| matches!(state, SetState::Online { .. }))
             .await
             .unwrap();
 

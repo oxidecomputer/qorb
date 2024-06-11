@@ -11,6 +11,7 @@ use crate::slot;
 
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -66,6 +67,7 @@ struct PoolInner<Conn: Connection> {
     slots: HashMap<backend::Name, slot::Set<Conn>>,
     priority_list: PriorityList<backend::Name>,
 
+    request_queue: VecDeque<oneshot::Sender<Result<claim::Handle<Conn>, Error>>>,
     policy: Policy,
 
     // Tracks stats for each backend.
@@ -89,6 +91,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             resolver,
             slots: HashMap::new(),
             priority_list: PriorityList::new(),
+            request_queue: VecDeque::new(),
             policy,
             stats_tx,
             rx,
@@ -182,10 +185,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                 // Handle requests from clients
                 request = self.rx.recv() => {
                     match request {
-                        Some(Request::Claim { tx }) => {
-                            let result = self.claim().await;
-                            let _ = tx.send(result);
-                        },
+                        Some(Request::Claim { tx }) => self.claim_or_enqueue(tx).await,
                         None => return,
                     }
                 }
@@ -214,8 +214,35 @@ impl<Conn: Connection> PoolInner<Conn> {
                     event!(Level::INFO, name = ?name, status = ?status, "Rebalancing: Backend has new status");
                     rebalance_interval.reset();
                     self.rebalance().await;
+
+                    if matches!(status, slot::SetState::Online { has_unclaimed_slots: true }) &&
+                        !self.request_queue.is_empty() {
+                        self.try_claim_from_queue().await;
+                    }
                 },
             }
+        }
+    }
+
+    async fn claim_or_enqueue(&mut self, tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>) {
+        let result = self.claim().await;
+        if result.is_ok() {
+            let _ = tx.send(result);
+        } else {
+            self.request_queue.push_back(tx);
+        }
+    }
+
+    async fn try_claim_from_queue(&mut self) {
+        let Some(tx) = self.request_queue.pop_front() else {
+            return;
+        };
+
+        let result = self.claim().await;
+        if result.is_ok() {
+            let _ = tx.send(result);
+        } else {
+            self.request_queue.push_front(tx);
         }
     }
 
@@ -232,7 +259,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                     let _ = slot_set.set_wanted_count(1).await;
                     questionable_backend_count += 1;
                 }
-                slot::SetState::Online => {
+                slot::SetState::Online { .. } => {
                     usable_backends.push(name.clone());
                 }
             }
@@ -435,5 +462,172 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
 impl<Conn: Connection> Drop for Pool<Conn> {
     fn drop(&mut self) {
         self.handle.abort()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use crate::backend::{self, Backend, Connector};
+    use crate::policy::{Policy, SetConfig};
+    use crate::resolver::{AllBackends, Resolver};
+    use async_trait::async_trait;
+    use std::collections::BTreeMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct TestResolver {
+        tx: watch::Sender<AllBackends>,
+    }
+
+    impl TestResolver {
+        fn new() -> Self {
+            let backends = Arc::new(BTreeMap::new());
+            let (tx, _) = watch::channel(backends);
+            Self { tx }
+        }
+
+        fn replace(&self, backends: BTreeMap<backend::Name, Backend>) {
+            self.tx.send_replace(Arc::new(backends));
+        }
+    }
+
+    impl Resolver for TestResolver {
+        fn monitor(&mut self) -> watch::Receiver<AllBackends> {
+            self.tx.subscribe()
+        }
+    }
+
+    struct TestConnection {
+        id: usize,
+        backend: Backend,
+    }
+
+    impl TestConnection {
+        fn new(id: usize, backend: Backend) -> Self {
+            Self { id, backend }
+        }
+    }
+
+    struct TestConnector {
+        next_id: AtomicUsize,
+    }
+
+    impl TestConnector {
+        fn new() -> Self {
+            Self {
+                next_id: AtomicUsize::new(1),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Connector for TestConnector {
+        type Connection = TestConnection;
+
+        async fn connect(&self, backend: &Backend) -> Result<Self::Connection, backend::Error> {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            Ok(TestConnection::new(id, backend.clone()))
+        }
+    }
+
+    // Tests that a claim can be made to a single backend.
+    #[tokio::test]
+    async fn test_get_claim_from_one_backend() {
+        let resolver = Box::new(TestResolver::new());
+        let connector = Arc::new(TestConnector::new());
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        resolver.replace(BTreeMap::from([(
+            backend::Name::new("aaa"),
+            Backend::new(address),
+        )]));
+
+        let pool = Pool::new(resolver, connector, Policy::default());
+        let handle = pool.claim().await.expect("Failed to get claim");
+
+        assert_eq!(handle.id, 1);
+        assert_eq!(handle.backend.address, address);
+    }
+
+    // Tests that a claim can be made before backends actually appear,
+    // and they'll be enqueued / complete later.
+    #[tokio::test]
+    async fn test_get_claim_before_backend_appears() {
+        let resolver = Box::new(TestResolver::new());
+        let connector = Arc::new(TestConnector::new());
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        let pool = Pool::new(resolver.clone(), connector, Policy::default());
+
+        let join_handle = tokio::task::spawn(async move {
+            let handle = pool.claim().await.expect("Failed to get claim");
+            assert_eq!(handle.id, 1);
+            assert_eq!(handle.backend.address, address);
+        });
+
+        resolver.replace(BTreeMap::from([(
+            backend::Name::new("aaa"),
+            Backend::new(address),
+        )]));
+
+        join_handle.await.expect("Background task failed");
+    }
+
+    // Tests that claims are enqueued when there are more claims being made
+    // than slots available.
+    #[tokio::test]
+    async fn test_get_more_claims_than_slots() {
+        let resolver = Box::new(TestResolver::new());
+        let connector = Arc::new(TestConnector::new());
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        resolver.replace(BTreeMap::from([(
+            backend::Name::new("aaa"),
+            Backend::new(address),
+        )]));
+
+        let pool = Pool::new(
+            resolver,
+            connector,
+            Policy {
+                spares_wanted: 5,
+                max_slots: 5,
+                set_config: SetConfig {
+                    max_count: 5,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        // Fill all the spares with claims
+        let mut handles = vec![];
+        for i in 1..=5 {
+            let handle = pool.claim().await.expect("Failed to get claim");
+            assert_eq!(handle.id, i);
+            assert_eq!(handle.backend.address, address);
+            handles.push(handle);
+        }
+
+        // When we try another claim, it should not be able to complete
+        let result =
+            tokio::time::timeout(tokio::time::Duration::from_millis(50), pool.claim()).await;
+        assert!(
+            result.is_err(),
+            "Unexpected non-error result (expected timeout)"
+        );
+
+        // If we make space (drop a previously-used handle, which should recycle a slot),
+        // then the next claim we make should succeed, and re-use that old connection.
+        handles.remove(0);
+
+        let handle = pool
+            .claim()
+            .await
+            .expect("Failed to get claim after space became available!");
+        assert_eq!(handle.id, 1);
     }
 }

@@ -58,6 +58,12 @@ pub struct Backend {
     pub address: SocketAddr,
 }
 
+impl Backend {
+    pub fn new(address: SocketAddr) -> Self {
+        Self { address }
+    }
+}
+
 /// Interface for raw connections.
 pub trait Connection: Send + 'static {}
 

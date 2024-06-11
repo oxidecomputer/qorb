@@ -5,6 +5,7 @@ use qorb::backend::{self, Backend};
 
 generate_api!("examples/dropshot_echo_server/openapi.json");
 
+#[allow(dead_code)]
 struct EchoClientConnector {}
 
 #[async_trait]
