@@ -215,8 +215,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                     rebalance_interval.reset();
                     self.rebalance().await;
 
-                    if matches!(status, slot::SetState::Online { has_unclaimed_slots: true }) &&
-                        !self.request_queue.is_empty() {
+                    if matches!(status, slot::SetState::Online { has_unclaimed_slots: true }) {
                         self.try_claim_from_queue().await;
                     }
                 },
@@ -234,15 +233,18 @@ impl<Conn: Connection> PoolInner<Conn> {
     }
 
     async fn try_claim_from_queue(&mut self) {
-        let Some(tx) = self.request_queue.pop_front() else {
-            return;
-        };
+        loop {
+            let Some(tx) = self.request_queue.pop_front() else {
+                return;
+            };
 
-        let result = self.claim().await;
-        if result.is_ok() {
-            let _ = tx.send(result);
-        } else {
-            self.request_queue.push_front(tx);
+            let result = self.claim().await;
+            if result.is_ok() {
+                let _ = tx.send(result);
+            } else {
+                self.request_queue.push_front(tx);
+                return;
+            }
         }
     }
 
