@@ -63,6 +63,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 camino = { workspace = true }
+criterion = { version = "0.5.1", features = [ "async_tokio" ] }
 crossterm = { workspace = true, features = ["event-stream"] }
 dropshot = { workspace = true }
 hickory-client = { workspace = true, default-features = false }
@@ -73,6 +74,10 @@ reqwest = { workspace = true, features = ["json", "stream"] }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "test-util"] }
 tracing-subscriber = "0.3"
+
+[[bench]]
+name = "pool_benchmark"
+harness = false
 
 [features]
 all = [ "diesel_pg", "qtop" ]
