@@ -18,7 +18,7 @@ use std::sync::{
 };
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::interval;
+use tokio::time::{interval, Duration};
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::StreamMap;
 use tracing::{event, instrument, Level};
@@ -33,6 +33,9 @@ pub enum Error {
 
     #[error("Pool terminated")]
     Terminated,
+
+    #[error("Request timed out")]
+    TimedOut,
 }
 
 enum Request<Conn: Connection> {
@@ -370,6 +373,7 @@ pub struct Pool<Conn: Connection> {
     handle: tokio::task::JoinHandle<()>,
     tx: mpsc::Sender<Request<Conn>>,
     stats: Stats,
+    claim_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -427,6 +431,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     ) -> Self {
         let (tx, rx) = mpsc::channel(1);
         let (stats_tx, stats_rx) = watch::channel(HashMap::default());
+        let claim_timeout = policy.claim_timeout;
         let handle = tokio::task::spawn(async move {
             let worker = PoolInner::new(resolver, backend_connector, policy, rx, stats_tx);
             worker.run().await;
@@ -439,6 +444,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
                 rx: stats_rx,
                 claims: Arc::new(AtomicUsize::new(0)),
             },
+            claim_timeout,
         }
     }
 
@@ -451,13 +457,27 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     pub async fn claim(&self) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
 
-        self.tx
-            .send(Request::Claim { tx })
+        // TODO: The work of "on_acquire" could be done here? Would prevent the
+        // slot set from blocking, and we'd also be able to loop. Picking a new
+        // backend might also be the right call if "on_acquire" is failing?
+        //
+        // There is admittedly a question of "fairness" within a queue of
+        // claims; looping at this point would send us to the back of the queue
+        // if there were multiple callers.
+
+        let request_claim = async {
+            self.tx
+                .send(Request::Claim { tx })
+                .await
+                .map_err(|_| Error::Terminated)?;
+            let claim = rx.await.map_err(|_| Error::Terminated)?;
+            self.stats.claims.fetch_add(1, Ordering::Relaxed);
+            claim
+        };
+
+        tokio::time::timeout(self.claim_timeout, request_claim)
             .await
-            .map_err(|_| Error::Terminated)?;
-        let claim = rx.await.map_err(|_| Error::Terminated)?;
-        self.stats.claims.fetch_add(1, Ordering::Relaxed);
-        claim
+            .map_err(|_| Error::TimedOut)?
     }
 }
 
@@ -615,8 +635,7 @@ mod test {
         }
 
         // When we try another claim, it should not be able to complete
-        let result =
-            tokio::time::timeout(tokio::time::Duration::from_millis(50), pool.claim()).await;
+        let result = tokio::time::timeout(Duration::from_millis(50), pool.claim()).await;
         assert!(
             result.is_err(),
             "Unexpected non-error result (expected timeout)"

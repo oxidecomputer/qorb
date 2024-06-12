@@ -24,6 +24,9 @@ pub struct Policy {
     /// The interval at which rebalancing backends should occur.
     pub rebalance_interval: Duration,
 
+    /// Sets the timeout for a client of the pool making a claim.
+    pub claim_timeout: Duration,
+
     /// Configuration for a slot set attempting to connect to a backend.
     pub set_config: SetConfig,
 }
@@ -34,6 +37,7 @@ impl Default for Policy {
             spares_wanted: 8,
             max_slots: 16,
             rebalance_interval: Duration::from_secs(60),
+            claim_timeout: Duration::from_secs(30),
             set_config: SetConfig::default(),
         }
     }
