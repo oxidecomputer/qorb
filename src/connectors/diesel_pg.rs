@@ -65,12 +65,14 @@ impl backend::Connector for DieselPgConnector {
         })
         .await
         .expect("Task panicked establishing connection")?;
+        Ok(conn)
+    }
 
-        // TODO: This be a better fit with an "on_acquire" function?
+    async fn on_acquire(&self, conn: &mut Self::Connection) -> Result<(), Error> {
         conn.batch_execute_async(DISALLOW_FULL_TABLE_SCAN_SQL)
             .await
             .map_err(|e| Error::Other(anyhow!(e)))?;
-        Ok(conn)
+        Ok(())
     }
 
     async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Error> {

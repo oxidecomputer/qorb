@@ -71,6 +71,11 @@ pub struct SetConfig {
     pub health_interval: Duration,
 
     /// The maximum amount of time a health check has before failing.
+    ///
+    /// This is a bound on the following methods of the backend connector:
+    /// - [crate::backend::Connector::is_valid]
+    /// - [crate::backend::Connector::on_acquire]
+    /// - [crate::backend::Connector::on_recycle]
     pub health_check_timeout: Duration,
 }
 

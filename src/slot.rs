@@ -773,22 +773,39 @@ impl<Conn: Connection> SetWorker<Conn> {
         name = ":SetWorker::claim",
         fields(name = ?self.name),
     )]
-    fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
-        // Before we vend out the slot's connection to a client, make sure that
-        // we have space to take it back once they're done with it.
-        let Ok(permit) = self.slot_tx.clone().try_reserve_owned() else {
-            event!(Level::TRACE, "Could not reserve slot_tx permit");
-            // This is more of an "all slots in-use" error,
-            // but it should look the same to clients.
-            return Err(Error::NoSlotsReady);
-        };
+    async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
+        loop {
+            // Before we vend out the slot's connection to a client, make sure that
+            // we have space to take it back once they're done with it.
+            let Ok(permit) = self.slot_tx.clone().try_reserve_owned() else {
+                event!(Level::TRACE, "Could not reserve slot_tx permit");
+                // This is more of an "all slots in-use" error,
+                // but it should look the same to clients.
+                return Err(Error::NoSlotsReady);
+            };
 
-        let Some(handle) = self.take_connected_unclaimed_slot(permit) else {
-            event!(Level::TRACE, "Failed to take unclaimed slot");
-            return Err(Error::NoSlotsReady);
-        };
+            let Some(mut handle) = self.take_connected_unclaimed_slot(permit) else {
+                event!(Level::TRACE, "Failed to take unclaimed slot");
+                return Err(Error::NoSlotsReady);
+            };
 
-        Ok(handle)
+            let result = tokio::time::timeout(
+                self.config.health_check_timeout,
+                self.backend_connector.on_acquire(&mut handle),
+            )
+            .await;
+
+            let Ok(result) = result else {
+                event!(Level::TRACE, "Timeout performing 'on_acquire' on claim");
+                continue;
+            };
+            let Ok(()) = result else {
+                event!(Level::TRACE, "Failed performing 'on_acquire' on claim");
+                continue;
+            };
+
+            return Ok(handle);
+        }
     }
 
     #[instrument(
@@ -813,7 +830,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                 request = self.rx.recv() => {
                     match request {
                         Some(SetRequest::Claim { tx }) => {
-                            let result = self.claim();
+                            let result = self.claim().await;
                             let _ = tx.send(result);
                         },
                         Some(SetRequest::SetWantedCount { count }) => {
