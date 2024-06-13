@@ -34,14 +34,6 @@ struct BackendRecord {
 struct Client {
     resolver: TokioAsyncResolver,
     hardcoded_ttl: Option<Duration>,
-
-    // TODO: We definitely need a more elaborate representation of health here,
-    // beyond "the number of missed requests in a row we've had".
-    //
-    // This number will go up when the DNS client cannot access the server, but
-    // this is but one of many signals.
-    //
-    // TODO: Maybe use the failure window here too?
     failed_requests: WindowedCounter,
 }
 
@@ -153,6 +145,7 @@ impl DnsResolverWorker {
         result
     }
 
+    // Begins tracking a DNS server, if it does not already exist.
     fn ensure_dns_server(&mut self, address: SocketAddr) {
         let failure_window = self.config.query_interval * 10;
         self.dns_servers
@@ -178,12 +171,6 @@ impl DnsResolverWorker {
                         });
                     }
                 },
-
-                // TODO: There's more work we need to do here, under the realm of
-                // "Dynamic DNS":
-                //
-                // - Query DNS for the set over servers we should be using
-                // - Monitor the TTLs of our own DNS Servers
             }
         }
     }
@@ -467,21 +454,23 @@ mod test {
         )
     }
 
-    fn aaaa_record(name: &str, addr: Ipv6Addr) -> (RrKey, RecordSet) {
+    fn aaaa_record(aaaa: &AAAA, addr: Ipv6Addr) -> (RrKey, RecordSet) {
         (
-            RrKey::new(LowerName::from_str(name).unwrap(), RecordType::AAAA),
+            RrKey::new(LowerName::from_str(&aaaa.name).unwrap(), RecordType::AAAA),
             Record::from_rdata(
-                Name::from_utf8(name).unwrap(),
-                0,
+                Name::from_utf8(&aaaa.name).unwrap(),
+                aaaa.ttl,
                 RData::AAAA(rdata::AAAA::from(addr)),
             )
             .into(),
         )
     }
-    fn srv_record(name: &str, aaaa_records: &[(u16, &str)]) -> (RrKey, RecordSet) {
+    fn srv_record(name: &str, aaaa_records: &[AAAA]) -> (RrKey, RecordSet) {
         let mut record_set = RecordSet::new(&Name::from_utf8(name).unwrap(), RecordType::SRV, 0);
 
-        for (port, aaaa_name) in aaaa_records {
+        for aaaa in aaaa_records {
+            let port = aaaa.port;
+            let aaaa_name = &aaaa.name;
             record_set.insert(
                 Record::from_rdata(
                     Name::from_utf8(name).unwrap(),
@@ -489,7 +478,7 @@ mod test {
                     RData::SRV(rdata::SRV::new(
                         0,
                         0,
-                        *port,
+                        port,
                         Name::from_utf8(aaaa_name).unwrap(),
                     )),
                 ),
@@ -503,13 +492,19 @@ mod test {
         )
     }
 
+    struct AAAA {
+        port: u16,
+        name: String,
+        ttl: u32,
+    }
+
     // Configuring a DNS server with hickory is a mess of configuration options.
     //
     // This builder attempts to make that config slightly easier for tests.
     struct DnsServerBuilder {
         domain: String,
         srv: String,
-        aaaa_records: Vec<(u16, String)>,
+        aaaa_records: Vec<AAAA>,
     }
 
     impl DnsServerBuilder {
@@ -521,8 +516,12 @@ mod test {
             }
         }
 
-        fn add_backend(mut self, port: u16, name: impl ToString) -> Self {
-            self.aaaa_records.push((port, name.to_string()));
+        fn add_backend(mut self, port: u16, name: impl ToString, ttl: u32) -> Self {
+            self.aaaa_records.push(AAAA {
+                port,
+                name: name.to_string(),
+                ttl,
+            });
             self
         }
 
@@ -530,18 +529,11 @@ mod test {
             let aaaa_records = self
                 .aaaa_records
                 .iter()
-                .map(|(_port, name)| aaaa_record(&name, Ipv6Addr::LOCALHOST));
+                .map(|aaaa| aaaa_record(&aaaa, Ipv6Addr::LOCALHOST));
 
             let mut records = BTreeMap::from([
                 soa_record(&self.domain),
-                srv_record(
-                    &self.srv,
-                    self.aaaa_records
-                        .iter()
-                        .map(|(port, name)| (*port, name.as_ref()))
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                ),
+                srv_record(&self.srv, self.aaaa_records.as_slice()),
             ]);
             records.extend(aaaa_records);
 
@@ -579,8 +571,8 @@ mod test {
 
         // Start the DNS server, which runs independently of the resolver
         let dns_server_address = DnsServerBuilder::new("example.com", "test.example.com")
-            .add_backend(1234, "test001.example.com.")
-            .add_backend(5678, "test002.example.com.")
+            .add_backend(1234, "test001.example.com.", 100)
+            .add_backend(5678, "test002.example.com.", 100)
             .run()
             .await;
 
@@ -590,7 +582,7 @@ mod test {
         let config = DnsResolverConfig::default();
         let mut resolver = DnsResolver::new(service, bootstrap_servers, config);
 
-        // Wait until any number of backends appaer
+        // Wait until any number of backends appear
         let mut monitor = resolver.monitor();
         let backends = monitor
             .wait_for(|all_backends| {
@@ -625,8 +617,8 @@ mod test {
         //
         // This server contains backend information that's actually useful to the resolver!
         let dns_server_address = DnsServerBuilder::new("example.com", "test.example.com")
-            .add_backend(1234, "test001.example.com.")
-            .add_backend(5678, "test002.example.com.")
+            .add_backend(1234, "test001.example.com.", 100)
+            .add_backend(5678, "test002.example.com.", 100)
             .run()
             .await;
 
@@ -635,7 +627,7 @@ mod test {
         // This server contains no backend information about the "test" service we're trying to
         // reach.
         let bootstrap_dns_server_address = DnsServerBuilder::new("example.com", "dns.example.com")
-            .add_backend(dns_server_address.port(), "dns001.example.com.")
+            .add_backend(dns_server_address.port(), "dns001.example.com.", 100)
             .run()
             .await;
 
@@ -648,7 +640,7 @@ mod test {
         };
         let mut resolver = DnsResolver::new(service, bootstrap_servers, config);
 
-        // Wait until any number of backends appaer. For this to happen, we must have looked up
+        // Wait until any number of backends appear. For this to happen, we must have looked up
         // the additional DNS server.
         let mut monitor = resolver.monitor();
         let backends = monitor
@@ -674,7 +666,137 @@ mod test {
         );
     }
 
-    // TODO: Test TTLs?
+    async fn wait_for_backends(
+        monitor: &mut watch::Receiver<AllBackends>,
+        count: usize,
+    ) -> AllBackends {
+        monitor
+            .wait_for(|all_backends| {
+                let backend_count = all_backends.len() == count;
+                event!(
+                    Level::DEBUG,
+                    all_backends = ?all_backends,
+                    wanted = count,
+                    "Waiting for backends to appear"
+                );
+                backend_count
+            })
+            .await
+            .unwrap()
+            .clone()
+    }
+
+    // Test the expected, if quirky, behavior of a zero TTL DNS record.
+    #[tokio::test]
+    async fn test_zero_ttl() {
+        setup_tracing_subscriber();
+
+        // Start the DNS server, which runs independently of the resolver
+        let dns_server_address = DnsServerBuilder::new("example.com", "test.example.com")
+            .add_backend(1234, "test001.example.com.", 0)
+            .run()
+            .await;
+
+        // Start the resolver, which queries the DNS server
+        let service = service::Name("test.example.com".into());
+        let bootstrap_servers = vec![dns_server_address];
+        let config = DnsResolverConfig {
+            query_interval: Duration::from_millis(10),
+            hardcoded_ttl: None,
+            ..Default::default()
+        };
+        let mut resolver = DnsResolver::new(service, bootstrap_servers, config);
+
+        let mut monitor = resolver.monitor();
+
+        // We have a query interval of 10ms, but a TTL of zero.
+        // That means we're going to see these backends, but only very briefly,
+        // and they'll rapidly be discarded.
+        //
+        // As a result, we expect to oscillate between zero and one backends.
+        wait_for_backends(&mut monitor, 1).await;
+        wait_for_backends(&mut monitor, 0).await;
+        wait_for_backends(&mut monitor, 1).await;
+        wait_for_backends(&mut monitor, 0).await;
+        wait_for_backends(&mut monitor, 1).await;
+        wait_for_backends(&mut monitor, 0).await;
+    }
+
+    // Tests that TTLs expire at an expected rate.
+    #[tokio::test]
+    async fn test_ttl_expiration() {
+        setup_tracing_subscriber();
+
+        // Note the TTL on these records -- we'll wait increasing amounts of
+        // time to force each record to expire.
+        let dns_server_address = DnsServerBuilder::new("example.com", "test.example.com")
+            .add_backend(1234, "test001.example.com.", 10)
+            .add_backend(5678, "test002.example.com.", 100)
+            .add_backend(9012, "test003.example.com.", 1000)
+            .run()
+            .await;
+
+        let service = service::Name("test.example.com".into());
+        let bootstrap_servers = vec![dns_server_address];
+        let config = DnsResolverConfig {
+            ..Default::default()
+        };
+        let mut resolver = DnsResolver::new(service, bootstrap_servers, config);
+
+        // Observe all records
+        let mut monitor = resolver.monitor();
+        let backends = wait_for_backends(&mut monitor, 3).await;
+        assert_eq!(backends.len(), 3);
+        let mut iter = backends.keys();
+        assert_eq!(
+            iter.next().unwrap(),
+            &backend::Name::new("test001.example.com.")
+        );
+        assert_eq!(
+            iter.next().unwrap(),
+            &backend::Name::new("test002.example.com.")
+        );
+        assert_eq!(
+            iter.next().unwrap(),
+            &backend::Name::new("test003.example.com.")
+        );
+
+        // Force expiration of test001
+        tokio::time::pause();
+        tokio::time::advance(tokio::time::Duration::from_secs(50)).await;
+        tokio::time::resume();
+        let backends = wait_for_backends(&mut monitor, 2).await;
+        assert_eq!(backends.len(), 2);
+        let mut iter = backends.keys();
+        assert_eq!(
+            iter.next().unwrap(),
+            &backend::Name::new("test002.example.com.")
+        );
+        assert_eq!(
+            iter.next().unwrap(),
+            &backend::Name::new("test003.example.com.")
+        );
+
+        // Force expiration of test002
+        tokio::time::pause();
+        tokio::time::advance(tokio::time::Duration::from_secs(500)).await;
+        tokio::time::resume();
+        let backends = wait_for_backends(&mut monitor, 1).await;
+        assert_eq!(backends.len(), 1);
+        let mut iter = backends.keys();
+        assert_eq!(
+            iter.next().unwrap(),
+            &backend::Name::new("test003.example.com.")
+        );
+
+        // Force expiration of test003
+        tokio::time::pause();
+        tokio::time::advance(tokio::time::Duration::from_secs(5000)).await;
+        tokio::time::resume();
+        let backends = wait_for_backends(&mut monitor, 0).await;
+        assert_eq!(backends.len(), 0);
+    }
+
     // TODO: Test timeouts?
     // TODO: Test health of failing DNS server?
 }
