@@ -84,7 +84,12 @@ impl Client {
                 Ok((target, aaaa, port)) => {
                     event!(Level::DEBUG, ?aaaa, "Successfully looked up AAAA record");
                     let expires_at = match self.hardcoded_ttl {
-                        Some(duration) => Instant::now().checked_add(duration),
+                        Some(duration) => {
+                            // Note that if this overflows, it gets set to
+                            // "None", which we treat as not expiring. This is
+                            // okay.
+                            Instant::now().checked_add(duration)
+                        }
                         None => Some(aaaa.valid_until()),
                     };
                     let name = backend::Name::from(target);
@@ -309,12 +314,19 @@ impl DnsResolverWorker {
             }
         });
 
-        let Some((name, record)) = next_expiration else {
+        let Some((
+            name,
+            BackendRecord {
+                expires_at: Some(deadline),
+                ..
+            },
+        )) = next_expiration
+        else {
             let () = futures::future::pending().await;
             unreachable!();
         };
 
-        tokio::time::sleep_until(record.expires_at.unwrap().into()).await;
+        tokio::time::sleep_until((*deadline).into()).await;
         name.clone()
     }
 }
@@ -682,7 +694,7 @@ mod test {
                 backend_count
             })
             .await
-            .unwrap()
+            .expect("Sender end has been unexpectedly closed")
             .clone()
     }
 
@@ -795,6 +807,63 @@ mod test {
         tokio::time::resume();
         let backends = wait_for_backends(&mut monitor, 0).await;
         assert_eq!(backends.len(), 0);
+    }
+
+    // Tests that TTLs are ignored with hardcoded TTL configuration.
+    #[tokio::test]
+    async fn test_hardcoded_ttl_expiration() {
+        setup_tracing_subscriber();
+
+        // Note the TTL on these records -- we'll wait increasing amounts of
+        // time to force each record to expire.
+        let dns_server_address = DnsServerBuilder::new("example.com", "test.example.com")
+            .add_backend(1234, "test001.example.com.", 10)
+            .add_backend(5678, "test002.example.com.", 100)
+            .add_backend(9012, "test003.example.com.", 1000)
+            .run()
+            .await;
+
+        let service = service::Name("test.example.com".into());
+        let bootstrap_servers = vec![dns_server_address];
+        let config = DnsResolverConfig {
+            hardcoded_ttl: Some(tokio::time::Duration::MAX),
+            ..Default::default()
+        };
+        let mut resolver = DnsResolver::new(service, bootstrap_servers, config);
+
+        // Observe all records
+        let mut monitor = resolver.monitor();
+        let backends = wait_for_backends(&mut monitor, 3).await;
+        assert_eq!(backends.len(), 3);
+        let mut iter = backends.keys();
+        assert_eq!(
+            iter.next().unwrap(),
+            &backend::Name::new("test001.example.com.")
+        );
+        assert_eq!(
+            iter.next().unwrap(),
+            &backend::Name::new("test002.example.com.")
+        );
+        assert_eq!(
+            iter.next().unwrap(),
+            &backend::Name::new("test003.example.com.")
+        );
+
+        // This *would* force expiration of test001, but doesn't here.
+        tokio::time::pause();
+        tokio::time::advance(tokio::time::Duration::from_secs(50)).await;
+        tokio::time::resume();
+
+        // Compare this with test_ttl_expiration - the records don't actually
+        // expire with a hardcoded TTL.
+        let r = timeout(
+            tokio::time::Duration::from_millis(10),
+            wait_for_backends(&mut monitor, 2),
+        )
+        .await;
+        assert!(r.is_err(), "Should have timed out waiting for two backends");
+        let backends = wait_for_backends(&mut monitor, 3).await;
+        assert_eq!(backends.len(), 3);
     }
 
     // TODO: Test timeouts?
