@@ -7,6 +7,7 @@ use crate::window_counter::WindowedCounter;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use hickory_resolver::config::LookupIpStrategy;
 use hickory_resolver::config::NameServerConfig;
 use hickory_resolver::config::Protocol;
 use hickory_resolver::config::ResolverConfig;
@@ -40,9 +41,17 @@ struct Client {
 impl Client {
     fn new(address: SocketAddr, hardcoded_ttl: Option<Duration>, failure_window: Duration) -> Self {
         let mut rc = ResolverConfig::new();
-        rc.add_name_server(NameServerConfig::new(address, Protocol::Udp));
+        rc.add_name_server(NameServerConfig {
+            socket_addr: address,
+            protocol: Protocol::Udp,
+            tls_dns_name: None,
+            trust_negative_responses: false,
+            bind_addr: None,
+        });
         let mut opts = ResolverOpts::default();
         opts.use_hosts_file = false;
+        opts.ip_strategy = LookupIpStrategy::Ipv6Only;
+        opts.negative_max_ttl = Some(std::time::Duration::from_secs(15));
         let resolver = TokioAsyncResolver::tokio(rc, opts);
         Self {
             resolver,
