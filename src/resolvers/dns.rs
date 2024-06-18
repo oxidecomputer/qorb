@@ -39,7 +39,7 @@ struct Client {
 }
 
 impl Client {
-    fn new(address: SocketAddr, hardcoded_ttl: Option<Duration>, failure_window: Duration) -> Self {
+    fn new(config: &DnsResolverConfig, address: SocketAddr, failure_window: Duration) -> Self {
         let mut rc = ResolverConfig::new();
         rc.add_name_server(NameServerConfig {
             socket_addr: address,
@@ -52,10 +52,12 @@ impl Client {
         opts.use_hosts_file = false;
         opts.ip_strategy = LookupIpStrategy::Ipv6Only;
         opts.negative_max_ttl = Some(std::time::Duration::from_secs(15));
+        opts.timeout = config.query_timeout;
+        opts.edns0 = true;
         let resolver = TokioAsyncResolver::tokio(rc, opts);
         Self {
             resolver,
-            hardcoded_ttl,
+            hardcoded_ttl: config.hardcoded_ttl,
             failed_requests: WindowedCounter::new(failure_window),
         }
     }
@@ -164,7 +166,7 @@ impl DnsResolverWorker {
         let failure_window = self.config.query_interval * 10;
         self.dns_servers
             .entry(address)
-            .or_insert_with(|| Client::new(address, self.config.hardcoded_ttl, failure_window));
+            .or_insert_with(|| Client::new(&self.config, address, failure_window));
     }
 
     async fn run(mut self) {
