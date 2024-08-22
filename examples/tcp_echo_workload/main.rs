@@ -12,6 +12,7 @@ use qorb::policy::{Policy, SetConfig};
 use qorb::pool::Pool;
 use qorb::resolvers::dns::{DnsResolver, DnsResolverConfig};
 use qorb::service;
+use ratatui::style::Styled;
 use ratatui::{prelude::*, widgets::*};
 use std::env;
 use std::io::stdout;
@@ -270,7 +271,7 @@ impl AllClaimers {
                 Constraint::Length(1),
             ],
         )
-        .split(frame.size());
+        .split(frame.area());
         const NAME: &str = "INDEX";
         const CLAIMED: &str = "[CLAIMED]";
         const CLAIM_DURATION: &str = "[CLAIM DURATION (ms)]";
