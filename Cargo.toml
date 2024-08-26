@@ -27,7 +27,7 @@ crossterm = "0.28.1"
 hickory-client = { version = "0.24", default-features = false }
 hickory-server = { version = "0.24", default-features = false }
 progenitor = "0.7"
-ratatui = "0.28.0"
+ratatui = "0.28.1"
 reqwest = { version = "0.11", features = ["json", "stream"] }
 tracing-subscriber = "0.3"
 
