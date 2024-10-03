@@ -5,15 +5,15 @@
 //! It uses the following terminology:
 //! * Services are named entities providing the same interface.
 //! * Backends are specific instantiations of a program, providing
-//! a service. In the case of, e.g., a distributed database, a single
-//! service would be provided by multiple backends.
+//!   a service. In the case of, e.g., a distributed database, a single
+//!   service would be provided by multiple backends.
 //!
 //! # Usage
 //!
 //! * The main interface for this crate is [pool::Pool].
 //! * To construct a pool, you must supply a [resolver::Resolver] and
-//! a [backend::Connector]. These are interfaces which specify "how to find
-//! backends" and "how to create connections to a backend", respectively.
+//!   a [backend::Connector]. These are interfaces which specify "how to find
+//!   backends" and "how to create connections to a backend", respectively.
 
 // Public API
 pub mod backend;
