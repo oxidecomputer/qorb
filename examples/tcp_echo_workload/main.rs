@@ -340,9 +340,11 @@ impl AllClaimers {
             ],
         )
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Workload Generator").set_style(Style::default().bold())),
+            Block::default().borders(Borders::ALL).title(
+                "Workload Generator"
+                    .to_string()
+                    .set_style(Style::default().bold()),
+            ),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_spacing(HighlightSpacing::Always)
@@ -460,7 +462,7 @@ impl ClaimerInner {
                     }
 
                     // Keep the connection alive for an extra duration
-                    let duration = self.claim_duration.lock().unwrap().clone();
+                    let duration = *self.claim_duration.lock().unwrap();
                     sleep(duration).await;
 
                     let mut buf = [0; 5];

@@ -354,8 +354,8 @@ impl DnsResolver {
     /// Creates a new DNS resolver which queries for backends.
     ///
     /// - `service`: The name of the SRV records to observe from DNS.
-    /// These are associated with AAAA records, and the SocketAddrs represented
-    /// by those records are returned through the [crate::resolver::Resolver] interface.
+    ///   These are associated with AAAA records, and the SocketAddrs represented
+    ///   by those records are returned through the [crate::resolver::Resolver] interface.
     /// - `bootstrap_servers`: The initial list of DNS servers to query.
     /// - `config`: Additional tweakable configuration options.
     pub fn new(
@@ -515,6 +515,7 @@ mod test {
         )
     }
 
+    #[allow(clippy::upper_case_acronyms)]
     struct AAAA {
         port: u16,
         name: String,
@@ -552,7 +553,7 @@ mod test {
             let aaaa_records = self
                 .aaaa_records
                 .iter()
-                .map(|aaaa| aaaa_record(&aaaa, Ipv6Addr::LOCALHOST));
+                .map(|aaaa| aaaa_record(aaaa, Ipv6Addr::LOCALHOST));
 
             let mut records = BTreeMap::from([
                 soa_record(&self.domain),

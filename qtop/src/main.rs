@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::io::stdout;
+use style::Styled;
 
 use crossterm::{
     event::{Event, EventStream, KeyCode},
@@ -46,7 +47,7 @@ impl Update {
                 Constraint::Length(1),
             ],
         )
-        .split(frame.size());
+        .split(frame.area());
         const NAME: &str = "NAME";
         const CPS: &str = "CLAIMS/s";
         const CONNECTING: &str = "CONNECTING";
@@ -111,9 +112,8 @@ async fn main() -> anyhow::Result<()> {
     let args: Args = Args::parse();
     let (mut ws, _) = tokio_tungstenite::connect_async(args.url.clone())
         .await
-        .map_err(|err| {
+        .inspect_err(|_| {
             eprintln!("Cannot connect; URL is usually: `ws://<address>:<port>/qtop/stats`");
-            err
         })?;
 
     enable_raw_mode()?;
@@ -132,10 +132,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             Some(Ok(Event::Key(event))) = &mut event_fut => {
                 event_fut = reader.next().fuse();
-                match event.code {
-                    KeyCode::Char('q') => break,
-                    _ => {},
-                }
+                if let KeyCode::Char('q') = event.code { break }
             }
             Some(wsmsg) = &mut ws_fut => {
                 ws_fut = ws.next().fuse();
