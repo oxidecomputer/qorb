@@ -12,10 +12,12 @@ use hickory_resolver::config::NameServerConfig;
 use hickory_resolver::config::Protocol;
 use hickory_resolver::config::ResolverConfig;
 use hickory_resolver::config::ResolverOpts;
+use hickory_resolver::error::{ResolveError, ResolveErrorKind};
 use hickory_resolver::TokioAsyncResolver;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::net::SocketAddrV6;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -70,7 +72,7 @@ impl Client {
     async fn lookup_socket_v6(
         &self,
         name: &service::Name,
-    ) -> Result<HashMap<backend::Name, BackendRecord>, anyhow::Error> {
+    ) -> Result<HashMap<backend::Name, BackendRecord>, ResolveError> {
         // Look up all the SRV records for this particular name.
         let srv = self.resolver.srv_lookup(&name.0).await?;
         event!(Level::DEBUG, ?srv, "Successfully looked up SRV record");
@@ -178,6 +180,9 @@ impl DnsResolverWorker {
             tokio::select! {
                 _ = next_tick => {
                     self.query_dns().await;
+                    if self.backends.is_empty() {
+                        query_interval.reset_after(self.config.query_retry);
+                    }
                 },
                 backend_name = next_backend_expiration => {
                     if self.backends.remove(&backend_name).is_some() {
@@ -214,18 +219,35 @@ impl DnsResolverWorker {
         // whether they responded in time or not.
         let first_result = Arc::new(Mutex::new(None));
 
+        // If we get a `NoRecordsFound` error from a server, we won't consider
+        // the client to have errored, but we also don't want to take that
+        // result as authoritative: if dynamic resolution is in play, we might
+        // have one client that only has records for other DNS servers and other
+        // clients that only have records for backends.
+        //
+        // If at least one client returns `NoRecordsFound` _and_ no clients
+        // return records, we'll return `Some(_)` with an empty list of
+        // backends, to honor what DNS has told us.
+        let saw_no_records_found = Arc::new(AtomicBool::new(false));
+
         dns_lookup
             .for_each_concurrent(Some(self.config.max_dns_concurrency), |(client, result)| {
                 let first_result = first_result.clone();
+                let saw_no_records_found = saw_no_records_found.clone();
                 async move {
                     match result {
                         Ok(Ok(backends)) => {
                             first_result.lock().unwrap().get_or_insert(backends);
                         }
-                        Ok(Err(err)) => {
-                            event!(Level::ERROR, ?err, "DNS request failed");
-                            client.mark_error();
-                        }
+                        Ok(Err(err)) => match err.kind() {
+                            ResolveErrorKind::NoRecordsFound { .. } => {
+                                saw_no_records_found.store(true, Ordering::Relaxed);
+                            }
+                            _ => {
+                                event!(Level::ERROR, ?err, "DNS request failed");
+                                client.mark_error();
+                            }
+                        },
                         Err(err) => {
                             event!(Level::ERROR, ?err, "DNS request timed out");
                             client.mark_error();
@@ -239,7 +261,11 @@ impl DnsResolverWorker {
         // all DNS servers. At the moment, however, we're taking "whoever
         // returned results the fastest".
         let result = first_result.lock().unwrap().take();
-        result
+        match result {
+            Some(backends) => Some(backends),
+            None if saw_no_records_found.load(Ordering::Relaxed) => Some(HashMap::new()),
+            None => None,
+        }
     }
 
     async fn query_for_dns_servers(&mut self) {
@@ -389,6 +415,10 @@ impl Resolver for DnsResolver {
 // available backends?
 pub const DEFAULT_QUERY_INTERVAL: Duration = Duration::from_secs(60);
 
+// How often will we re-query DNS servers if they reported an empty set of
+// backends?
+pub const DEFAULT_QUERY_RETRY: Duration = Duration::from_secs(10);
+
 // How long do we expect a healthy DNS server to take to respond?
 pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -404,10 +434,17 @@ pub struct DnsResolverConfig {
     /// Default: 5
     pub max_dns_concurrency: usize,
 
-    /// How long should we wait before re-querying DNS servers?
+    /// How long should we wait before re-querying DNS servers, if we received
+    /// at least one backend record?
     ///
     /// Default: 60 seconds
     pub query_interval: Duration,
+
+    /// How long should we wait before re-querying DNS servers, if we received
+    /// no backend records from a DNS server?
+    ///
+    /// Default: 10 seconds
+    pub query_retry: Duration,
 
     /// After starting to query a DNS server, how long until we timeout?
     ///
@@ -426,6 +463,7 @@ impl Default for DnsResolverConfig {
             resolver_service: None,
             max_dns_concurrency: 5,
             query_interval: DEFAULT_QUERY_INTERVAL,
+            query_retry: DEFAULT_QUERY_RETRY,
             query_timeout: DEFAULT_QUERY_TIMEOUT,
             hardcoded_ttl: None,
         }
@@ -440,7 +478,9 @@ mod test {
     use hickory_server::proto::rr::{
         rdata, LowerName, Name, RData, Record, RecordSet, RecordType, RrKey,
     };
-    use hickory_server::server::ServerFuture;
+    use hickory_server::server::{
+        Request, RequestHandler, ResponseHandler, ResponseInfo, ServerFuture,
+    };
     use hickory_server::store::in_memory::InMemoryAuthority;
     use std::collections::BTreeMap;
     use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -516,40 +556,34 @@ mod test {
     }
 
     #[allow(clippy::upper_case_acronyms)]
+    #[derive(Clone)]
     struct AAAA {
         port: u16,
         name: String,
         ttl: u32,
     }
 
-    // Configuring a DNS server with hickory is a mess of configuration options.
-    //
-    // This builder attempts to make that config slightly easier for tests.
-    struct DnsServerBuilder {
+    #[derive(Clone)]
+    struct DnsServerData {
         domain: String,
         srv: String,
         aaaa_records: Vec<AAAA>,
     }
 
-    impl DnsServerBuilder {
-        fn new(domain: impl ToString, srv: impl ToString) -> Self {
-            Self {
-                domain: domain.to_string(),
-                srv: srv.to_string(),
-                aaaa_records: vec![],
-            }
+    impl DnsServerData {
+        fn remove_backend(&mut self, name: &str) {
+            self.aaaa_records.retain(|aaaa| aaaa.name != name);
         }
 
-        fn add_backend(mut self, port: u16, name: impl ToString, ttl: u32) -> Self {
+        fn add_backend(&mut self, port: u16, name: impl ToString, ttl: u32) {
             self.aaaa_records.push(AAAA {
                 port,
                 name: name.to_string(),
                 ttl,
             });
-            self
         }
 
-        async fn run(self) -> SocketAddr {
+        fn build_authority(&self) -> Box<dyn AuthorityObject> {
             let aaaa_records = self
                 .aaaa_records
                 .iter()
@@ -561,7 +595,7 @@ mod test {
             ]);
             records.extend(aaaa_records);
 
-            let authority = Box::new(Arc::new(
+            Box::new(Arc::new(
                 InMemoryAuthority::new(
                     Name::from_utf8(&self.domain).unwrap(),
                     records,
@@ -569,16 +603,49 @@ mod test {
                     true,
                 )
                 .unwrap(),
-            )) as Box<dyn AuthorityObject>;
-            let mut catalog = Catalog::new();
-            catalog.upsert(LowerName::from_str(&self.domain).unwrap(), authority);
+            ))
+        }
 
+        fn build_catalog(&self) -> Catalog {
+            let mut catalog = Catalog::new();
+            catalog.upsert(
+                LowerName::from_str(&self.domain).unwrap(),
+                self.build_authority(),
+            );
+            catalog
+        }
+    }
+
+    // Configuring a DNS server with hickory is a mess of configuration options.
+    //
+    // This builder attempts to make that config slightly easier for tests.
+    struct DnsServerBuilder {
+        data: DnsServerData,
+    }
+
+    impl DnsServerBuilder {
+        fn new(domain: impl ToString, srv: impl ToString) -> Self {
+            Self {
+                data: DnsServerData {
+                    domain: domain.to_string(),
+                    srv: srv.to_string(),
+                    aaaa_records: vec![],
+                },
+            }
+        }
+
+        fn add_backend(mut self, port: u16, name: impl ToString, ttl: u32) -> Self {
+            self.data.add_backend(port, name, ttl);
+            self
+        }
+
+        async fn start_server<T: RequestHandler>(handler: T) -> SocketAddr {
             let listener = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
 
             event!(Level::DEBUG, ?addr, "New DNS server on address");
 
-            let mut server = ServerFuture::new(catalog);
+            let mut server = ServerFuture::new(handler);
             server.register_socket(listener);
 
             tokio::task::spawn(async move {
@@ -586,6 +653,63 @@ mod test {
             });
 
             addr
+        }
+
+        async fn run(self) -> SocketAddr {
+            Self::start_server(self.data.build_catalog()).await
+        }
+
+        async fn run_updateable(self) -> UpdateableServer {
+            let catalog =
+                UpdateableCatalog(Arc::new(tokio::sync::Mutex::new(self.data.build_catalog())));
+            let address = Self::start_server(catalog.clone()).await;
+            UpdateableServer {
+                data: self.data,
+                catalog,
+                address,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct UpdateableCatalog(Arc<tokio::sync::Mutex<Catalog>>);
+
+    #[async_trait::async_trait]
+    impl RequestHandler for UpdateableCatalog {
+        async fn handle_request<R: ResponseHandler>(
+            &self,
+            request: &Request,
+            response_handle: R,
+        ) -> ResponseInfo {
+            self.0
+                .lock()
+                .await
+                .handle_request(request, response_handle)
+                .await
+        }
+    }
+
+    struct UpdateableServer {
+        data: DnsServerData,
+        address: SocketAddr,
+        catalog: UpdateableCatalog,
+    }
+
+    impl UpdateableServer {
+        async fn remove_backend(&mut self, name: &str) {
+            self.data.remove_backend(name);
+            self.catalog.0.lock().await.upsert(
+                LowerName::from_str(&self.data.domain).unwrap(),
+                self.data.build_authority(),
+            );
+        }
+
+        async fn add_backend(&mut self, port: u16, name: impl ToString, ttl: u32) {
+            self.data.add_backend(port, name, ttl);
+            self.catalog.0.lock().await.upsert(
+                LowerName::from_str(&self.data.domain).unwrap(),
+                self.data.build_authority(),
+            );
         }
     }
 
@@ -876,6 +1000,96 @@ mod test {
         assert!(r.is_err(), "Should have timed out waiting for two backends");
         let backends = wait_for_backends(&mut monitor, 3).await;
         assert_eq!(backends.len(), 3);
+    }
+
+    // The tests of our test helpers to ensure it behaves the way it claims to
+    // (which subsequent tests expect).
+    #[tokio::test]
+    async fn test_updateable_server() {
+        setup_tracing_subscriber();
+
+        let mut dns_server = DnsServerBuilder::new("example.com", "test.example.com")
+            .run_updateable()
+            .await;
+
+        let service = service::Name("test.example.com".into());
+        let client = Client::new(
+            &DnsResolverConfig::default(),
+            dns_server.address,
+            Duration::from_millis(100),
+        );
+        match client.lookup_socket_v6(&service).await {
+            Err(err) => match err.kind() {
+                ResolveErrorKind::NoRecordsFound { .. } => (),
+                _ => panic!("unexpected error: {err}"),
+            },
+            Ok(backends) => panic!("unexpectedly found {} backends", backends.len()),
+        }
+
+        dns_server
+            .add_backend(1234, "test001.example.com.", 1000)
+            .await;
+        let backends = client
+            .lookup_socket_v6(&service)
+            .await
+            .expect("successful lookup");
+        assert_eq!(backends.len(), 1);
+
+        dns_server
+            .add_backend(1235, "test002.example.com.", 1000)
+            .await;
+        let backends = client
+            .lookup_socket_v6(&service)
+            .await
+            .expect("successful lookup");
+        assert_eq!(backends.len(), 2);
+
+        dns_server.remove_backend("test001.example.com.").await;
+        let backends = client
+            .lookup_socket_v6(&service)
+            .await
+            .expect("successful lookup");
+        assert_eq!(backends.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_no_records_found() {
+        setup_tracing_subscriber();
+
+        // Start a DNS server that reports no records for the service.
+        let mut dns_server = DnsServerBuilder::new("example.com", "test.example.com")
+            .add_backend(1234, "test001.example.com.", 1000)
+            .run_updateable()
+            .await;
+
+        let service = service::Name("test.example.com".into());
+        let bootstrap_servers = vec![dns_server.address];
+        let config = DnsResolverConfig {
+            query_interval: Duration::from_secs(60),
+            query_retry: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let mut resolver = DnsResolver::new(service, bootstrap_servers, config);
+        let mut monitor = resolver.monitor();
+
+        // Wait until we've sen the record, then remove it and wait until our
+        // monitor realizes it's gone (via advancing time past
+        // `query_interval`).
+        wait_for_backends(&mut monitor, 1).await;
+        dns_server.remove_backend("test001.example.com.").await;
+        tokio::time::pause();
+        tokio::time::advance(tokio::time::Duration::from_secs(61)).await;
+        tokio::time::resume();
+        wait_for_backends(&mut monitor, 0).await;
+
+        // Now put the backend back in place on the DNS server side.
+        dns_server
+            .add_backend(1234, "test001.example.com.", 1000)
+            .await;
+
+        // We should nearly immediately find this new backend, due to the very
+        // low `query_retry` interval.
+        wait_for_backends(&mut monitor, 1).await;
     }
 
     // TODO: Test timeouts?
