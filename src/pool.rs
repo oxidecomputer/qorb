@@ -651,4 +651,82 @@ mod test {
             .expect("Failed to get claim after space became available!");
         assert_eq!(handle.id, 1);
     }
+
+    // Get a claim through one backend, update the resolver, and observe
+    // that we connect to the new backend.
+    #[tokio::test]
+    async fn test_claim_after_backend_swap() {
+        let resolver = Box::new(TestResolver::new());
+        let connector = Arc::new(TestConnector::new());
+
+        // This address will appear in DNS first
+        let address1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        // This address will appear in DNS later
+        let address2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090);
+
+        // Start with address1
+        resolver.replace(BTreeMap::from([(
+            backend::Name::new("aaa"),
+            Backend::new(address1),
+        )]));
+        let pool = Pool::new(
+            resolver.clone(),
+            connector,
+            Policy {
+                claim_timeout: Duration::from_millis(100),
+                ..Default::default()
+            },
+        );
+
+        // We can access that first address
+        let handle = pool.claim().await.expect("Failed to get claim");
+        assert_eq!(handle.id, 1);
+        assert_eq!(handle.backend.address, address1);
+        drop(handle);
+
+        resolver.replace(BTreeMap::from([(
+            backend::Name::new("bbb"),
+            Backend::new(address2),
+        )]));
+
+        // NOTE: We don't really have a great interface for "the moment the
+        // DNS resolution update propagates to the slot sets", but it should
+        // happen eventually.
+        loop {
+            let handle = pool.claim().await.expect("Failed to get claim");
+
+            if handle.backend.address == address1 {
+                eprintln!("Still accessing old address; waiting to shift to new backend...");
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                continue;
+            }
+
+            assert_eq!(handle.backend.address, address2);
+            break;
+        }
+
+        // The moment we've processed the resolver update, we should no longer
+        // see any connections to the old backend.
+        //
+        // Confirm that we can keep pulling claims from the pool until it's all
+        // used up, and they'll only point to the new backend.
+        let mut handles = vec![];
+        loop {
+            match pool.claim().await {
+                Ok(handle) => {
+                    assert_eq!(handle.backend.address, address2);
+                    handles.push(handle);
+                }
+                Err(err) => {
+                    assert!(matches!(err, Error::TimedOut), "Unexpected error: {err:?}");
+                    break;
+                }
+            }
+        }
+
+        // Since we connect pretty quickly, we should have used up all our
+        // slots.
+        assert_eq!(handles.len(), Policy::default().max_slots);
+    }
 }
