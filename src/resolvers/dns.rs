@@ -181,7 +181,7 @@ impl DnsResolverWorker {
                 _ = next_tick => {
                     self.query_dns().await;
                     if self.backends.is_empty() {
-                        query_interval.reset_after(self.config.query_retry);
+                        query_interval.reset_after(self.config.query_retry_if_no_records_found);
                     }
                 },
                 backend_name = next_backend_expiration => {
@@ -220,14 +220,24 @@ impl DnsResolverWorker {
         let first_result = Arc::new(Mutex::new(None));
 
         // If we get a `NoRecordsFound` error from a server, we won't consider
-        // the client to have errored, but we also don't want to take that
-        // result as authoritative: if dynamic resolution is in play, we might
-        // have one client that only has records for other DNS servers and other
-        // clients that only have records for backends.
+        // the client to have errored, but we also don't necessarily want to
+        // take that result as authoritative. If at least one client returns
+        // `NoRecordsFound` _and_ no clients return records, we'll return
+        // `Some(_)` with an empty list of backends, to honor what DNS has told
+        // us.
         //
-        // If at least one client returns `NoRecordsFound` _and_ no clients
-        // return records, we'll return `Some(_)` with an empty list of
-        // backends, to honor what DNS has told us.
+        // A couple examples where we might see this behavior in practice:
+        //
+        // * We have two DNS servers that are both responding to queries, but
+        //   one has not yet been populated with records. If it responds first,
+        //   we are willing to wait for the second to respond too.
+        // * If dynamic resolution is in play, we might have one DNS server that
+        //   only has records for other DNS servers, and those other DNS servers
+        //   only have records for backends. In this case, if we're querying for
+        //   a backend, the bootstrapping server will have no records; if we're
+        //   querying for the DNS servers, the other DNS servers will have no
+        //   records. Either way, we're willing to wait for other servers to see
+        //   if one of them has records.
         let saw_no_records_found = Arc::new(AtomicBool::new(false));
 
         dns_lookup
@@ -444,7 +454,7 @@ pub struct DnsResolverConfig {
     /// no backend records from a DNS server?
     ///
     /// Default: 10 seconds
-    pub query_retry: Duration,
+    pub query_retry_if_no_records_found: Duration,
 
     /// After starting to query a DNS server, how long until we timeout?
     ///
@@ -463,7 +473,7 @@ impl Default for DnsResolverConfig {
             resolver_service: None,
             max_dns_concurrency: 5,
             query_interval: DEFAULT_QUERY_INTERVAL,
-            query_retry: DEFAULT_QUERY_RETRY,
+            query_retry_if_no_records_found: DEFAULT_QUERY_RETRY,
             query_timeout: DEFAULT_QUERY_TIMEOUT,
             hardcoded_ttl: None,
         }
@@ -696,20 +706,21 @@ mod test {
     }
 
     impl UpdateableServer {
-        async fn remove_backend(&mut self, name: &str) {
-            self.data.remove_backend(name);
+        async fn update_catalog_from_data(&mut self) {
             self.catalog.0.lock().await.upsert(
                 LowerName::from_str(&self.data.domain).unwrap(),
                 self.data.build_authority(),
             );
         }
 
+        async fn remove_backend(&mut self, name: &str) {
+            self.data.remove_backend(name);
+            self.update_catalog_from_data().await;
+        }
+
         async fn add_backend(&mut self, port: u16, name: impl ToString, ttl: u32) {
             self.data.add_backend(port, name, ttl);
-            self.catalog.0.lock().await.upsert(
-                LowerName::from_str(&self.data.domain).unwrap(),
-                self.data.build_authority(),
-            );
+            self.update_catalog_from_data().await;
         }
     }
 
@@ -1056,7 +1067,7 @@ mod test {
     async fn test_no_records_found() {
         setup_tracing_subscriber();
 
-        // Start a DNS server that reports no records for the service.
+        // Start a DNS server that reports 1 record for the service.
         let mut dns_server = DnsServerBuilder::new("example.com", "test.example.com")
             .add_backend(1234, "test001.example.com.", 1000)
             .run_updateable()
@@ -1066,13 +1077,13 @@ mod test {
         let bootstrap_servers = vec![dns_server.address];
         let config = DnsResolverConfig {
             query_interval: Duration::from_secs(60),
-            query_retry: Duration::from_millis(100),
+            query_retry_if_no_records_found: Duration::from_millis(100),
             ..Default::default()
         };
         let mut resolver = DnsResolver::new(service, bootstrap_servers, config);
         let mut monitor = resolver.monitor();
 
-        // Wait until we've sen the record, then remove it and wait until our
+        // Wait until we've seen the record, then remove it and wait until our
         // monitor realizes it's gone (via advancing time past
         // `query_interval`).
         wait_for_backends(&mut monitor, 1).await;
@@ -1088,8 +1099,10 @@ mod test {
             .await;
 
         // We should nearly immediately find this new backend, due to the very
-        // low `query_retry` interval.
-        wait_for_backends(&mut monitor, 1).await;
+        // low `query_retry_if_no_records_found` interval.
+        tokio::time::timeout(Duration::from_secs(5), wait_for_backends(&mut monitor, 1))
+            .await
+            .expect("quickly found new entry");
     }
 
     // TODO: Test timeouts?
