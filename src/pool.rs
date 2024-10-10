@@ -707,7 +707,7 @@ mod test {
         }
 
         // The moment we've processed the resolver update, we should no longer
-        // see any connections to the old bakcend.
+        // see any connections to the old backend.
         //
         // Confirm that we can keep pulling claims from the pool until it's all
         // used up, and they'll only point to the new backend.
