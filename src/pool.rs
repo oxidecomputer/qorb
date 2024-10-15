@@ -42,9 +42,6 @@ enum Request<Conn: Connection> {
     Claim {
         tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>,
     },
-    Terminate {
-        tx: oneshot::Sender<Result<(), Error>>,
-    },
 }
 
 /// A shared reference to backend stats
@@ -191,25 +188,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                 // Handle requests from clients
                 request = self.rx.recv() => {
                     match request {
-                        Some(Request::Claim { tx }) => {
-                            self.claim_or_enqueue(tx).await
-                        }
-                        // The caller has explicitly asked us to terminate, and
-                        // we should respond to them once we've stopped doing
-                        // work.
-                        Some(Request::Terminate { tx }) => {
-                            // Terminate all background tasks, including:
-                            // - The resolver (may or may not have background
-                            // tasks, this is dependent on the implementation)
-                            // - Each of the slot sets
-                            self.terminate().await;
-                            let _ignored_result = tx.send(Ok(()));
-                            return;
-                        },
-                        // The caller has abandoned their connecion to the pool.
-                        //
-                        // We stop handling new requests, but have no one to
-                        // notify.
+                        Some(Request::Claim { tx }) => self.claim_or_enqueue(tx).await,
                         None => return,
                     }
                 }
@@ -269,19 +248,6 @@ impl<Conn: Connection> PoolInner<Conn> {
                 self.request_queue.push_front(tx);
                 return;
             }
-        }
-    }
-
-    // Terminate all background tasks, including:
-    // - The resolver (may or may not have background
-    // tasks, this is dependent on the implementation)
-    // - Each of the slot sets
-    #[instrument(skip(self), name = "PoolInner::terminate")]
-    async fn terminate(&mut self) {
-        self.resolver.terminate().await;
-
-        for (_backend, mut slot_set) in self.slots.drain() {
-            slot_set.terminate().await;
         }
     }
 
@@ -480,17 +446,6 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
             },
             claim_timeout,
         }
-    }
-
-    /// Terminates the connection pool
-    pub async fn terminate(&mut self) -> Result<(), Error> {
-        let (tx, rx) = oneshot::channel();
-
-        self.tx
-            .send(Request::Terminate { tx })
-            .await
-            .map_err(|_| Error::Terminated)?;
-        rx.await.map_err(|_| Error::Terminated)?
     }
 
     pub fn stats(&self) -> &Stats {
@@ -773,33 +728,5 @@ mod test {
         // Since we connect pretty quickly, we should have used up all our
         // slots.
         assert_eq!(handles.len(), Policy::default().max_slots);
-    }
-
-    #[tokio::test]
-    async fn test_terminate() {
-        let resolver = Box::new(TestResolver::new());
-        let connector = Arc::new(TestConnector::new());
-        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-
-        resolver.replace(BTreeMap::from([(
-            backend::Name::new("aaa"),
-            Backend::new(address),
-        )]));
-
-        let mut pool = Pool::new(resolver, connector, Policy::default());
-        let handle = pool.claim().await.expect("Failed to get claim");
-
-        assert_eq!(handle.id, 1);
-        assert_eq!(handle.backend.address, address);
-
-        pool.terminate().await.unwrap();
-        assert!(matches!(
-            pool.terminate().await.unwrap_err(),
-            Error::Terminated,
-        ));
-        assert!(matches!(
-            pool.claim().await.map(|_| ()).unwrap_err(),
-            Error::Terminated,
-        ));
     }
 }

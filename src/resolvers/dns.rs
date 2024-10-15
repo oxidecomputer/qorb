@@ -171,16 +171,13 @@ impl DnsResolverWorker {
             .or_insert_with(|| Client::new(&self.config, address, failure_window));
     }
 
-    async fn run(mut self, mut terminate_rx: tokio::sync::oneshot::Receiver<()>) {
+    async fn run(mut self) {
         let mut query_interval = tokio::time::interval(self.config.query_interval);
         loop {
             let next_tick = query_interval.tick();
             let next_backend_expiration = self.sleep_until_next_backend_expiration();
 
             tokio::select! {
-                _ = &mut terminate_rx => {
-                    return;
-                },
                 _ = next_tick => {
                     self.query_dns().await;
                     if self.backends.is_empty() {
@@ -385,8 +382,7 @@ impl DnsResolverWorker {
 ///
 /// Currently only supports Ipv6 addresses.
 pub struct DnsResolver {
-    handle: Option<tokio::task::JoinHandle<()>>,
-    terminate_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    handle: tokio::task::JoinHandle<()>,
     watch_rx: watch::Receiver<AllBackends>,
 }
 
@@ -405,44 +401,23 @@ impl DnsResolver {
     ) -> Self {
         let (watch_tx, watch_rx) = watch::channel(Arc::new(BTreeMap::new()));
         let worker = DnsResolverWorker::new(watch_tx, service, bootstrap_servers, config);
-        let (terminate_tx, terminate_rx) = tokio::sync::oneshot::channel();
-        let handle = Some(tokio::task::spawn(async move {
-            worker.run(terminate_rx).await;
-        }));
+        let handle = tokio::task::spawn(async move {
+            worker.run().await;
+        });
 
-        Self {
-            handle,
-            terminate_tx: Some(terminate_tx),
-            watch_rx,
-        }
+        Self { handle, watch_rx }
     }
 }
 
 impl Drop for DnsResolver {
     fn drop(&mut self) {
-        let Some(handle) = self.handle.take() else {
-            return;
-        };
-        handle.abort();
+        self.handle.abort();
     }
 }
 
-#[async_trait::async_trait]
 impl Resolver for DnsResolver {
     fn monitor(&mut self) -> watch::Receiver<AllBackends> {
         self.watch_rx.clone()
-    }
-
-    async fn terminate(&mut self) {
-        let Some(handle) = self.handle.take() else {
-            return;
-        };
-        let Some(terminate_tx) = self.terminate_tx.take() else {
-            return;
-        };
-
-        let _send_result = terminate_tx.send(());
-        let _join_result = handle.await;
     }
 }
 
@@ -1128,28 +1103,6 @@ mod test {
         tokio::time::timeout(Duration::from_secs(5), wait_for_backends(&mut monitor, 1))
             .await
             .expect("quickly found new entry");
-    }
-
-    #[tokio::test]
-    async fn test_terminate() {
-        setup_tracing_subscriber();
-
-        // Start a DNS server that reports 1 record for the service.
-        let dns_server = DnsServerBuilder::new("example.com", "test.example.com")
-            .add_backend(1234, "test001.example.com.", 1000)
-            .run_updateable()
-            .await;
-
-        let service = service::Name("test.example.com".into());
-        let bootstrap_servers = vec![dns_server.address];
-        let config = DnsResolverConfig {
-            query_interval: Duration::from_secs(60),
-            query_retry_if_no_records_found: Duration::from_millis(100),
-            ..Default::default()
-        };
-        let mut resolver = DnsResolver::new(service, bootstrap_servers, config);
-
-        resolver.terminate().await;
     }
 
     // TODO: Test timeouts?
