@@ -442,7 +442,7 @@ impl Resolver for DnsResolver {
         };
 
         let _send_result = terminate_tx.send(());
-        let _join_result = handle.await;
+        handle.await.expect("Resolver task panicked unexpectedly");
     }
 }
 

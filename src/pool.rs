@@ -198,10 +198,6 @@ impl<Conn: Connection> PoolInner<Conn> {
                         // we should respond to them once we've stopped doing
                         // work.
                         Some(Request::Terminate { tx }) => {
-                            // Terminate all background tasks, including:
-                            // - The resolver (may or may not have background
-                            // tasks, this is dependent on the implementation)
-                            // - Each of the slot sets
                             self.terminate().await;
                             let _ignored_result = tx.send(Ok(()));
                             return;
@@ -210,7 +206,10 @@ impl<Conn: Connection> PoolInner<Conn> {
                         //
                         // We stop handling new requests, but have no one to
                         // notify.
-                        None => return,
+                        None => {
+                            self.terminate().await;
+                            return;
+                        }
                     }
                 }
                 // Handle updates from the resolver
