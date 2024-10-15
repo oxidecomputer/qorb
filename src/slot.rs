@@ -440,6 +440,9 @@ struct SetWorker<Conn: Connection> {
     // Interface for receiving client requests
     rx: mpsc::Receiver<SetRequest<Conn>>,
 
+    // Identifies that the set worker should terminate immediately
+    terminate_rx: tokio::sync::oneshot::Receiver<()>,
+
     // Interface for communicating backend status
     status_tx: watch::Sender<SetState>,
 
@@ -468,6 +471,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     fn new(
         name: backend::Name,
         rx: mpsc::Receiver<SetRequest<Conn>>,
+        terminate_rx: tokio::sync::oneshot::Receiver<()>,
         status_tx: watch::Sender<SetState>,
         config: SetConfig,
         wanted_count: usize,
@@ -486,6 +490,7 @@ impl<Conn: Connection> SetWorker<Conn> {
             stats,
             failure_window,
             rx,
+            terminate_rx,
             status_tx,
             slot_tx,
             slot_rx,
@@ -770,7 +775,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         level = "trace",
         skip(self),
         err,
-        name = ":SetWorker::claim",
+        name = "SetWorker::claim",
         fields(name = ?self.name),
     )]
     async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
@@ -817,6 +822,9 @@ impl<Conn: Connection> SetWorker<Conn> {
     async fn run(&mut self) {
         loop {
             tokio::select! {
+                _ = &mut self.terminate_rx => {
+                    return;
+                },
                 // Recycle old requests
                 request = self.slot_rx.recv() => {
                     match request {
@@ -862,13 +870,15 @@ pub(crate) enum SetState {
 /// A set of slots for a particular backend.
 pub(crate) struct Set<Conn: Connection> {
     tx: mpsc::Sender<SetRequest<Conn>>,
+
     status_rx: watch::Receiver<SetState>,
 
     name: backend::Name,
     pub(crate) stats: Arc<Mutex<Stats>>,
     failure_window: Arc<WindowedCounter>,
 
-    handle: JoinHandle<()>,
+    terminate_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl<Conn: Connection> Set<Conn> {
@@ -886,6 +896,7 @@ impl<Conn: Connection> Set<Conn> {
         backend_connector: SharedConnector<Conn>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1);
+        let (terminate_tx, terminate_rx) = tokio::sync::oneshot::channel();
         let (status_tx, status_rx) = watch::channel(SetState::Offline);
         let failure_duration = config.max_connection_backoff * 2;
         let stats = Arc::new(Mutex::new(Stats::default()));
@@ -898,6 +909,7 @@ impl<Conn: Connection> Set<Conn> {
                 let mut worker = SetWorker::new(
                     name,
                     rx,
+                    terminate_rx,
                     status_tx,
                     config,
                     wanted_count,
@@ -916,7 +928,8 @@ impl<Conn: Connection> Set<Conn> {
             name,
             stats,
             failure_window,
-            handle,
+            terminate_tx: Some(terminate_tx),
+            handle: Some(handle),
         }
     }
 
@@ -1009,11 +1022,27 @@ impl<Conn: Connection> Set<Conn> {
     pub(crate) fn get_stats(&self) -> Stats {
         self.stats.lock().unwrap().clone()
     }
+
+    /// Terminates all connections used by the slot set
+    #[instrument(skip(self), name = "Set::terminate")]
+    pub(crate) async fn terminate(&mut self) {
+        let Some(terminate_tx) = self.terminate_tx.take() else {
+            return;
+        };
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let _send_result = terminate_tx.send(());
+        let _join_result = handle.await;
+    }
 }
 
 impl<Conn: Connection> Drop for Set<Conn> {
     fn drop(&mut self) {
-        self.handle.abort();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        handle.abort();
     }
 }
 
@@ -1468,5 +1497,39 @@ mod test {
         // Note that the connection we previously tried to access was marked
         // as failed during validation.
         assert_eq!(raw_conn.get_state(), TestConnectionState::ValidFail);
+    }
+
+    #[tokio::test]
+    async fn test_terminate() {
+        setup_tracing_subscriber();
+        let mut set = Set::new(
+            SetConfig::default(),
+            5,
+            backend::Name::new("Test set"),
+            backend::Backend { address: BACKEND },
+            Arc::new(TestConnector::new()),
+        );
+
+        // Let the connections fill up
+        set.monitor()
+            .wait_for(|state| matches!(state, SetState::Online { .. }))
+            .await
+            .unwrap();
+
+        let conn = set.claim().await.unwrap();
+
+        // We should be able to terminate, even with a claim out.
+        set.terminate().await;
+
+        assert!(matches!(
+            set.claim().await.map(|_| ()).unwrap_err(),
+            Error::SlotWorkerTerminated,
+        ));
+        assert!(matches!(
+            set.set_wanted_count(1).await.unwrap_err(),
+            Error::SlotWorkerTerminated
+        ));
+
+        drop(conn);
     }
 }
