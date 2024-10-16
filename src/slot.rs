@@ -855,29 +855,11 @@ impl<Conn: Connection> SetWorker<Conn> {
         loop {
             tokio::select! {
                 biased;
-                // If we should exit, terminate immediately
+                // If we should exit, terminate immediately.
                 _ = &mut self.terminate_rx => {
-                    while let Some((_id, slot)) = self.slots.pop_first() {
-                        let handle = {
-                            let mut lock = slot.inner.guarded.lock().unwrap();
-
-                            // First, fire the oneshot, so the background task
-                            // starts to exit.
-                            if let Some(tx) = lock.terminate_tx.take() {
-                                let _send_result = tx.send(());
-                            }
-
-                            // Next, pull out the handle, so we can watch it
-                            // terminate.
-                            let Some(handle) = lock.handle.take() else {
-                                return;
-                            };
-                            handle
-                        };
-
-                        handle.await.expect("Slot worker panicked");
-                    }
-                    return;
+                    // Break out of the loop rather than return, so that the
+                    // termination code runs.
+                    break;
                 },
                 // Recycle old requests
                 request = self.slot_rx.recv() => {
@@ -898,12 +880,37 @@ impl<Conn: Connection> SetWorker<Conn> {
                         Some(SetRequest::SetWantedCount { count }) => {
                             self.set_wanted_count(count);
                         },
+                        // All clients have gone away, so terminate the set.
                         None => {
-                            return;
-                        }
+                            // Break out of the loop rather than return, so that the
+                            // termination code runs.
+                            break;
+                        },
                     }
                 }
             }
+        }
+
+        // If we have exited from the run loop, tear down the background tasks
+        while let Some((_id, slot)) = self.slots.pop_first() {
+            let handle = {
+                let mut lock = slot.inner.guarded.lock().unwrap();
+
+                // First, fire the oneshot, so the background task
+                // starts to exit.
+                if let Some(tx) = lock.terminate_tx.take() {
+                    let _send_result = tx.send(());
+                }
+
+                // Next, pull out the handle, so we can watch it
+                // terminate.
+                let Some(handle) = lock.handle.take() else {
+                    return;
+                };
+                handle
+            };
+
+            handle.await.expect("Slot worker panicked");
         }
     }
 }
