@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch, Notify};
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 use tracing::{event, instrument, span, Instrument, Level};
 
@@ -86,11 +86,17 @@ struct SlotInnerGuarded<Conn: Connection> {
     // Tightly coupled with `Self::stats`.
     status_tx: watch::Sender<SetState>,
 
+    // Used as a one-way termination signal for
+    // the slot worker to terminate.
+    //
+    // See also: Self::handle
+    terminate_tx: Option<tokio::sync::oneshot::Sender<()>>,
+
     // A task which may may be monitoring the slot.
     //
     // In the "Connecting" state, this task attempts to connect to the backend.
     // In the "ConnectedUnclaimed", this task monitors the connection's health.
-    handle: Option<AbortHandle>,
+    handle: Option<JoinHandle<()>>,
 }
 
 struct SlotInner<Conn: Connection> {
@@ -202,29 +208,40 @@ impl<Conn: Connection> Clone for Slot<Conn> {
 }
 
 impl<Conn: Connection> Slot<Conn> {
+    // Returns "true" if connected successfully.
+    // Returns "false" if explicitly told to exit.
     async fn loop_until_connected(
         &self,
         config: &SetConfig,
         connector: &SharedConnector<Conn>,
         backend: &Backend,
-    ) {
+        terminate_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    ) -> bool {
         let mut retry_duration = config.min_connection_backoff.add_spread(config.spread);
 
         loop {
-            match connector.connect(backend).await {
-                Ok(conn) => {
-                    self.inner.state_transition(
-                        self.inner.guarded.lock().unwrap(),
-                        State::ConnectedUnclaimed(DebugIgnore(conn)),
-                    );
-                    return;
+            tokio::select! {
+                biased;
+                _ = &mut *terminate_rx => {
+                    return false;
                 }
-                Err(err) => {
-                    event!(Level::WARN, ?err, ?backend, "Failed to connect");
-                    self.inner.failure_window.add(1);
-                    retry_duration =
-                        retry_duration.exponential_backoff(config.max_connection_backoff);
-                    tokio::time::sleep(retry_duration).await;
+                result = connector.connect(backend) => {
+                    match result {
+                        Ok(conn) => {
+                            self.inner.state_transition(
+                                self.inner.guarded.lock().unwrap(),
+                                State::ConnectedUnclaimed(DebugIgnore(conn)),
+                            );
+                            return true;
+                        }
+                        Err(err) => {
+                            event!(Level::WARN, ?err, ?backend, "Failed to connect");
+                            self.inner.failure_window.add(1);
+                            retry_duration =
+                                retry_duration.exponential_backoff(config.max_connection_backoff);
+                            tokio::time::sleep(retry_duration).await;
+                        }
+                    }
                 }
             }
         }
@@ -440,6 +457,9 @@ struct SetWorker<Conn: Connection> {
     // Interface for receiving client requests
     rx: mpsc::Receiver<SetRequest<Conn>>,
 
+    // Identifies that the set worker should terminate immediately
+    terminate_rx: tokio::sync::oneshot::Receiver<()>,
+
     // Interface for communicating backend status
     status_tx: watch::Sender<SetState>,
 
@@ -468,6 +488,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     fn new(
         name: backend::Name,
         rx: mpsc::Receiver<SetRequest<Conn>>,
+        terminate_rx: tokio::sync::oneshot::Receiver<()>,
         status_tx: watch::Sender<SetState>,
         config: SetConfig,
         wanted_count: usize,
@@ -486,6 +507,7 @@ impl<Conn: Connection> SetWorker<Conn> {
             stats,
             failure_window,
             rx,
+            terminate_rx,
             status_tx,
             slot_tx,
             slot_rx,
@@ -499,11 +521,13 @@ impl<Conn: Connection> SetWorker<Conn> {
     // Creates a new Slot, which always starts as "Connecting", and spawn a task
     // to actually connect to the backend and monitor slot health.
     fn create_slot(&mut self, slot_id: SlotId) {
+        let (terminate_tx, mut terminate_rx) = tokio::sync::oneshot::channel();
         let slot = Slot {
             inner: Arc::new(SlotInner {
                 guarded: Mutex::new(SlotInnerGuarded {
                     state: State::Connecting,
                     status_tx: self.status_tx.clone(),
+                    terminate_tx: Some(terminate_tx),
                     handle: None,
                 }),
                 recycling_needed: Notify::new(),
@@ -517,78 +541,91 @@ impl<Conn: Connection> SetWorker<Conn> {
             .unwrap()
             .enter_state(&State::<Conn>::Connecting);
 
-        slot.inner.guarded.lock().unwrap().handle = Some(
-            tokio::task::spawn({
-                let slot = slot.clone();
-                let config = self.config.clone();
-                let connector = self.backend_connector.clone();
-                let backend = self.backend.clone();
-                async move {
-                    let mut interval = interval(config.health_interval);
+        slot.inner.guarded.lock().unwrap().handle = Some(tokio::task::spawn({
+            let slot = slot.clone();
+            let config = self.config.clone();
+            let connector = self.backend_connector.clone();
+            let backend = self.backend.clone();
+            async move {
+                let mut interval = interval(config.health_interval);
 
-                    loop {
-                        event!(Level::TRACE, slot_id, "Starting Slot work loop");
-                        enum Work {
-                            DoConnect,
-                            DoMonitor,
+                loop {
+                    event!(Level::TRACE, slot_id, "Starting Slot work loop");
+                    enum Work {
+                        DoConnect,
+                        DoMonitor,
+                    }
+
+                    // We're deciding what work to do, based on the state,
+                    // within an isolated scope. This is due to:
+                    // https://github.com/rust-lang/rust/issues/69663
+                    //
+                    // Even if we drop the MutexGuard before `.await` points,
+                    // rustc still sees something "non-Send" held across an
+                    // `.await`.
+                    let work = {
+                        let guarded = slot.inner.guarded.lock().unwrap();
+                        match &guarded.state {
+                            State::Connecting => Work::DoConnect,
+                            State::ConnectedUnclaimed(_)
+                            | State::ConnectedRecycling(_)
+                            | State::ConnectedChecking
+                            | State::ConnectedClaimed => Work::DoMonitor,
+                            State::Terminated => return,
                         }
+                    };
 
-                        // We're deciding what work to do, based on the state,
-                        // within an isolated scope. This is due to:
-                        // https://github.com/rust-lang/rust/issues/69663
-                        //
-                        // Even if we drop the MutexGuard before `.await` points,
-                        // rustc still sees something "non-Send" held across an
-                        // `.await`.
-                        let work = {
-                            let guarded = slot.inner.guarded.lock().unwrap();
-                            match &guarded.state {
-                                State::Connecting => Work::DoConnect,
-                                State::ConnectedUnclaimed(_)
-                                | State::ConnectedRecycling(_)
-                                | State::ConnectedChecking
-                                | State::ConnectedClaimed => Work::DoMonitor,
-                                State::Terminated => return,
+                    match work {
+                        Work::DoConnect => {
+                            let span = span!(Level::TRACE, "Slot worker connecting", slot_id);
+                            async {
+                                if !slot
+                                    .loop_until_connected(
+                                        &config,
+                                        &connector,
+                                        &backend,
+                                        &mut terminate_rx,
+                                    )
+                                    .await
+                                {
+                                    // The slot was instructed to exit
+                                    // before it connected. Bail.
+                                    return;
+                                }
+                                interval.reset_after(interval.period().add_spread(config.spread));
                             }
-                        };
-
-                        match work {
-                            Work::DoConnect => {
-                                let span = span!(Level::TRACE, "Slot worker connecting", slot_id);
-                                async {
-                                    slot.loop_until_connected(&config, &connector, &backend)
-                                        .await;
+                            .instrument(span)
+                            .await;
+                        }
+                        Work::DoMonitor => {
+                            tokio::select! {
+                                biased;
+                                _ = &mut terminate_rx => {
+                                    // If we've been instructed to bail out,
+                                    // do that immediately.
+                                    return;
+                                },
+                                _ = interval.tick() => {
+                                    slot.validate_health_if_connected(
+                                        &connector,
+                                        config.health_check_timeout,
+                                    )
+                                    .await;
                                     interval
                                         .reset_after(interval.period().add_spread(config.spread));
-                                }
-                                .instrument(span)
-                                .await;
-                            }
-                            Work::DoMonitor => {
-                                tokio::select! {
-                                    _ = interval.tick() => {
-                                        slot.validate_health_if_connected(
-                                            &connector,
-                                            config.health_check_timeout,
-                                        )
-                                        .await;
-                                        interval
-                                            .reset_after(interval.period().add_spread(config.spread));
-                                    },
-                                    _ = slot.inner.recycling_needed.notified() => {
-                                        slot.recycle_if_needed(
-                                            &connector,
-                                            config.health_check_timeout,
-                                        ).await;
-                                    },
-                                }
+                                },
+                                _ = slot.inner.recycling_needed.notified() => {
+                                    slot.recycle_if_needed(
+                                        &connector,
+                                        config.health_check_timeout,
+                                    ).await;
+                                },
                             }
                         }
                     }
                 }
-            })
-            .abort_handle(),
-        );
+            }
+        }));
     }
 
     // Borrows a connection out of the first unclaimed slot.
@@ -770,7 +807,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         level = "trace",
         skip(self),
         err,
-        name = ":SetWorker::claim",
+        name = "SetWorker::claim",
         fields(name = ?self.name),
     )]
     async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
@@ -817,6 +854,31 @@ impl<Conn: Connection> SetWorker<Conn> {
     async fn run(&mut self) {
         loop {
             tokio::select! {
+                biased;
+                // If we should exit, terminate immediately
+                _ = &mut self.terminate_rx => {
+                    while let Some((_id, slot)) = self.slots.pop_first() {
+                        let handle = {
+                            let mut lock = slot.inner.guarded.lock().unwrap();
+
+                            // First, fire the oneshot, so the background task
+                            // starts to exit.
+                            if let Some(tx) = lock.terminate_tx.take() {
+                                let _send_result = tx.send(());
+                            }
+
+                            // Next, pull out the handle, so we can watch it
+                            // terminate.
+                            let Some(handle) = lock.handle.take() else {
+                                return;
+                            };
+                            handle
+                        };
+
+                        handle.await.expect("Slot worker panicked");
+                    }
+                    return;
+                },
                 // Recycle old requests
                 request = self.slot_rx.recv() => {
                     match request {
@@ -862,13 +924,15 @@ pub(crate) enum SetState {
 /// A set of slots for a particular backend.
 pub(crate) struct Set<Conn: Connection> {
     tx: mpsc::Sender<SetRequest<Conn>>,
+
     status_rx: watch::Receiver<SetState>,
 
     name: backend::Name,
     pub(crate) stats: Arc<Mutex<Stats>>,
     failure_window: Arc<WindowedCounter>,
 
-    handle: JoinHandle<()>,
+    terminate_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl<Conn: Connection> Set<Conn> {
@@ -886,6 +950,7 @@ impl<Conn: Connection> Set<Conn> {
         backend_connector: SharedConnector<Conn>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1);
+        let (terminate_tx, terminate_rx) = tokio::sync::oneshot::channel();
         let (status_tx, status_rx) = watch::channel(SetState::Offline);
         let failure_duration = config.max_connection_backoff * 2;
         let stats = Arc::new(Mutex::new(Stats::default()));
@@ -898,6 +963,7 @@ impl<Conn: Connection> Set<Conn> {
                 let mut worker = SetWorker::new(
                     name,
                     rx,
+                    terminate_rx,
                     status_tx,
                     config,
                     wanted_count,
@@ -916,7 +982,8 @@ impl<Conn: Connection> Set<Conn> {
             name,
             stats,
             failure_window,
-            handle,
+            terminate_tx: Some(terminate_tx),
+            handle: Some(handle),
         }
     }
 
@@ -1009,11 +1076,27 @@ impl<Conn: Connection> Set<Conn> {
     pub(crate) fn get_stats(&self) -> Stats {
         self.stats.lock().unwrap().clone()
     }
+
+    /// Terminates all connections used by the slot set
+    #[instrument(skip(self), name = "Set::terminate")]
+    pub(crate) async fn terminate(&mut self) {
+        let Some(terminate_tx) = self.terminate_tx.take() else {
+            return;
+        };
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let _send_result = terminate_tx.send(());
+        handle.await.expect("Slot set worker panicked unexpectedly");
+    }
 }
 
 impl<Conn: Connection> Drop for Set<Conn> {
     fn drop(&mut self) {
-        self.handle.abort();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        handle.abort();
     }
 }
 
@@ -1468,5 +1551,39 @@ mod test {
         // Note that the connection we previously tried to access was marked
         // as failed during validation.
         assert_eq!(raw_conn.get_state(), TestConnectionState::ValidFail);
+    }
+
+    #[tokio::test]
+    async fn test_terminate() {
+        setup_tracing_subscriber();
+        let mut set = Set::new(
+            SetConfig::default(),
+            5,
+            backend::Name::new("Test set"),
+            backend::Backend { address: BACKEND },
+            Arc::new(TestConnector::new()),
+        );
+
+        // Let the connections fill up
+        set.monitor()
+            .wait_for(|state| matches!(state, SetState::Online { .. }))
+            .await
+            .unwrap();
+
+        let conn = set.claim().await.unwrap();
+
+        // We should be able to terminate, even with a claim out.
+        set.terminate().await;
+
+        assert!(matches!(
+            set.claim().await.map(|_| ()).unwrap_err(),
+            Error::SlotWorkerTerminated,
+        ));
+        assert!(matches!(
+            set.set_wanted_count(1).await.unwrap_err(),
+            Error::SlotWorkerTerminated
+        ));
+
+        drop(conn);
     }
 }
