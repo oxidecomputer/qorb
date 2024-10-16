@@ -442,7 +442,7 @@ impl Resolver for DnsResolver {
         };
 
         let _send_result = terminate_tx.send(());
-        handle.await.expect("Resolver task panicked unexpectedly");
+        crate::join::propagate_panics(handle.await);
     }
 }
 

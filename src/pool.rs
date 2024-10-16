@@ -205,7 +205,8 @@ impl<Conn: Connection> PoolInner<Conn> {
                         // The caller has abandoned their connecion to the pool.
                         //
                         // We stop handling new requests, but have no one to
-                        // notify.
+                        // notify. Given that the caller no longer needs the
+                        // pool, we choose to terminate to avoid leaks.
                         None => {
                             self.terminate().await;
                             return;
