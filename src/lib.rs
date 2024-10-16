@@ -28,6 +28,7 @@ pub mod service;
 // Necessary for implementation
 mod backoff;
 // mod codel;
+mod join;
 mod priority_list;
 mod rebalancer;
 mod slot;

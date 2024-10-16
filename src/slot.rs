@@ -910,7 +910,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                 handle
             };
 
-            handle.await.expect("Slot worker panicked");
+            crate::join::propagate_panics(handle.await);
         }
     }
 }
@@ -1094,7 +1094,7 @@ impl<Conn: Connection> Set<Conn> {
             return;
         };
         let _send_result = terminate_tx.send(());
-        handle.await.expect("Slot set worker panicked unexpectedly");
+        crate::join::propagate_panics(handle.await);
     }
 }
 
