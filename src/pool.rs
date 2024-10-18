@@ -485,10 +485,10 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
             .send(Request::Terminate)
             .await
             .map_err(|_| Error::Terminated)?;
-        if let Some(handle) = self.handle.lock().unwrap().take() {
-            handle.await.map_err(|_| Error::Terminated)?;
-        }
-        Ok(())
+        let Some(handle) = self.handle.lock().unwrap().take() else {
+            return Ok(());
+        };
+        handle.await.map_err(|_| Error::Terminated)
     }
 
     pub fn stats(&self) -> &Stats {
