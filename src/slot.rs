@@ -1122,6 +1122,7 @@ impl<Conn: Connection> Drop for Set<Conn> {
 mod test {
     use super::*;
     use crate::backend;
+    use async_trait::async_trait;
     use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1183,7 +1184,7 @@ mod test {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl backend::Connector for TestConnector {
         type Connection = TestConnection;
 
@@ -1603,5 +1604,117 @@ mod test {
         ));
 
         drop(conn);
+    }
+
+    #[tokio::test]
+    async fn test_terminate_while_rebalancing() {
+        #[derive(Debug)]
+        struct TestConfig {
+            // Original number of slots
+            wanted: usize,
+
+            // Number of claims to take, before we stall
+            //
+            // Should be less or equal to "wanted_count"
+            claimed: usize,
+
+            // New number of slots, after we stall
+            new_wanted: usize,
+        }
+
+        let configs = [
+            // Test decreasing slot count by 50%, with claims at various levels
+            TestConfig {
+                wanted: 8,
+                claimed: 0,
+                new_wanted: 4,
+            },
+            TestConfig {
+                wanted: 8,
+                claimed: 4,
+                new_wanted: 4,
+            },
+            TestConfig {
+                wanted: 8,
+                claimed: 8,
+                new_wanted: 4,
+            },
+            // Test doubling slot count, with claims at various levels
+            TestConfig {
+                wanted: 4,
+                claimed: 0,
+                new_wanted: 8,
+            },
+            TestConfig {
+                wanted: 4,
+                claimed: 2,
+                new_wanted: 8,
+            },
+            TestConfig {
+                wanted: 4,
+                claimed: 4,
+                new_wanted: 8,
+            },
+            // Test fully draining slots
+            TestConfig {
+                wanted: 8,
+                claimed: 0,
+                new_wanted: 0,
+            },
+            TestConfig {
+                wanted: 8,
+                claimed: 4,
+                new_wanted: 0,
+            },
+            TestConfig {
+                wanted: 8,
+                claimed: 8,
+                new_wanted: 0,
+            },
+        ];
+
+        setup_tracing_subscriber();
+
+        for config in configs {
+            println!("Testing config: {config:?}");
+
+            let connector = Arc::new(crate::test_utils::SlowConnector::new());
+            let mut set = Set::new(
+                SetConfig::default(),
+                config.wanted,
+                backend::Name::new("Test set"),
+                backend::Backend { address: BACKEND },
+                connector.clone(),
+            );
+
+            // Let the connections fill up
+            set.monitor()
+                .wait_for(|state| matches!(state, SetState::Online { .. }))
+                .await
+                .unwrap();
+
+            // Claim some of the handles
+            let mut handles = vec![];
+            for _ in 0..config.claimed {
+                handles.push(set.claim().await.unwrap());
+            }
+
+            // All future connections should be slow!
+            connector.stall();
+
+            // This should start making new connections...
+            set.set_wanted_count(config.new_wanted).await.unwrap();
+
+            set.terminate().await;
+
+            connector.panic_on_access();
+
+            drop(handles);
+
+            assert!(matches!(
+                set.claim().await.map(|_| ()).unwrap_err(),
+                Error::SlotWorkerTerminated,
+            ));
+        }
     }
 }

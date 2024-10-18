@@ -32,6 +32,8 @@ mod join;
 mod priority_list;
 mod rebalancer;
 mod slot;
+#[cfg(test)]
+mod test_utils;
 mod window_counter;
 
 // Default implementations of generic interfaces
