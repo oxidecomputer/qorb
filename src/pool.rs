@@ -542,7 +542,7 @@ mod test {
     use async_trait::async_trait;
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
     struct TestResolver {
@@ -803,43 +803,6 @@ mod test {
         ));
     }
 
-    struct SlowConnector {
-        delay_ms: AtomicU64,
-    }
-
-    impl SlowConnector {
-        fn new() -> Self {
-            Self {
-                delay_ms: AtomicU64::new(1),
-            }
-        }
-
-        async fn go_slow(&self) {
-            let delay_ms = self.delay_ms.load(Ordering::SeqCst);
-            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-        }
-    }
-
-    #[async_trait]
-    impl Connector for SlowConnector {
-        type Connection = ();
-
-        async fn connect(&self, _backend: &Backend) -> Result<Self::Connection, backend::Error> {
-            self.go_slow().await;
-            Ok(())
-        }
-
-        async fn is_valid(&self, _: &mut Self::Connection) -> Result<(), backend::Error> {
-            self.go_slow().await;
-            Ok(())
-        }
-
-        async fn on_acquire(&self, _: &mut Self::Connection) -> Result<(), backend::Error> {
-            self.go_slow().await;
-            Ok(())
-        }
-    }
-
     fn setup_tracing_subscriber() {
         use tracing_subscriber::fmt::format::FmtSpan;
         tracing_subscriber::fmt()
@@ -855,7 +818,7 @@ mod test {
         setup_tracing_subscriber();
 
         let resolver = Box::new(TestResolver::new());
-        let connector = Arc::new(SlowConnector::new());
+        let connector = Arc::new(crate::test_utils::SlowConnector::new());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
         resolver.replace(BTreeMap::from([(
@@ -866,11 +829,11 @@ mod test {
         let pool = Pool::new(resolver, connector.clone(), Policy::default());
         let _handle = pool.claim().await.expect("Failed to get claim");
 
-        // This delay is enormous, but the point is that termination should not
-        // get stuck behind any ongoing operations that might happen.
-        connector.delay_ms.store(99999999, Ordering::SeqCst);
-
+        // Create a large delay, which terminate() should skip.
+        connector.stall();
         pool.terminate().await.unwrap();
+        connector.panic_on_access();
+
         assert!(matches!(
             pool.terminate().await.unwrap_err(),
             Error::Terminated,
@@ -886,7 +849,7 @@ mod test {
         setup_tracing_subscriber();
 
         let resolver = Box::new(TestResolver::new());
-        let connector = Arc::new(SlowConnector::new());
+        let connector = Arc::new(crate::test_utils::SlowConnector::new());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
         resolver.replace(BTreeMap::from([(
@@ -894,13 +857,14 @@ mod test {
             Backend::new(address),
         )]));
 
-        // This delay is enormous, but the point is that termination should not
-        // get stuck behind any ongoing operations that might happen.
-        connector.delay_ms.store(99999999, Ordering::SeqCst);
+        // Create a large delay, which terminate() should skip.
+        connector.stall();
 
         let pool = Pool::new(resolver, connector.clone(), Policy::default());
 
         pool.terminate().await.unwrap();
+        connector.panic_on_access();
+
         assert!(matches!(
             pool.terminate().await.unwrap_err(),
             Error::Terminated,
