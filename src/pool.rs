@@ -542,7 +542,7 @@ mod test {
     use async_trait::async_trait;
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     #[derive(Clone)]
     struct TestResolver {
@@ -791,6 +791,114 @@ mod test {
 
         assert_eq!(handle.id, 1);
         assert_eq!(handle.backend.address, address);
+
+        pool.terminate().await.unwrap();
+        assert!(matches!(
+            pool.terminate().await.unwrap_err(),
+            Error::Terminated,
+        ));
+        assert!(matches!(
+            pool.claim().await.map(|_| ()).unwrap_err(),
+            Error::Terminated,
+        ));
+    }
+
+    struct SlowConnector {
+        delay_ms: AtomicU64,
+    }
+
+    impl SlowConnector {
+        fn new() -> Self {
+            Self {
+                delay_ms: AtomicU64::new(1),
+            }
+        }
+
+        async fn go_slow(&self) {
+            let delay_ms = self.delay_ms.load(Ordering::SeqCst);
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+        }
+    }
+
+    #[async_trait]
+    impl Connector for SlowConnector {
+        type Connection = ();
+
+        async fn connect(&self, _backend: &Backend) -> Result<Self::Connection, backend::Error> {
+            self.go_slow().await;
+            Ok(())
+        }
+
+        async fn is_valid(&self, _: &mut Self::Connection) -> Result<(), backend::Error> {
+            self.go_slow().await;
+            Ok(())
+        }
+
+        async fn on_acquire(&self, _: &mut Self::Connection) -> Result<(), backend::Error> {
+            self.go_slow().await;
+            Ok(())
+        }
+    }
+
+    fn setup_tracing_subscriber() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        tracing_subscriber::fmt()
+            .with_thread_names(true)
+            .with_span_events(FmtSpan::ENTER)
+            .with_max_level(tracing::Level::TRACE)
+            .with_test_writer()
+            .init();
+    }
+
+    #[tokio::test]
+    async fn test_terminate_with_slow_active_claim() {
+        setup_tracing_subscriber();
+
+        let resolver = Box::new(TestResolver::new());
+        let connector = Arc::new(SlowConnector::new());
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        resolver.replace(BTreeMap::from([(
+            backend::Name::new("aaa"),
+            Backend::new(address),
+        )]));
+
+        let pool = Pool::new(resolver, connector.clone(), Policy::default());
+        let _handle = pool.claim().await.expect("Failed to get claim");
+
+        // This delay is enormous, but the point is that termination should not
+        // get stuck behind any ongoing operations that might happen.
+        connector.delay_ms.store(99999999, Ordering::SeqCst);
+
+        pool.terminate().await.unwrap();
+        assert!(matches!(
+            pool.terminate().await.unwrap_err(),
+            Error::Terminated,
+        ));
+        assert!(matches!(
+            pool.claim().await.map(|_| ()).unwrap_err(),
+            Error::Terminated,
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_terminate_with_slow_setup() {
+        setup_tracing_subscriber();
+
+        let resolver = Box::new(TestResolver::new());
+        let connector = Arc::new(SlowConnector::new());
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        resolver.replace(BTreeMap::from([(
+            backend::Name::new("aaa"),
+            Backend::new(address),
+        )]));
+
+        // This delay is enormous, but the point is that termination should not
+        // get stuck behind any ongoing operations that might happen.
+        connector.delay_ms.store(99999999, Ordering::SeqCst);
+
+        let pool = Pool::new(resolver, connector.clone(), Policy::default());
 
         pool.terminate().await.unwrap();
         assert!(matches!(

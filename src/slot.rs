@@ -578,7 +578,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                     match work {
                         Work::DoConnect => {
                             let span = span!(Level::TRACE, "Slot worker connecting", slot_id);
-                            async {
+                            let connected = async {
                                 if !slot
                                     .loop_until_connected(
                                         &config,
@@ -590,12 +590,22 @@ impl<Conn: Connection> SetWorker<Conn> {
                                 {
                                     // The slot was instructed to exit
                                     // before it connected. Bail.
-                                    return;
+                                    event!(
+                                        Level::TRACE,
+                                        slot_id,
+                                        "Terminating instead of connecting"
+                                    );
+                                    return false;
                                 }
                                 interval.reset_after(interval.period().add_spread(config.spread));
+                                true
                             }
                             .instrument(span)
                             .await;
+
+                            if !connected {
+                                return;
+                            }
                         }
                         Work::DoMonitor => {
                             tokio::select! {
@@ -603,6 +613,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                                 _ = &mut terminate_rx => {
                                     // If we've been instructed to bail out,
                                     // do that immediately.
+                                    event!(Level::TRACE, slot_id, "Terminating while monitoring");
                                     return;
                                 },
                                 _ = interval.tick() => {
