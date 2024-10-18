@@ -42,9 +42,7 @@ enum Request<Conn: Connection> {
     Claim {
         tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>,
     },
-    Terminate {
-        tx: oneshot::Sender<Result<(), Error>>,
-    },
+    Terminate,
 }
 
 /// A shared reference to backend stats
@@ -197,9 +195,8 @@ impl<Conn: Connection> PoolInner<Conn> {
                         // The caller has explicitly asked us to terminate, and
                         // we should respond to them once we've stopped doing
                         // work.
-                        Some(Request::Terminate { tx }) => {
+                        Some(Request::Terminate) => {
                             self.terminate().await;
-                            let _ignored_result = tx.send(Ok(()));
                             return;
                         },
                         // The caller has abandoned their connecion to the pool.
@@ -404,7 +401,7 @@ impl<Conn: Connection> PoolInner<Conn> {
 
 /// Manages a set of connections to a service
 pub struct Pool<Conn: Connection> {
-    handle: tokio::task::JoinHandle<()>,
+    handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     tx: mpsc::Sender<Request<Conn>>,
     stats: Stats,
     claim_timeout: Duration,
@@ -472,7 +469,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
         });
 
         Self {
-            handle,
+            handle: Mutex::new(Some(handle)),
             tx,
             stats: Stats {
                 rx: stats_rx,
@@ -484,13 +481,14 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
 
     /// Terminates the connection pool
     pub async fn terminate(&self) -> Result<(), Error> {
-        let (tx, rx) = oneshot::channel();
-
         self.tx
-            .send(Request::Terminate { tx })
+            .send(Request::Terminate)
             .await
             .map_err(|_| Error::Terminated)?;
-        rx.await.map_err(|_| Error::Terminated)?
+        let Some(handle) = self.handle.lock().unwrap().take() else {
+            return Ok(());
+        };
+        handle.await.map_err(|_| Error::Terminated)
     }
 
     pub fn stats(&self) -> &Stats {
@@ -528,7 +526,9 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
 
 impl<Conn: Connection> Drop for Pool<Conn> {
     fn drop(&mut self) {
-        self.handle.abort()
+        if let Some(handle) = self.handle.lock().unwrap().take() {
+            handle.abort();
+        }
     }
 }
 
