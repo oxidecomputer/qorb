@@ -189,6 +189,41 @@ impl<Conn: Connection> PoolInner<Conn> {
         new_backends
     }
 
+    // Forcefully fail the next client claim request.
+    fn fail_claim(&mut self) {
+        let Some(request) = self.request_queue.pop_front() else {
+            return;
+        };
+        // We would have claimed this request if we could have done
+        // so earlier. Don't bother trying to access it now.
+        //
+        // Instead, identify "why haven't we succeeded" to help the
+        // client diagnose what's happening.
+        let err = match self.slots.len() {
+            // We don't know of any valid backends from the resolver
+            0 => Error::NoBackends,
+            _ => {
+                if self
+                    .slots
+                    .values()
+                    .any(|set| matches!(set.get_state(), slot::SetState::Online { .. }))
+                {
+                    // Backends exist, and appear online, but we couldn't get a claim.
+                    // Presumably, this means all existing claims are in-use.
+                    Error::AllClaimsUsed
+                } else {
+                    // Backends exist, but we don't see any connections that appear alive.
+                    Error::NoBackendsOnline
+                }
+            }
+        };
+
+        let _ = request.tx.send(Err(err));
+    }
+
+    // Waits until the next claim request timeout.
+    //
+    // If one does not exist, wait forever.
     async fn run(mut self) {
         let mut rebalance_interval = interval(self.policy.rebalance_interval);
         rebalance_interval.reset();
@@ -197,11 +232,12 @@ impl<Conn: Connection> PoolInner<Conn> {
         let mut backend_status_stream = StreamMap::new();
         let mut resolver_stream = WatchStream::new(self.resolver.monitor());
         loop {
-            let request_timeout = if let Some(oldest_request) = self.request_queue.front() {
-                tokio::time::sleep_until(oldest_request.deadline)
-            } else {
-                // TODO: This is a hack
-                tokio::time::sleep(tokio::time::Duration::from_secs(10000))
+            // Either get the next request timeout, or wait forever.
+            let next_request_timeout = async {
+                match self.request_queue.front() {
+                    Some(oldest_request) => tokio::time::sleep_until(oldest_request.deadline).await,
+                    None => std::future::pending().await,
+                }
             };
 
             tokio::select! {
@@ -230,28 +266,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                     }
                 }
                 // Timeout old requests from clients
-                _ = request_timeout => {
-                    let Some(request) = self.request_queue.pop_front() else {
-                        continue;
-                    };
-                    // We would have claimed this request if we could have done
-                    // it earlier - this request will fail, but help the client
-                    // identify "why".
-                    let err = match self.slots.len() {
-                        0 => Error::NoBackends,
-                        _ => {
-                            if self.slots.values().any(|set| {
-                                matches!(set.get_state(), slot::SetState::Online { .. })
-                            }) {
-                                Error::AllClaimsUsed
-                            } else {
-                                Error::NoBackendsOnline
-                            }
-                        },
-                    };
-
-                    let _ = request.tx.send(Err(err));
-                },
+                _ = next_request_timeout => self.fail_claim(),
                 // Handle updates from the resolver
                 Some(all_backends) = resolver_stream.next() => {
                     event!(Level::INFO, "Resolver updated known backends");
@@ -932,7 +947,10 @@ mod test {
             Box::new(resolver.clone()),
             connector.clone(),
             Policy {
+                // NOTE: We need to set this so we can test the
+                // 'all claims in-use' error case.
                 max_slots: 1,
+                // We will hit this timeout, so keep it relatively short.
                 claim_timeout: Duration::from_millis(5),
                 ..Default::default()
             },
@@ -962,7 +980,7 @@ mod test {
         connector.start_failing();
         drop(claim);
 
-        // Failure casae: Although the backend appears in the resolver,
+        // Failure case: Although the backend appears in the resolver,
         // it's not online. Give a more informative error than "no slots
         // ready".
         let claim_err = pool.claim().await.map(|_| ()).unwrap_err();
