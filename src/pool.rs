@@ -34,14 +34,8 @@ pub enum Error {
     #[error("Backends exist, and appear online, but all claims are used")]
     AllClaimsUsed,
 
-    #[error(transparent)]
-    Slot(#[from] slot::Error),
-
     #[error("Pool terminated")]
     Terminated,
-
-    #[error("Request timed out")]
-    TimedOut,
 }
 
 enum Request<Conn: Connection> {
