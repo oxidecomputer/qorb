@@ -24,6 +24,7 @@ pub mod pool;
 pub mod qtop;
 pub mod resolver;
 pub mod service;
+pub mod slot;
 
 // Necessary for implementation
 mod backoff;
@@ -31,7 +32,6 @@ mod backoff;
 mod join;
 mod priority_list;
 mod rebalancer;
-mod slot;
 #[cfg(test)]
 mod test_utils;
 mod window_counter;
