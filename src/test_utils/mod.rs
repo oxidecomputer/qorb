@@ -35,7 +35,7 @@ impl SlowConnector {
         self.panic_on_access.store(true, Ordering::SeqCst);
     }
 
-    // Internal shared logic for each of the connetor APIs
+    // Internal shared logic for each of the connector APIs
     async fn react_to_connection_operation(&self) {
         if self.panic_on_access.load(Ordering::SeqCst) {
             panic!("Should not be making new requests through this connector!");
@@ -67,6 +67,58 @@ impl Connector for SlowConnector {
 
     async fn on_recycle(&self, _: &mut Self::Connection) -> Result<(), backend::Error> {
         self.react_to_connection_operation().await;
+        Ok(())
+    }
+}
+
+/// A test-only connector which can throw errors on connection access
+pub struct FaultyConnector {
+    fail_on_access: AtomicBool,
+}
+
+impl FaultyConnector {
+    pub fn new() -> Self {
+        Self {
+            fail_on_access: AtomicBool::new(false),
+        }
+    }
+
+    pub fn start_failing(&self) {
+        self.fail_on_access.store(true, Ordering::SeqCst);
+    }
+
+    // Internal shared logic for each of the connector APIs
+    async fn react_to_connection_operation(&self) -> Result<(), backend::Error> {
+        if self.fail_on_access.load(Ordering::SeqCst) {
+            return Err(backend::Error::Other(anyhow::anyhow!(
+                "Connector failing intentionally"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Connector for FaultyConnector {
+    type Connection = ();
+
+    async fn connect(&self, _backend: &Backend) -> Result<Self::Connection, backend::Error> {
+        self.react_to_connection_operation().await?;
+        Ok(())
+    }
+
+    async fn is_valid(&self, _: &mut Self::Connection) -> Result<(), backend::Error> {
+        self.react_to_connection_operation().await?;
+        Ok(())
+    }
+
+    async fn on_acquire(&self, _: &mut Self::Connection) -> Result<(), backend::Error> {
+        self.react_to_connection_operation().await?;
+        Ok(())
+    }
+
+    async fn on_recycle(&self, _: &mut Self::Connection) -> Result<(), backend::Error> {
+        self.react_to_connection_operation().await?;
         Ok(())
     }
 }

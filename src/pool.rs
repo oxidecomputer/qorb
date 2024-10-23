@@ -18,7 +18,7 @@ use std::sync::{
 };
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{interval, Duration};
+use tokio::time::interval;
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::StreamMap;
 use tracing::{event, instrument, Level};
@@ -28,14 +28,14 @@ pub enum Error {
     #[error("No backends found for this service")]
     NoBackends,
 
-    #[error(transparent)]
-    Slot(#[from] slot::Error),
+    #[error("Backends exist, but none are online")]
+    NoBackendsOnline,
+
+    #[error("Backends exist, and appear online, but all claims are used")]
+    AllClaimsUsed,
 
     #[error("Pool terminated")]
     Terminated,
-
-    #[error("Request timed out")]
-    TimedOut,
 }
 
 enum Request<Conn: Connection> {
@@ -64,6 +64,12 @@ impl serde::Serialize for BackendStats {
     }
 }
 
+// A claim request that could not complete immediately
+struct ClaimRequest<Conn: Connection> {
+    tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>,
+    deadline: tokio::time::Instant,
+}
+
 struct PoolInner<Conn: Connection> {
     backend_connector: backend::SharedConnector<Conn>,
 
@@ -71,7 +77,7 @@ struct PoolInner<Conn: Connection> {
     slots: HashMap<backend::Name, slot::Set<Conn>>,
     priority_list: PriorityList<backend::Name>,
 
-    request_queue: VecDeque<oneshot::Sender<Result<claim::Handle<Conn>, Error>>>,
+    request_queue: VecDeque<ClaimRequest<Conn>>,
     policy: Policy,
 
     // Tracks stats for each backend.
@@ -177,6 +183,41 @@ impl<Conn: Connection> PoolInner<Conn> {
         new_backends
     }
 
+    // Forcefully fail the next client claim request.
+    fn fail_claim(&mut self) {
+        let Some(request) = self.request_queue.pop_front() else {
+            return;
+        };
+        // We would have claimed this request if we could have done
+        // so earlier. Don't bother trying to access it now.
+        //
+        // Instead, identify "why haven't we succeeded" to help the
+        // client diagnose what's happening.
+        let err = match self.slots.len() {
+            // We don't know of any valid backends from the resolver
+            0 => Error::NoBackends,
+            _ => {
+                if self
+                    .slots
+                    .values()
+                    .any(|set| matches!(set.get_state(), slot::SetState::Online { .. }))
+                {
+                    // Backends exist, and appear online, but we couldn't get a claim.
+                    // Presumably, this means all existing claims are in-use.
+                    Error::AllClaimsUsed
+                } else {
+                    // Backends exist, but we don't see any connections that appear alive.
+                    Error::NoBackendsOnline
+                }
+            }
+        };
+
+        let _ = request.tx.send(Err(err));
+    }
+
+    // Waits until the next claim request timeout.
+    //
+    // If one does not exist, wait forever.
     async fn run(mut self) {
         let mut rebalance_interval = interval(self.policy.rebalance_interval);
         rebalance_interval.reset();
@@ -185,6 +226,14 @@ impl<Conn: Connection> PoolInner<Conn> {
         let mut backend_status_stream = StreamMap::new();
         let mut resolver_stream = WatchStream::new(self.resolver.monitor());
         loop {
+            // Either get the next request timeout, or wait forever.
+            let next_request_timeout = async {
+                match self.request_queue.front() {
+                    Some(oldest_request) => tokio::time::sleep_until(oldest_request.deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+
             tokio::select! {
                 // Handle requests from clients
                 request = self.rx.recv() => {
@@ -210,6 +259,8 @@ impl<Conn: Connection> PoolInner<Conn> {
                         }
                     }
                 }
+                // Timeout old requests from clients
+                _ = next_request_timeout => self.fail_claim(),
                 // Handle updates from the resolver
                 Some(all_backends) = resolver_stream.next() => {
                     event!(Level::INFO, "Resolver updated known backends");
@@ -248,22 +299,30 @@ impl<Conn: Connection> PoolInner<Conn> {
         let result = self.claim().await;
         if result.is_ok() {
             let _ = tx.send(result);
-        } else {
-            self.request_queue.push_back(tx);
+            return;
         }
+        // If we fail to claim a request...
+        //
+        // - Keep this request in a queue. A backend may gain slots or come
+        // online later.
+        // - Start the clock on a timeout.
+        self.request_queue.push_back(ClaimRequest {
+            tx,
+            deadline: tokio::time::Instant::now() + self.policy.claim_timeout,
+        });
     }
 
     async fn try_claim_from_queue(&mut self) {
         loop {
-            let Some(tx) = self.request_queue.pop_front() else {
+            let Some(request) = self.request_queue.pop_front() else {
                 return;
             };
 
             let result = self.claim().await;
             if result.is_ok() {
-                let _ = tx.send(result);
+                let _ = request.tx.send(result);
             } else {
-                self.request_queue.push_front(tx);
+                self.request_queue.push_front(request);
                 return;
             }
         }
@@ -404,7 +463,6 @@ pub struct Pool<Conn: Connection> {
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     tx: mpsc::Sender<Request<Conn>>,
     stats: Stats,
-    claim_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -462,7 +520,6 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     ) -> Self {
         let (tx, rx) = mpsc::channel(1);
         let (stats_tx, stats_rx) = watch::channel(HashMap::default());
-        let claim_timeout = policy.claim_timeout;
         let handle = tokio::task::spawn(async move {
             let worker = PoolInner::new(resolver, backend_connector, policy, rx, stats_tx);
             worker.run().await;
@@ -475,7 +532,6 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
                 rx: stats_rx,
                 claims: Arc::new(AtomicUsize::new(0)),
             },
-            claim_timeout,
         }
     }
 
@@ -508,19 +564,13 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
         // claims; looping at this point would send us to the back of the queue
         // if there were multiple callers.
 
-        let request_claim = async {
-            self.tx
-                .send(Request::Claim { tx })
-                .await
-                .map_err(|_| Error::Terminated)?;
-            let claim = rx.await.map_err(|_| Error::Terminated)?;
-            self.stats.claims.fetch_add(1, Ordering::Relaxed);
-            claim
-        };
-
-        tokio::time::timeout(self.claim_timeout, request_claim)
+        self.tx
+            .send(Request::Claim { tx })
             .await
-            .map_err(|_| Error::TimedOut)?
+            .map_err(|_| Error::Terminated)?;
+        let claim = rx.await.map_err(|_| Error::Terminated)?;
+        self.stats.claims.fetch_add(1, Ordering::Relaxed);
+        claim
     }
 }
 
@@ -543,6 +593,7 @@ mod test {
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::Duration;
 
     #[derive(Clone)]
     struct TestResolver {
@@ -743,7 +794,7 @@ mod test {
 
             if handle.backend.address == address1 {
                 eprintln!("Still accessing old address; waiting to shift to new backend...");
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }
 
@@ -764,7 +815,10 @@ mod test {
                     handles.push(handle);
                 }
                 Err(err) => {
-                    assert!(matches!(err, Error::TimedOut), "Unexpected error: {err:?}");
+                    assert!(
+                        matches!(err, Error::AllClaimsUsed,),
+                        "Unexpected error: {err:?}"
+                    );
                     break;
                 }
             }
@@ -873,5 +927,60 @@ mod test {
             pool.claim().await.map(|_| ()).unwrap_err(),
             Error::Terminated,
         ));
+    }
+
+    #[tokio::test]
+    async fn test_better_errors() {
+        setup_tracing_subscriber();
+
+        let resolver = TestResolver::new();
+        let connector = Arc::new(crate::test_utils::FaultyConnector::new());
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        let pool = Pool::new(
+            Box::new(resolver.clone()),
+            connector.clone(),
+            Policy {
+                // NOTE: We need to set this so we can test the
+                // 'all claims in-use' error case.
+                max_slots: 1,
+                // We will hit this timeout, so keep it relatively short.
+                claim_timeout: Duration::from_millis(5),
+                ..Default::default()
+            },
+        );
+
+        // Failure case: No backends appear in the resolver
+        let claim_err = pool.claim().await.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(claim_err, Error::NoBackends),
+            "Unexpected error: {claim_err}"
+        );
+
+        resolver.replace(BTreeMap::from([(
+            backend::Name::new("aaa"),
+            Backend::new(address),
+        )]));
+
+        let claim = pool.claim().await.expect("Failed to make claim");
+
+        // Failure case: We've hit the claim capacity with a backend
+        // that is online.
+        let claim_err = pool.claim().await.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(claim_err, Error::AllClaimsUsed),
+            "Unexpected error: {claim_err}"
+        );
+        connector.start_failing();
+        drop(claim);
+
+        // Failure case: Although the backend appears in the resolver,
+        // it's not online. Give a more informative error than "no slots
+        // ready".
+        let claim_err = pool.claim().await.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(claim_err, Error::NoBackendsOnline),
+            "Unexpected error: {claim_err}"
+        );
     }
 }
