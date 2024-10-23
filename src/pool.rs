@@ -465,9 +465,14 @@ pub struct Pool<Conn: Connection> {
     stats: Stats,
 }
 
+/// Pool-side stats, including statistics for each backend.
 #[derive(Clone)]
 pub struct Stats {
+    /// Per-backend statistics
     pub rx: watch::Receiver<HashMap<backend::Name, BackendStats>>,
+
+    /// The total number of claims made (successfully or unsuccessfully)
+    /// within the pool so far.
     pub claims: Arc<AtomicUsize>,
 }
 
@@ -547,6 +552,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
         handle.await.map_err(|_| Error::Terminated)
     }
 
+    /// Returns a reference to pool-wide stats
     pub fn stats(&self) -> &Stats {
         &self.stats
     }
