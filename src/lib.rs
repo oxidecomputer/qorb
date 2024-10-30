@@ -89,7 +89,7 @@ mod probes {
 
     /// Fires right before attempting to make a connection, with the address
     /// we're connecting to.
-    fn connect__start(id: &usdt::UniqueId, addr: &std::net::SocketAddr) {}
+    fn connect__start(id: &usdt::UniqueId, addr: &str) {}
 
     /// Fires just after successfully making a connection.
     fn connect__done(id: &usdt::UniqueId) {}
@@ -101,13 +101,13 @@ mod probes {
     /// Fires when qorb creates a new handle, before returning it in a call to
     /// `qorb::Pool::claim()`. This includes an ID for the handle, and the
     /// address of the backend the handle is connected to.
-    fn handle__claimed(id: usize, addr: &std::net::SocketAddr) {}
+    fn handle__claimed(id: usize, addr: &str) {}
 
-    /// Fires when qorb recycles a handle, usually when it is dropped.
-    fn handle__recycled(id: usize) {}
+    /// Fires when a handle is returned to qorb, usually when it is dropped.
+    fn handle__returned(id: usize) {}
 
     /// Fires just before we start a health-check to a backend.
-    fn health__check__start(id: &usdt::UniqueId, addr: &std::net::SocketAddr) {}
+    fn health__check__start(id: &usdt::UniqueId, addr: &str) {}
 
     /// Fires after a successful health-check to a backend.
     fn health__check__done(id: &usdt::UniqueId) {}
@@ -116,7 +116,7 @@ mod probes {
     fn health__check__failed(id: &usdt::UniqueId, reason: &str) {}
 
     /// Fires just before we recycle a connection to a backend.
-    fn recycle__start(id: &usdt::UniqueId, addr: &std::net::SocketAddr) {}
+    fn recycle__start(id: &usdt::UniqueId, addr: &str) {}
 
     /// Fires after successfully recycling a connection to a backend.
     fn recycle__done(id: &usdt::UniqueId) {}

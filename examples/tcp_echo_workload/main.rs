@@ -99,6 +99,7 @@ fn usage(args: &[String]) {
     eprintln!("  --help: See this help message");
     eprintln!("  --tracing: Enable tracing (writes to {})", trace_path);
     eprintln!("  --super-tracing: Enable more tracing");
+    eprintln!("  --probes: Enable USDT DTrace probes");
     eprintln!("  --bootstrap=<DNS address>: Provide a bootstrap DNS address");
 }
 
@@ -108,10 +109,12 @@ async fn main() -> anyhow::Result<()> {
 
     let mut trace_level = Tracing::Off;
     let mut bootstrap_address = "[::1]:1234".parse()?;
+    let mut enable_probes = false;
     for arg in &args[1..] {
         match arg.as_str() {
             "--tracing" => trace_level = Tracing::On,
             "--super-tracing" => trace_level = Tracing::ReallyOn,
+            "--probes" => enable_probes = true,
             "--help" => {
                 usage(&args);
                 return Ok(());
@@ -129,6 +132,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing(trace_level);
+    #[cfg(feature = "probes")]
+    if enable_probes {
+        usdt::register_probes().unwrap();
+    }
 
     // We need to tell the pool about at least one DNS server to get the party
     // started.

@@ -256,7 +256,7 @@ impl<Conn: Connection> Slot<Conn> {
         #[cfg(feature = "probes")]
         let id = usdt::UniqueId::new();
         #[cfg(feature = "probes")]
-        probes::connect__start!(|| (&id, &backend.address));
+        probes::connect__start!(|| (&id, backend.address.to_string()));
         let res = connector.connect(backend).await;
         #[cfg(feature = "probes")]
         match &res {
@@ -295,7 +295,7 @@ impl<Conn: Connection> Slot<Conn> {
         #[cfg(feature = "probes")]
         let id = usdt::UniqueId::new();
         #[cfg(feature = "probes")]
-        probes::recycle__start!(|| (&id, &backend.address));
+        probes::recycle__start!(|| (&id, backend.address.to_string()));
 
         let result = tokio::time::timeout(timeout, connector.on_recycle(&mut conn)).await;
 
@@ -354,7 +354,7 @@ impl<Conn: Connection> Slot<Conn> {
         #[cfg(feature = "probes")]
         let id = usdt::UniqueId::new();
         #[cfg(feature = "probes")]
-        probes::health__check__start!(|| (&id, &backend.address));
+        probes::health__check__start!(|| (&id, backend.address.to_string()));
 
         // It's important that we don't hold the slot lock across an
         // await point. To avoid this issue, we actually take the
@@ -718,7 +718,9 @@ impl<Conn: Connection> SetWorker<Conn> {
                 let borrowed_conn = BorrowedConnection::new(conn, *id);
 
                 #[cfg(feature = "probes")]
-                crate::probes::handle__claimed!(|| (borrowed_conn.id, &self.backend.address));
+                crate::probes::handle__claimed!(|| {
+                    (borrowed_conn.id, self.backend.address.to_string())
+                });
 
                 // The "drop" method of the claim::Handle will return it to
                 // the slot set, through the permit (which is connected to
@@ -742,7 +744,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     fn recycle_connection(&mut self, borrowed_conn: BorrowedConnection<Conn>) {
         let slot_id = borrowed_conn.id;
         #[cfg(feature = "probes")]
-        crate::probes::handle__recycled!(|| slot_id);
+        crate::probes::handle__returned!(|| slot_id);
         let inner = self
             .slots
             .get_mut(&slot_id)
