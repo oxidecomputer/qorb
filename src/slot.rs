@@ -3,6 +3,8 @@ use crate::backend::{self, Backend, SharedConnector};
 use crate::backoff::ExponentialBackoff;
 use crate::claim;
 use crate::policy::SetConfig;
+#[cfg(feature = "probes")]
+use crate::probes;
 use crate::window_counter::WindowedCounter;
 
 use debug_ignore::DebugIgnore;
@@ -225,7 +227,7 @@ impl<Conn: Connection> Slot<Conn> {
                 _ = &mut *terminate_rx => {
                     return false;
                 }
-                result = connector.connect(backend) => {
+                result = Self::do_connect(connector, backend) => {
                     match result {
                         Ok(conn) => {
                             self.inner.state_transition(
@@ -247,12 +249,34 @@ impl<Conn: Connection> Slot<Conn> {
         }
     }
 
+    async fn do_connect(
+        connector: &SharedConnector<Conn>,
+        backend: &Backend,
+    ) -> Result<Conn, backend::Error> {
+        #[cfg(feature = "probes")]
+        let id = usdt::UniqueId::new();
+        #[cfg(feature = "probes")]
+        probes::connect__start!(|| (&id, &backend.address));
+        let res = connector.connect(backend).await;
+        #[cfg(feature = "probes")]
+        match &res {
+            Ok(_) => probes::connect__done!(|| &id),
+            Err(e) => probes::connect__failed!(|| (&id, e.to_string())),
+        }
+        res
+    }
+
     #[instrument(
         level = "trace",
         skip(self, connector),
         name = "Slot::recycle_if_needed"
     )]
-    async fn recycle_if_needed(&self, connector: &SharedConnector<Conn>, timeout: Duration) {
+    async fn recycle_if_needed(
+        &self,
+        connector: &SharedConnector<Conn>,
+        timeout: Duration,
+        backend: &Backend,
+    ) {
         // Grab the connection, if and only if it needs recycling
         let mut conn = {
             let slot = self.inner.guarded.lock().unwrap();
@@ -268,21 +292,32 @@ impl<Conn: Connection> Slot<Conn> {
             conn
         };
 
+        #[cfg(feature = "probes")]
+        let id = usdt::UniqueId::new();
+        #[cfg(feature = "probes")]
+        probes::recycle__start!(|| (&id, &backend.address));
+
         let result = tokio::time::timeout(timeout, connector.on_recycle(&mut conn)).await;
 
         let slot = self.inner.guarded.lock().unwrap();
         match result {
             Ok(Ok(())) => {
+                #[cfg(feature = "probes")]
+                probes::recycle__done!(|| &id);
                 event!(Level::TRACE, "Connection recycled successfully");
                 self.inner
                     .state_transition(slot, State::ConnectedUnclaimed(DebugIgnore(conn)));
             }
             Ok(Err(err)) => {
+                #[cfg(feature = "probes")]
+                probes::recycle__failed!(|| (&id, err.to_string()));
                 event!(Level::WARN, ?err, "Connection failed during recycle check");
                 self.inner.failure_window.add(1);
                 self.inner.state_transition(slot, State::Connecting);
             }
             Err(_) => {
+                #[cfg(feature = "probes")]
+                probes::recycle__failed!(|| (&id, "Timeout"));
                 event!(Level::WARN, "Connection timed out during recycle check");
                 self.inner.failure_window.add(1);
                 self.inner.state_transition(slot, State::Connecting);
@@ -299,6 +334,7 @@ impl<Conn: Connection> Slot<Conn> {
         &self,
         connector: &SharedConnector<Conn>,
         timeout: Duration,
+        backend: &Backend,
     ) {
         // Grab the connection, if and only if it's idle in the pool.
         let mut conn = {
@@ -315,6 +351,11 @@ impl<Conn: Connection> Slot<Conn> {
             conn
         };
 
+        #[cfg(feature = "probes")]
+        let id = usdt::UniqueId::new();
+        #[cfg(feature = "probes")]
+        probes::health__check__start!(|| (&id, &backend.address));
+
         // It's important that we don't hold the slot lock across an
         // await point. To avoid this issue, we actually take the
         // slot out of the connection pool, replacing the state of
@@ -328,16 +369,22 @@ impl<Conn: Connection> Slot<Conn> {
         let slot = self.inner.guarded.lock().unwrap();
         match result {
             Ok(Ok(())) => {
+                #[cfg(feature = "probes")]
+                probes::health__check__done!(|| &id);
                 event!(Level::TRACE, "Connection remains healthy");
                 self.inner
                     .state_transition(slot, State::ConnectedUnclaimed(DebugIgnore(conn)));
             }
             Ok(Err(err)) => {
+                #[cfg(feature = "probes")]
+                probes::health__check__failed!(|| (&id, err.to_string()));
                 event!(Level::WARN, ?err, "Connection failed during health check");
                 self.inner.failure_window.add(1);
                 self.inner.state_transition(slot, State::Connecting);
             }
             Err(_) => {
+                #[cfg(feature = "probes")]
+                probes::health__check__failed!(|| (&id, "Timeout"));
                 event!(Level::WARN, "Connection timed out during health check");
                 self.inner.failure_window.add(1);
                 self.inner.state_transition(slot, State::Connecting);
@@ -620,6 +667,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                                     slot.validate_health_if_connected(
                                         &connector,
                                         config.health_check_timeout,
+                                        &backend,
                                     )
                                     .await;
                                     interval
@@ -629,6 +677,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                                     slot.recycle_if_needed(
                                         &connector,
                                         config.health_check_timeout,
+                                        &backend,
                                     ).await;
                                 },
                             }
@@ -668,6 +717,9 @@ impl<Conn: Connection> SetWorker<Conn> {
 
                 let borrowed_conn = BorrowedConnection::new(conn, *id);
 
+                #[cfg(feature = "probes")]
+                crate::probes::handle__claimed!(|| (borrowed_conn.id, &self.backend.address));
+
                 // The "drop" method of the claim::Handle will return it to
                 // the slot set, through the permit (which is connected to
                 // slot_rx).
@@ -689,6 +741,8 @@ impl<Conn: Connection> SetWorker<Conn> {
     )]
     fn recycle_connection(&mut self, borrowed_conn: BorrowedConnection<Conn>) {
         let slot_id = borrowed_conn.id;
+        #[cfg(feature = "probes")]
+        crate::probes::handle__recycled!(|| slot_id);
         let inner = self
             .slots
             .get_mut(&slot_id)

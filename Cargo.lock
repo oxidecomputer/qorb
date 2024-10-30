@@ -1972,6 +1972,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "usdt",
 ]
 
 [[package]]

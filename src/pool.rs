@@ -5,6 +5,8 @@ use crate::backend::Connection;
 use crate::claim;
 use crate::policy::Policy;
 use crate::priority_list::PriorityList;
+#[cfg(feature = "probes")]
+use crate::probes;
 use crate::rebalancer;
 use crate::resolver;
 use crate::slot;
@@ -36,6 +38,19 @@ pub enum Error {
 
     #[error("Pool terminated")]
     Terminated,
+}
+
+impl Error {
+    #[cfg(feature = "probes")]
+    // Convert to a static string for USDT probes.
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Error::NoBackends => "NoBackends",
+            Error::NoBackendsOnline => "NoBackendsOnline",
+            Error::AllClaimsUsed => "AllClaimsUsed",
+            Error::Terminated => "Terminated",
+        }
+    }
 }
 
 enum Request<Conn: Connection> {
@@ -560,6 +575,20 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     /// Acquires a handle to a connection within the connection pool.
     #[instrument(level = "debug", skip(self), err, name = "Pool::claim")]
     pub async fn claim(&self) -> Result<claim::Handle<Conn>, Error> {
+        #[cfg(feature = "probes")]
+        let id = usdt::UniqueId::new();
+        #[cfg(feature = "probes")]
+        probes::claim__start!(|| &id);
+        let res = self.do_claim().await;
+        #[cfg(feature = "probes")]
+        match &res {
+            Ok(_) => probes::claim__done!(|| &id),
+            Err(e) => probes::claim__failed!(|| (&id, e.as_str())),
+        }
+        res
+    }
+
+    async fn do_claim(&self) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
 
         // TODO: The work of "on_acquire" could be done here? Would prevent the
