@@ -88,7 +88,9 @@ async fn concurrent_claims(count: usize) {
         Backend::new(address),
     )]));
 
-    let pool = Arc::new(Pool::new(resolver, connector, Policy::default()));
+    let pool = Arc::new(
+        Pool::new(resolver, connector, Policy::default()).expect("Failed to register probes"),
+    );
 
     let futs: Vec<_> = (0..count)
         .map(|_| {

@@ -5,6 +5,8 @@ use crate::backend::Connection;
 use crate::claim;
 use crate::policy::Policy;
 use crate::priority_list::PriorityList;
+#[cfg(feature = "probes")]
+use crate::probes;
 use crate::rebalancer;
 use crate::resolver;
 use crate::slot;
@@ -36,6 +38,19 @@ pub enum Error {
 
     #[error("Pool terminated")]
     Terminated,
+}
+
+impl Error {
+    #[cfg(feature = "probes")]
+    // Convert to a static string for USDT probes.
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Error::NoBackends => "NoBackends",
+            Error::NoBackendsOnline => "NoBackendsOnline",
+            Error::AllClaimsUsed => "AllClaimsUsed",
+            Error::Terminated => "Terminated",
+        }
+    }
 }
 
 enum Request<Conn: Connection> {
@@ -476,6 +491,33 @@ pub struct Stats {
     pub claims: Arc<AtomicUsize>,
 }
 
+/// A wrapper type indicating that the USDT probes could not be registered.
+///
+/// In this case, no probes will be available in the process. However, similar
+/// to `std::sync::PoisonError`, this contains the pool itself. Applications
+/// which don't care about a probe registration failure may still get access to
+/// the pool
+pub struct RegistrationError<Conn: Connection>(Pool<Conn>);
+
+impl<Conn: Connection> std::fmt::Debug for RegistrationError<Conn> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistrationError").finish_non_exhaustive()
+    }
+}
+
+impl<Conn: Connection> std::fmt::Display for RegistrationError<Conn> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        "USDT probe registration failed".fmt(f)
+    }
+}
+
+impl<Conn: Connection> RegistrationError<Conn> {
+    /// Consume the error and get access to the contained pool.
+    pub fn into_inner(self) -> Pool<Conn> {
+        self.0
+    }
+}
+
 impl<Conn: Connection + Send + 'static> Pool<Conn> {
     /// Creates a new connection pool.
     ///
@@ -508,7 +550,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     ///
     /// // Create the connection pool itself.
     /// let policy = Policy::default();
-    /// let pool = Pool::new(resolver, connector, policy);
+    /// let pool = Pool::new(resolver, connector, policy).unwrap();
     ///
     /// // Grab a connection from the pool.
     /// // Note that it may take a moment for the pool to create connections
@@ -517,12 +559,28 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     ///
     /// # };
     /// ```
+    ///
+    /// # DTrace probe registration
+    ///
+    /// This constructor returns a `Result`, because it attempts to register the
+    /// USDT probes it exposes, a fallible process. However, that failure is
+    /// extremely unlikely to happen in practice, and so the `Err` variant of
+    /// the returned result allows callers to access the constructed `Pool`
+    /// anyway.
+    ///
+    /// This lets applications decide how to handle that failure. Those which
+    /// want to abort if the USDT probes cannot be registered may propagate or
+    /// unwrap the error. Those which don't want a registration failure to be
+    /// fatal may unwrap the error variant to get the pool in any case.
+    ///
+    /// Note that if the `"probes"` feauture is not enabled, this method is
+    /// infallible.
     #[instrument(skip(resolver, backend_connector), name = "Pool::new")]
     pub fn new(
         resolver: resolver::BoxedResolver,
         backend_connector: backend::SharedConnector<Conn>,
         policy: Policy,
-    ) -> Self {
+    ) -> Result<Self, RegistrationError<Conn>> {
         let (tx, rx) = mpsc::channel(1);
         let (stats_tx, stats_rx) = watch::channel(HashMap::default());
         let handle = tokio::task::spawn(async move {
@@ -530,14 +588,21 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
             worker.run().await;
         });
 
-        Self {
+        let self_ = Self {
             handle: Mutex::new(Some(handle)),
             tx,
             stats: Stats {
                 rx: stats_rx,
                 claims: Arc::new(AtomicUsize::new(0)),
             },
+        };
+        #[cfg(feature = "probes")]
+        match usdt::register_probes() {
+            Ok(_) => Ok(self_),
+            Err(_) => Err(RegistrationError(self_)),
         }
+        #[cfg(not(feature = "probes"))]
+        Ok(self_)
     }
 
     /// Terminates the connection pool
@@ -560,6 +625,20 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     /// Acquires a handle to a connection within the connection pool.
     #[instrument(level = "debug", skip(self), err, name = "Pool::claim")]
     pub async fn claim(&self) -> Result<claim::Handle<Conn>, Error> {
+        #[cfg(feature = "probes")]
+        let id = usdt::UniqueId::new();
+        #[cfg(feature = "probes")]
+        probes::claim__start!(|| &id);
+        let res = self.do_claim().await;
+        #[cfg(feature = "probes")]
+        match &res {
+            Ok(_) => probes::claim__done!(|| &id),
+            Err(e) => probes::claim__failed!(|| (&id, e.as_str())),
+        }
+        res
+    }
+
+    async fn do_claim(&self) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
 
         // TODO: The work of "on_acquire" could be done here? Would prevent the
@@ -669,7 +748,7 @@ mod test {
             Backend::new(address),
         )]));
 
-        let pool = Pool::new(resolver, connector, Policy::default());
+        let pool = Pool::new(resolver, connector, Policy::default()).unwrap();
         let handle = pool.claim().await.expect("Failed to get claim");
 
         assert_eq!(handle.id, 1);
@@ -684,7 +763,7 @@ mod test {
         let connector = Arc::new(TestConnector::new());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
-        let pool = Pool::new(resolver.clone(), connector, Policy::default());
+        let pool = Pool::new(resolver.clone(), connector, Policy::default()).unwrap();
 
         let join_handle = tokio::task::spawn(async move {
             let handle = pool.claim().await.expect("Failed to get claim");
@@ -725,7 +804,8 @@ mod test {
                 },
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
 
         // Fill all the spares with claims
         let mut handles = vec![];
@@ -779,7 +859,8 @@ mod test {
                 claim_timeout: Duration::from_millis(100),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
 
         // We can access that first address
         let handle = pool.claim().await.expect("Failed to get claim");
@@ -846,7 +927,7 @@ mod test {
             Backend::new(address),
         )]));
 
-        let pool = Pool::new(resolver, connector, Policy::default());
+        let pool = Pool::new(resolver, connector, Policy::default()).unwrap();
         let handle = pool.claim().await.expect("Failed to get claim");
 
         assert_eq!(handle.id, 1);
@@ -886,7 +967,7 @@ mod test {
             Backend::new(address),
         )]));
 
-        let pool = Pool::new(resolver, connector.clone(), Policy::default());
+        let pool = Pool::new(resolver, connector.clone(), Policy::default()).unwrap();
         let _handle = pool.claim().await.expect("Failed to get claim");
 
         // Create a large delay, which terminate() should skip.
@@ -920,7 +1001,7 @@ mod test {
         // Create a large delay, which terminate() should skip.
         connector.stall();
 
-        let pool = Pool::new(resolver, connector.clone(), Policy::default());
+        let pool = Pool::new(resolver, connector.clone(), Policy::default()).unwrap();
 
         pool.terminate().await.unwrap();
         connector.panic_on_access();
@@ -954,7 +1035,8 @@ mod test {
                 claim_timeout: Duration::from_millis(5),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
 
         // Failure case: No backends appear in the resolver
         let claim_err = pool.claim().await.map(|_| ()).unwrap_err();

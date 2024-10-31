@@ -48,3 +48,84 @@ connection pooling with "qtop", a tool for inspecting connection pool state.
 # Run this command while the "tcp_echo_workload" is running.
 cargo run --bin qtop "ws://127.0.0.1:42069/qtop/stats"
 ----
+
+= DTrace probes
+
+`qorb` contains a number of DTrace USDT probes, which provide visibility into
+how connections are managed and claims handed out to clients. If `qorb` is
+compiled with the `probes` feature (which is enabled by default), then you can
+see the probes in action when running the `tcp_echo_workload` example.
+
+After setting up the example as described above, start the binary with the
+`--probes` flag:
+
+[source,bash]
+----
+cargo run --example tcp_echo_workload -- --probes
+----
+
+Now, you can see the available probes with the following, which prints out the
+name of each probe, its location in the binary, and its arguments.
+
+[source,bash]
+----
+dtrace -lvn qorb*:::
+----
+
+NOTE:: Running `dtrace` usually requires elevated permissions, so you will have
+to use `sudo` or similar.
+
+One of the probes we see is called `handle-claimed` -- that fires after `qorb`
+has found a handle for a client, and right before handing it back to the caller
+to use. You can use DTrace to see when any claim is taken from the pool with:
+
+[source,bash]
+----
+dtrace -n 'qorb*:::handle-claimed'
+dtrace: description 'qorb*:::handle-claimed' matched 1 probe
+CPU     ID                    FUNCTION:NAME
+  4  61311 _ZN4qorb4slot21SetWorker$LT$Conn$GT$29take_connected_unclaimed_slot17hc9ea3b0ce1b991a3E:handle-claimed
+  6  61311 _ZN4qorb4slot21SetWorker$LT$Conn$GT$29take_connected_unclaimed_slot17hc9ea3b0ce1b991a3E:handle-claimed
+  4  61311 _ZN4qorb4slot21SetWorker$LT$Conn$GT$29take_connected_unclaimed_slot17hc9ea3b0ce1b991a3E:handle-claimed
+  3  61311 _ZN4qorb4slot21SetWorker$LT$Conn$GT$29take_connected_unclaimed_slot17hc9ea3b0ce1b991a3E:handle-claimed
+  5  61311 _ZN4qorb4slot21SetWorker$LT$Conn$GT$29take_connected_unclaimed_slot17hc9ea3b0ce1b991a3E:handle-claimed
+  5  61311 _ZN4qorb4slot21SetWorker$LT$Conn$GT$29take_connected_unclaimed_slot17hc9ea3b0ce1b991a3E:handle-claimed
+  4  61311 _ZN4qorb4slot21SetWorker$LT$Conn$GT$29take_connected_unclaimed_slot17hc9ea3b0ce1b991a3E:handle-claimed
+----
+
+Probes also have arguments. For example, the `handle-claimed` probe includes a
+unique ID as the first argument, and the address of the backend the handle is
+connected to as the second. You can print the address out like this:
+
+[source,bash]
+----
+dtrace -qn 'qorb*:::handle-claimed { printf("claimed %s\n", copyinstr(arg1)); }'
+claimed [::1]:6002
+claimed [::1]:6002
+claimed [::1]:6001
+claimed [::1]:6001
+claimed [::1]:6001
+claimed [::1]:6002
+claimed [::1]:6003
+claimed [::1]:6001
+claimed [::1]:6002
+----
+
+Most probes have a "start" and "done" variant, which lets us trace how long
+those operations take. For example, we can track how long each claim is held
+like this:
+
+[source,bash]
+----
+dtrace -qn 'qorb*:::handle-claimed { claims[arg0] = timestamp; addrs[arg0] = copyinstr(arg1); }' -n 'qorb*:::handle-returned/claims[arg0]/ { printf("Held conn to %s for %d ms\n", addrs[arg0], (timestamp - claims[arg0]) / 1000 / 1000); claims[arg0] = 0; addrs[arg0] = 0;}'
+Held conn to [::1]:6001 for 131 ms
+Held conn to [::1]:6002 for 830 ms
+Held conn to [::1]:6001 for 40 ms
+Held conn to [::1]:6002 for 134 ms
+Held conn to [::1]:6002 for 834 ms
+Held conn to [::1]:6001 for 857 ms
+Held conn to [::1]:6003 for 811 ms
+----
+
+See the https://illumos.org/books/dtrace/preface.html#preface[Dynamic Tracing
+Guide] for more details on how to use DTrace to instrument production systems!

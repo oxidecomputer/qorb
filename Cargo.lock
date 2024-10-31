@@ -1942,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "qorb"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-bb8-diesel",
@@ -1972,6 +1972,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "usdt",
 ]
 
 [[package]]
