@@ -44,9 +44,19 @@
 //! enabled by default. Probes are zero-cost unless they are explicitly enabled,
 //! by tracing the program with the `dtrace(1)` command-line tool.
 //!
-//! Also note that consumers of the `qorb` pool need to call
-//! [`usdt::register_probes`] to register the probes with the OS. `qorb` does
-//! not do so automatically.
+//! On most systems, the USDT probes must be registered with the DTrace kernel
+//! module. This process is technically fallible, although extremely unlikely to
+//! fail in practice. To account for this, the `pool::Pool::new` constructor is
+//! fallible, returning an `Err` if registration fails. However, it's very
+//! context-dependent what one wants to do with this failure -- some
+//! applications may choose to panic, while others would rather have a pool that
+//! can't be instrumented rather than no pool at all.
+//!
+//! To support both of these cases, the `Result` returned from `pool::Pool::new`
+//! gives access to the pool itself in both the `Ok` or `Err` variant. Some
+//! applications may just `unwrap()` or propagate an error, while others may
+//! choose to extract the pool in either case. (This is similar to the
+//! `std::sync::PoisonError`.)
 
 // Public API
 pub mod backend;

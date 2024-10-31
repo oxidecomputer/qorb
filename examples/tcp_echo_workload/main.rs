@@ -169,7 +169,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Actually make the pool!
-    let pool = Arc::new(Pool::new(resolver, backend_connector, policy));
+    let pool = Arc::new(
+        Pool::new(resolver, backend_connector, policy).expect("USDT probe registration failed"),
+    );
 
     #[cfg(feature = "qtop")]
     tokio::spawn(export_stats_for_qtop(pool.stats().clone()));

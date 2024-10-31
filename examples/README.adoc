@@ -93,9 +93,9 @@ CPU     ID                    FUNCTION:NAME
   4  61311 _ZN4qorb4slot21SetWorker$LT$Conn$GT$29take_connected_unclaimed_slot17hc9ea3b0ce1b991a3E:handle-claimed
 ----
 
-Probe also have arguments. For example, the `handle-claimed` probe also includes
-a unique ID as the first argument, and the address of the backend the handle
-is connected to as the second. You can print the address out like this:
+Probes also have arguments. For example, the `handle-claimed` probe includes a
+unique ID as the first argument, and the address of the backend the handle is
+connected to as the second. You can print the address out like this:
 
 [source,bash]
 ----
