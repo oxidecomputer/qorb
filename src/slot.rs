@@ -1179,6 +1179,7 @@ mod test {
     use super::*;
     use crate::backend;
     use async_trait::async_trait;
+    use futures::StreamExt;
     use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1433,6 +1434,99 @@ mod test {
         }
 
         let _conn4 = set.claim().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_new_unclaimed_slots_change_state() {
+        setup_tracing_subscriber();
+
+        let connector = Arc::new(TestConnector::new());
+
+        let mut set = Set::new(
+            SetConfig {
+                max_count: 3,
+                min_connection_backoff: Duration::from_millis(1),
+                max_connection_backoff: Duration::from_millis(10),
+                spread: Duration::ZERO,
+                health_interval: Duration::from_millis(1),
+                ..Default::default()
+            },
+            3,
+            backend::Name::new("Test set"),
+            backend::Backend { address: BACKEND },
+            connector.clone(),
+        );
+
+        // Let the connections fill up
+        loop {
+            let stats = set.get_stats();
+            if stats.unclaimed_slots < 3 {
+                event!(Level::WARN, "Not enough unclaimed slots");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                break;
+            }
+        }
+
+        // The backend should appear online, with unclaimed slots
+        let mut monitor = set.monitor();
+        assert!(matches!(
+            *monitor.borrow_and_update(),
+            SetState::Online {
+                has_unclaimed_slots: true
+            }
+        ));
+        assert!(matches!(
+            set.get_state(),
+            SetState::Online {
+                has_unclaimed_slots: true
+            }
+        ));
+
+        // Grab three connections
+        let _claim1 = set.claim().await.expect("Failed to claim");
+        let _claim2 = set.claim().await.expect("Failed to claim");
+        let claim3 = set.claim().await.expect("Failed to claim");
+
+        // Cannot claim the fourth connection, this slot set is all used.
+        assert!(matches!(
+            set.claim()
+                .await
+                .map(|_| ())
+                .expect_err("Should have reached claim capacity"),
+            Error::NoSlotsReady,
+        ));
+
+        // Since three claims are out, the backend should appear online, but
+        // without any claimable slots.
+        let mut notification_stream = tokio_stream::wrappers::WatchStream::new(monitor);
+        assert_eq!(
+            notification_stream
+                .next()
+                .await
+                .expect("Unexpected end of stream"),
+            SetState::Online {
+                has_unclaimed_slots: false
+            }
+        );
+
+        // Drop one of the claims, observe the state change
+        drop(claim3);
+
+        let state = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            notification_stream.next(),
+        )
+        .await
+        .expect("Timed out waiting for state change")
+        .expect("Unexpected end of stream");
+
+        assert_eq!(
+            state,
+            SetState::Online {
+                has_unclaimed_slots: true
+            }
+        );
     }
 
     #[tokio::test]
