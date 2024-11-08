@@ -75,6 +75,12 @@ pub trait Connector: Send + Sync {
     type Connection: Connection;
 
     /// Creates a connection to a backend.
+    ///
+    /// If this function returns "Ok(Self::Connection)", qorb assumes the
+    /// connection is valid. The implementation of this method should take
+    /// care not to be "lazy" - if this connection method succeeds, but
+    /// "Self::is_valid" would fail, the connections in the pool will
+    /// churn between "connecting" and "failing health checks".
     async fn connect(&self, backend: &Backend) -> Result<Self::Connection, Error>;
 
     /// Determines if the connection to a backend is still valid.
