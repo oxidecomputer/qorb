@@ -1080,14 +1080,6 @@ mod test {
 
     #[tokio::test]
     async fn dropping_pool_closes_all_connections() {
-        struct DecrementOnDrop(Arc<AtomicUsize>);
-
-        impl Drop for DecrementOnDrop {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-
         async fn wait_for<F, Fut>(timeout: Duration, f: F) -> Result<(), Elapsed>
         where
             F: Fn() -> Fut,
@@ -1119,16 +1111,18 @@ mod test {
             tokio::spawn(async move {
                 while let Ok((mut stream, _)) = server_sock.accept().await {
                     n_active_conns.fetch_add(1, Ordering::Relaxed);
-                    let decr = DecrementOnDrop(Arc::clone(&n_active_conns));
+                    let n_active_conns = n_active_conns.clone();
                     tokio::spawn(async move {
                         let mut buf = vec![0; 1024];
                         loop {
                             match stream.read(&mut buf).await {
-                                Ok(0) | Err(_) => break,
+                                Ok(0) | Err(_) => {
+                                    n_active_conns.fetch_sub(1, Ordering::Relaxed);
+                                    return;
+                                }
                                 Ok(_) => continue,
                             }
                         }
-                        std::mem::drop(decr);
                     });
                 }
             })
@@ -1143,6 +1137,13 @@ mod test {
             connector,
             Policy {
                 spares_wanted,
+                set_config: SetConfig {
+                    // This is the default, but importantly, we want to test
+                    // that the connections get dropped before the next health
+                    // interval.
+                    health_interval: Duration::from_secs(30),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )

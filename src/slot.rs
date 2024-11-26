@@ -187,9 +187,16 @@ impl<Conn: Connection> SlotInner<Conn> {
 
 impl<Conn: Connection> Drop for SlotInner<Conn> {
     fn drop(&mut self) {
-        if let Some(handle) = self.guarded.lock().unwrap().handle.take() {
-            handle.abort();
+        if let Some(terminate_tx) = self.guarded.lock().unwrap().terminate_tx.take() {
+            let _send_result = terminate_tx.send(());
         }
+
+        // We intentionally don't abort the task handle for the slot.
+        //
+        // By firing terminate_tx, we cause the worker to exit on its own,
+        // using the same machinery as a clean termination call. If we aborted
+        // the task, it would lose the opportunity to read and repond to
+        // terminate_rx.
     }
 }
 
@@ -1167,10 +1174,16 @@ impl<Conn: Connection> Set<Conn> {
 
 impl<Conn: Connection> Drop for Set<Conn> {
     fn drop(&mut self) {
-        let Some(handle) = self.handle.take() else {
-            return;
-        };
-        handle.abort();
+        if let Some(terminate_tx) = self.terminate_tx.take() {
+            let _send_result = terminate_tx.send(());
+        }
+
+        // We intentionally don't abort the task handle for the set
+        //
+        // By firing terminate_tx, we cause the worker to exit on its own,
+        // using the same machinery as a clean termination call. If we aborted
+        // the task, it would lose the opportunity to read and repond to
+        // terminate_rx.
     }
 }
 
