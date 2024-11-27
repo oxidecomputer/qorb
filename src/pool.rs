@@ -672,12 +672,18 @@ mod test {
     use super::*;
 
     use crate::backend::{self, Backend, Connector};
+    use crate::connectors::tcp::TcpConnector;
     use crate::policy::{Policy, SetConfig};
     use crate::resolver::{AllBackends, Resolver};
+    use crate::resolvers::single_host::SingleHostResolver;
     use async_trait::async_trait;
+    use futures::Future;
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio::time::error::Elapsed;
     use tokio::time::Duration;
 
     #[derive(Clone)]
@@ -1070,5 +1076,104 @@ mod test {
             matches!(claim_err, Error::NoBackendsOnline),
             "Unexpected error: {claim_err}"
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_pool_closes_all_connections() {
+        async fn wait_for<F, Fut>(timeout: Duration, f: F) -> Result<(), Elapsed>
+        where
+            F: Fn() -> Fut,
+            Fut: Future<Output = bool>,
+        {
+            tokio::time::timeout(timeout, async move {
+                loop {
+                    if f().await {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+        }
+
+        setup_tracing_subscriber();
+
+        // Start a server that keeps connections open until the client closes
+        // them, and only keeps track of the counts.
+        let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let n_active_conns = Arc::new(AtomicUsize::new(0));
+        let server_sock = TcpListener::bind(server_addr)
+            .await
+            .expect("bound localhost");
+        let server_addr = server_sock.local_addr().expect("got local_addr");
+        let server_handle = {
+            let n_active_conns = Arc::clone(&n_active_conns);
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = server_sock.accept().await {
+                    n_active_conns.fetch_add(1, Ordering::Relaxed);
+                    let n_active_conns = n_active_conns.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0; 1024];
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => {
+                                    n_active_conns.fetch_sub(1, Ordering::Relaxed);
+                                    return;
+                                }
+                                Ok(_) => continue,
+                            }
+                        }
+                    });
+                }
+            })
+        };
+
+        // Create the pool.
+        let spares_wanted = 4;
+        let resolver = Box::new(SingleHostResolver::new(server_addr));
+        let connector = Arc::new(TcpConnector {});
+        let pool = Pool::new(
+            resolver,
+            connector,
+            Policy {
+                spares_wanted,
+                set_config: SetConfig {
+                    // This is the default, but importantly, we want to test
+                    // that the connections get dropped before the next health
+                    // interval.
+                    health_interval: Duration::from_secs(30),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("created pool");
+
+        // Wait for the pool to establish the number of connections we want.
+        wait_for(Duration::from_secs(10), {
+            let n_active_conns = Arc::clone(&n_active_conns);
+            move || {
+                let n_active_conns = Arc::clone(&n_active_conns);
+                async move { n_active_conns.load(Ordering::Relaxed) == spares_wanted }
+            }
+        })
+        .await
+        .expect("pool established connections");
+
+        // Drop the pool.
+        std::mem::drop(pool);
+
+        // Wait for the server to notice that all the connections are gone.
+        wait_for(Duration::from_secs(10), {
+            let n_active_conns = Arc::clone(&n_active_conns);
+            move || {
+                let n_active_conns = Arc::clone(&n_active_conns);
+                async move { n_active_conns.load(Ordering::Relaxed) == 0 }
+            }
+        })
+        .await
+        .expect("pool dropped connections");
+
+        server_handle.abort();
     }
 }
