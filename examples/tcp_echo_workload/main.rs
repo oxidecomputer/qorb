@@ -355,7 +355,7 @@ impl AllClaimers {
                     .set_style(Style::default().bold()),
             ),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_spacing(HighlightSpacing::Always)
         .highlight_symbol(Text::from(">>>"))
         .header(
