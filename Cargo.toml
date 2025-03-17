@@ -46,7 +46,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 async-bb8-diesel = { workspace = true, optional = true }
 diesel = { version = "2.2.8", optional = true, features = [ "postgres", "r2d2" ] }
-diesel-dtrace = { version = "0.3.0", optional = true }
+diesel-dtrace = { version = "0.4.2", optional = true }
 debug-ignore = { workspace = true }
 derive-where = { workspace = true }
 dropshot = { workspace = true, optional = true }
