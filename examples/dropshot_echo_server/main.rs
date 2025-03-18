@@ -61,7 +61,9 @@ async fn main() {
 
     if let Some(schema_path) = schema_path {
         let mut file = std::fs::File::create(schema_path).unwrap();
-        api.openapi("echo", "0.0.0").write(&mut file).unwrap();
+        api.openapi("echo", "0.0.0".parse().unwrap())
+            .write(&mut file)
+            .unwrap();
         return;
     }
 
