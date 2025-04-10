@@ -2,3 +2,4 @@
 
 pub mod dns;
 pub mod single_host;
+pub mod r#static;
