@@ -11,12 +11,14 @@ use std::sync::Arc;
 
 /// A [`Resolver`] that always returns a single address.
 #[derive(Clone, Debug)]
+#[deprecated = "Prefer to use FixedResolver with a single address"]
 pub struct SingleHostResolver {
     tx: watch::Sender<AllBackends>,
 }
 
 const SINGLE_HOST_BACKEND_NAME: &str = "singleton";
 
+#[allow(deprecated)]
 impl SingleHostResolver {
     /// Construct a resolver to always return the provided address.
     pub fn new(address: SocketAddr) -> Self {
@@ -29,6 +31,7 @@ impl SingleHostResolver {
     }
 }
 
+#[allow(deprecated)]
 impl Resolver for SingleHostResolver {
     fn monitor(&mut self) -> watch::Receiver<AllBackends> {
         self.tx.subscribe()
@@ -36,6 +39,7 @@ impl Resolver for SingleHostResolver {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 

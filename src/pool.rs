@@ -675,7 +675,7 @@ mod test {
     use crate::connectors::tcp::TcpConnector;
     use crate::policy::{Policy, SetConfig};
     use crate::resolver::{AllBackends, Resolver};
-    use crate::resolvers::single_host::SingleHostResolver;
+    use crate::resolvers::fixed::FixedResolver;
     use async_trait::async_trait;
     use futures::Future;
     use std::collections::BTreeMap;
@@ -1130,7 +1130,7 @@ mod test {
 
         // Create the pool.
         let spares_wanted = 4;
-        let resolver = Box::new(SingleHostResolver::new(server_addr));
+        let resolver = Box::new(FixedResolver::new([server_addr]));
         let connector = Arc::new(TcpConnector {});
         let pool = Pool::new(
             resolver,
