@@ -3,7 +3,7 @@
 use crate::backend;
 use crate::priority_list::WeightedValue;
 
-use rand::{thread_rng, Rng};
+use rand::{rng, Rng};
 
 // The "scores" assigned to backends are "punitive", in the sense
 // that adding to the score makes a backend less preferable.
@@ -29,6 +29,6 @@ pub fn claimed_err(backend: &mut WeightedValue<backend::Name>) {
 }
 
 pub fn add_random_jitter(backend: &mut WeightedValue<backend::Name>) {
-    let mut rng = thread_rng();
-    backend.score += rng.gen_range(0..BACKEND_JITTER_SCORE);
+    let mut rng = rng();
+    backend.score += rng.random_range(0..BACKEND_JITTER_SCORE);
 }

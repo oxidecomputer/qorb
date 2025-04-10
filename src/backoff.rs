@@ -1,4 +1,4 @@
-use rand::{thread_rng, Rng};
+use rand::{rng, Rng};
 use tokio::time::Duration;
 
 pub trait ExponentialBackoff: Sized {
@@ -8,12 +8,12 @@ pub trait ExponentialBackoff: Sized {
 
 impl ExponentialBackoff for Duration {
     fn add_spread(&self, spread: Duration) -> Self {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let nanos = spread.as_nanos();
         let spread = if nanos == 0 {
             0
         } else {
-            rng.gen_range(0..spread.as_nanos())
+            rng.random_range(0..spread.as_nanos())
         };
         self.saturating_add(Duration::from_nanos(spread.try_into().unwrap()))
     }
