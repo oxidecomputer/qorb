@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 /// A [`Resolver`] that always returns a fixed set of addresses.
 #[derive(Clone, Debug)]
-pub struct StaticResolver {
+pub struct FixedResolver {
     tx: watch::Sender<AllBackends>,
 }
 
-impl StaticResolver {
-    pub fn new(addrs: impl IntoIterator<Item = SocketAddr>) -> StaticResolver {
+impl FixedResolver {
+    pub fn new(addrs: impl IntoIterator<Item = SocketAddr>) -> FixedResolver {
         let all_backends = Arc::new(
             addrs
                 .into_iter()
@@ -23,11 +23,11 @@ impl StaticResolver {
                 .collect(),
         );
         let (tx, _rx) = watch::channel(all_backends);
-        StaticResolver { tx }
+        FixedResolver { tx }
     }
 }
 
-impl Resolver for StaticResolver {
+impl Resolver for FixedResolver {
     fn monitor(&mut self) -> watch::Receiver<AllBackends> {
         self.tx.subscribe()
     }
@@ -39,13 +39,13 @@ mod tests {
 
     use crate::{backend::Backend, backend::Name, resolver::Resolver as _};
 
-    use super::StaticResolver;
+    use super::FixedResolver;
 
     #[test]
-    fn static_resolver_returns_addresses() {
+    fn fixed_resolver_returns_addresses() {
         let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444);
         let addr2 = SocketAddr::new("ff:dd:ee::3".parse().unwrap(), 4445);
-        let mut res = StaticResolver::new([addr1, addr2]);
+        let mut res = FixedResolver::new([addr1, addr2]);
         let rx = res.monitor();
         let backends = rx.borrow();
         println!("{:?}", backends);
