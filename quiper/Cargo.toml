@@ -1,0 +1,19 @@
+[package]
+name = "quiper"
+version = "0.1.0"
+edition = "2024"
+description = "qorb connection pool for hyper-util"
+license = "MPL-2.0"
+
+[dependencies]
+async-trait = { workspace = true }
+qorb = { workspace = true }
+http = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["client-legacy", "tokio",
+# enabling either `http1` or `http2` is necessary for the builder type to exist, which is unfortunate
+"http1"
+] }
+tokio = { workspace = true, features = ["net"] }
+tower-service = { workspace = true }
+pin-project = "1"
