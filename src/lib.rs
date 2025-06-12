@@ -35,6 +35,10 @@
 //! - `slot-set-claim-start`: Fires when a claim has been made to a backend.
 //! - `slot-set-claim-done`: Fires when a backend returns a claim.
 //! - `slot-set-claim-failed`: Fires when a backend cannot return a claim.
+//! - `slot-set-online`: Fires when a backend becomes online.
+//! - `slot-set-offline`: Fires when a backend becomes offline.
+//! - `slot-state-change`: Fires when a slot has a state change, and emits
+//!   stats for the backend.
 //! - `handle-claimed`: Fires after claiming a handle from the pool, before
 //!   returning it to the client.
 //! - `handle-returned`: Fires when a handle is returned to the pool, after it
@@ -162,6 +166,27 @@ mod probes {
 
     /// Fires when a slot claim to a specific backend fails
     fn slot__set__claim__failed(pool: &str, claim_id: u64, reason: &str) {}
+
+    /// Fires when a slot set has become online, and has unclaimed slots.
+    fn slot__set__online(pool: &str, addr: &str, has_unclaimed_slots: bool) {}
+
+    /// Fires when a slot set has become offline.
+    fn slot__set__offline(pool: &str, addr: &str) {}
+
+    /// Fires whenever stats for a slot set are updated.
+    fn slot__state__change(
+        pool: &str,
+        addr: &str,
+        slot_id: u64,
+        old: &str,
+        new: &str,
+        connecting_slots: usize,
+        unclaimed_slots: usize,
+        checking_slots: usize,
+        claimed_slots: usize,
+        total_slots: usize,
+    ) {
+    }
 
     /// Fires when qorb creates a new handle, before returning it in a call to
     /// `qorb::Pool::claim()`. This includes an ID for the handle, and the

@@ -80,6 +80,19 @@ impl<Conn: Connection> State<Conn> {
     }
 }
 
+impl<Conn: Connection> State<Conn> {
+    fn as_str(&self) -> &'static str {
+        match self {
+            State::Connecting => "Connecting",
+            State::ConnectedUnclaimed(_) => "ConnectedUnclaimed",
+            State::ConnectedChecking => "ConnectedChecking",
+            State::ConnectedClaimed => "ConnectedClaimed",
+            State::ConnectedRecycling(_) => "ConnectedRecycling",
+            State::Terminated => "Terminated",
+        }
+    }
+}
+
 struct SlotInnerGuarded<Conn: Connection> {
     // The state of this individual connection.
     state: State<Conn>,
@@ -127,6 +140,8 @@ impl<Conn: Connection> SlotInner<Conn> {
     // emits a SetState on [Self::status_tx].
     fn state_transition(
         &self,
+        slot_id: SlotId,
+        backend: &Backend,
         mut inner: std::sync::MutexGuard<SlotInnerGuarded<Conn>>,
         new: State<Conn>,
     ) -> State<Conn> {
@@ -134,6 +149,8 @@ impl<Conn: Connection> SlotInner<Conn> {
             return State::Terminated;
         }
 
+        #[cfg(feature = "probes")]
+        let new_str = new.as_str();
         let old = std::mem::replace(&mut inner.state, new);
 
         let mut stats = self.stats.lock().unwrap();
@@ -141,6 +158,22 @@ impl<Conn: Connection> SlotInner<Conn> {
         stats.enter_state(&inner.state);
         let is_connected = !stats.has_no_connected_slots();
         let now_has_unclaimed_slots = stats.unclaimed_slots > 0;
+
+        #[cfg(feature = "probes")]
+        probes::slot__state__change!(|| {
+            (
+                self.pool_name.as_str(),
+                backend.address.to_string(),
+                slot_id.as_u64(),
+                old.as_str(),
+                new_str,
+                stats.connecting_slots,
+                stats.unclaimed_slots,
+                stats.checking_slots,
+                stats.claimed_slots,
+                stats.total_claims,
+            )
+        });
 
         // "Not connected" may mean:
         // - We're still initializing the backend, or
@@ -150,6 +183,15 @@ impl<Conn: Connection> SlotInner<Conn> {
         // an important signal to the pool, which may want to tune
         // the number of slots provisioned to this set.
         let set_online = || {
+            #[cfg(feature = "probes")]
+            probes::slot__set__online!(|| {
+                (
+                    self.pool_name.as_str(),
+                    backend.address.to_string(),
+                    now_has_unclaimed_slots,
+                )
+            });
+
             event!(
                 Level::INFO,
                 pool_name = %self.pool_name,
@@ -160,6 +202,11 @@ impl<Conn: Connection> SlotInner<Conn> {
             });
         };
         let set_offline = || {
+            #[cfg(feature = "probes")]
+            probes::slot__set__offline!(|| {
+                (self.pool_name.as_str(), backend.address.to_string())
+            });
+
             event!(
                 Level::INFO,
                 pool_name = %self.pool_name,
@@ -252,6 +299,8 @@ impl<Conn: Connection> Slot<Conn> {
                     match result {
                         Ok(conn) => {
                             self.inner.state_transition(
+                                slot_id,
+                                backend,
                                 self.inner.guarded.lock().unwrap(),
                                 State::ConnectedUnclaimed(DebugIgnore(conn)),
                             );
@@ -321,7 +370,8 @@ impl<Conn: Connection> Slot<Conn> {
                 return;
             }
             let State::ConnectedRecycling(DebugIgnore(conn)) =
-                self.inner.state_transition(slot, State::ConnectedChecking)
+                self.inner
+                    .state_transition(slot_id, backend, slot, State::ConnectedChecking)
             else {
                 panic!("We just verified that the state was 'ConnectedRecycling'");
             };
@@ -349,8 +399,12 @@ impl<Conn: Connection> Slot<Conn> {
                     slot_id = slot_id.as_u64(),
                     "Connection recycled successfully"
                 );
-                self.inner
-                    .state_transition(slot, State::ConnectedUnclaimed(DebugIgnore(conn)));
+                self.inner.state_transition(
+                    slot_id,
+                    backend,
+                    slot,
+                    State::ConnectedUnclaimed(DebugIgnore(conn)),
+                );
             }
             Ok(Err(err)) => {
                 #[cfg(feature = "probes")]
@@ -367,7 +421,8 @@ impl<Conn: Connection> Slot<Conn> {
                     "Connection failed during recycle check"
                 );
                 self.inner.failure_window.add(1);
-                self.inner.state_transition(slot, State::Connecting);
+                self.inner
+                    .state_transition(slot_id, backend, slot, State::Connecting);
             }
             Err(_) => {
                 #[cfg(feature = "probes")]
@@ -383,7 +438,8 @@ impl<Conn: Connection> Slot<Conn> {
                     "Connection timed out during recycle check"
                 );
                 self.inner.failure_window.add(1);
-                self.inner.state_transition(slot, State::Connecting);
+                self.inner
+                    .state_transition(slot_id, backend, slot, State::Connecting);
             }
         }
     }
@@ -408,7 +464,8 @@ impl<Conn: Connection> Slot<Conn> {
                 return;
             }
             let State::ConnectedUnclaimed(DebugIgnore(conn)) =
-                self.inner.state_transition(slot, State::ConnectedChecking)
+                self.inner
+                    .state_transition(slot_id, backend, slot, State::ConnectedChecking)
             else {
                 panic!("We just verified that the state was 'ConnectedUnclaimed'");
             };
@@ -439,8 +496,12 @@ impl<Conn: Connection> Slot<Conn> {
                 #[cfg(feature = "probes")]
                 probes::health__check__done!(|| (self.inner.pool_name.as_str(), slot_id.as_u64()));
                 event!(Level::TRACE, "Connection remains healthy");
-                self.inner
-                    .state_transition(slot, State::ConnectedUnclaimed(DebugIgnore(conn)));
+                self.inner.state_transition(
+                    slot_id,
+                    backend,
+                    slot,
+                    State::ConnectedUnclaimed(DebugIgnore(conn)),
+                );
             }
             Ok(Err(err)) => {
                 #[cfg(feature = "probes")]
@@ -451,7 +512,8 @@ impl<Conn: Connection> Slot<Conn> {
                 ));
                 event!(Level::WARN, ?err, "Connection failed during health check");
                 self.inner.failure_window.add(1);
-                self.inner.state_transition(slot, State::Connecting);
+                self.inner
+                    .state_transition(slot_id, backend, slot, State::Connecting);
             }
             Err(_) => {
                 #[cfg(feature = "probes")]
@@ -462,7 +524,8 @@ impl<Conn: Connection> Slot<Conn> {
                 ));
                 event!(Level::WARN, "Connection timed out during health check");
                 self.inner.failure_window.add(1);
-                self.inner.state_transition(slot, State::Connecting);
+                self.inner
+                    .state_transition(slot_id, backend, slot, State::Connecting);
             }
         }
     }
@@ -833,10 +896,12 @@ impl<Conn: Connection> SetWorker<Conn> {
                 //
                 // This makes it difficult to leak a connection, unless the drop
                 // method of the claim::Handle is skipped.
-                let State::ConnectedUnclaimed(DebugIgnore(conn)) = slot
-                    .inner
-                    .state_transition(guarded, State::ConnectedClaimed)
-                else {
+                let State::ConnectedUnclaimed(DebugIgnore(conn)) = slot.inner.state_transition(
+                    *id,
+                    &self.backend,
+                    guarded,
+                    State::ConnectedClaimed,
+                ) else {
                     panic!(
                         "We just matched this type before replacing it; this should be impossible"
                     );
@@ -895,6 +960,8 @@ impl<Conn: Connection> SetWorker<Conn> {
                 guarded.state
             );
             inner.state_transition(
+                slot_id,
+                &self.backend,
                 guarded,
                 State::ConnectedRecycling(DebugIgnore(borrowed_conn.conn)),
             );
@@ -956,31 +1023,36 @@ impl<Conn: Connection> SetWorker<Conn> {
                     |slot: &SlotInnerGuarded<Conn>| slot.state.removable(),
                 ];
                 for filter in filters {
-                    for (key, slot) in &self.slots {
+                    for (slot_id, slot) in &self.slots {
                         if to_remove.len() >= count_to_remove {
                             break;
                         }
                         let guarded = slot.inner.guarded.lock().unwrap();
                         if filter(&*guarded) {
-                            to_remove.push(*key);
+                            to_remove.push(*slot_id);
 
                             // It's important that we terminate the slot
                             // immediately, so the task which manages the slot
                             // will not continue modifying the state.
-                            slot.inner.state_transition(guarded, State::Terminated);
+                            slot.inner.state_transition(
+                                *slot_id,
+                                &self.backend,
+                                guarded,
+                                State::Terminated,
+                            );
                         }
                     }
                 }
 
-                for key in to_remove {
-                    event!(Level::TRACE, slot_id = key.as_u64(), "Removing slot");
-                    let Some(slot) = self.slots.remove(&key) else {
+                for slot_id in to_remove {
+                    event!(Level::TRACE, slot_id = slot_id.as_u64(), "Removing slot");
+                    let Some(slot) = self.slots.remove(&slot_id) else {
                         continue;
                     };
                     let Some(handle) = slot.inner.guarded.lock().unwrap().handle.take() else {
                         continue;
                     };
-                    event!(Level::TRACE, slot_id = key.as_u64(), "Aborting task");
+                    event!(Level::TRACE, slot_id = slot_id.as_u64(), "Aborting task");
                     handle.abort();
                 }
             }
