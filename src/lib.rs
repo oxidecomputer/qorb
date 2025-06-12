@@ -132,15 +132,20 @@ mod probes {
     /// Fires just after successfully making a connection.
     fn connect__done(pool: &str, slot_id: u64, addr: &str) {}
 
-    /// Fires just after failing to make a connectiona, with a string
+    /// Fires just after failing to make a connection, with a string
     /// identifying the reason.
     fn connect__failed(pool: &str, slot_id: u64, addr: &str, reason: &str) {}
 
     /// Fires when the pool is attempting to make a claim.
     ///
-    /// This issimilar to "claim__start", but it follows the internal
+    /// This is similar to "claim__start", but it follows the internal
     /// pool-specific task, which may happen multiple times if e.g.
     /// waiting for a backend to be ready.
+    ///
+    /// For example: a user may try to claim a connection before any backends
+    /// are ready. This will call "pool__claim__start" and later fail, but the
+    /// request will remain enqueued. Once a new backend is available, and
+    /// has claims that can be used, this probe will fire again.
     fn pool__claim__start(pool: &str, claim_id: u64) {}
 
     /// Fires when the pool has made a claim successfully.
