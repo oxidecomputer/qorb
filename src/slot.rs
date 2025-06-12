@@ -150,13 +150,21 @@ impl<Conn: Connection> SlotInner<Conn> {
         // an important signal to the pool, which may want to tune
         // the number of slots provisioned to this set.
         let set_online = || {
-            event!(Level::INFO, "state_transition: Set Online");
+            event!(
+                Level::INFO,
+                pool_name = self.pool_name.as_str(),
+                "state_transition: Set Online"
+            );
             inner.status_tx.send_replace(SetState::Online {
                 has_unclaimed_slots: now_has_unclaimed_slots,
             });
         };
         let set_offline = || {
-            event!(Level::INFO, "state_transition: Set Offline");
+            event!(
+                Level::INFO,
+                pool_name = self.pool_name.as_str(),
+                "state_transition: Set Offline"
+            );
             inner.status_tx.send_replace(SetState::Offline);
         };
 
@@ -250,7 +258,7 @@ impl<Conn: Connection> Slot<Conn> {
                             return true;
                         }
                         Err(err) => {
-                            event!(Level::WARN, ?err, ?backend, "Failed to connect");
+                            event!(Level::WARN, pool_name = self.inner.pool_name.as_str(), ?err, ?backend, "Failed to connect");
                             self.inner.failure_window.add(1);
                             retry_duration =
                                 retry_duration.exponential_backoff(config.max_connection_backoff);
@@ -335,7 +343,12 @@ impl<Conn: Connection> Slot<Conn> {
             Ok(Ok(())) => {
                 #[cfg(feature = "probes")]
                 probes::recycle__done!(|| (self.inner.pool_name.as_str(), slot_id.as_u64()));
-                event!(Level::TRACE, "Connection recycled successfully");
+                event!(
+                    Level::TRACE,
+                    pool_name = self.inner.pool_name.as_str(),
+                    slot_id = slot_id.as_u64(),
+                    "Connection recycled successfully"
+                );
                 self.inner
                     .state_transition(slot, State::ConnectedUnclaimed(DebugIgnore(conn)));
             }
@@ -346,7 +359,13 @@ impl<Conn: Connection> Slot<Conn> {
                     slot_id.as_u64(),
                     err.to_string()
                 ));
-                event!(Level::WARN, ?err, "Connection failed during recycle check");
+                event!(
+                    Level::WARN,
+                    pool_name = self.inner.pool_name.as_str(),
+                    ?err,
+                    slot_id = slot_id.as_u64(),
+                    "Connection failed during recycle check"
+                );
                 self.inner.failure_window.add(1);
                 self.inner.state_transition(slot, State::Connecting);
             }
@@ -357,7 +376,12 @@ impl<Conn: Connection> Slot<Conn> {
                     slot_id.as_u64(),
                     "Timeout"
                 ));
-                event!(Level::WARN, "Connection timed out during recycle check");
+                event!(
+                    Level::WARN,
+                    pool_name = self.inner.pool_name.as_str(),
+                    slot_id = slot_id.as_u64(),
+                    "Connection timed out during recycle check"
+                );
                 self.inner.failure_window.add(1);
                 self.inner.state_transition(slot, State::Connecting);
             }
@@ -367,6 +391,7 @@ impl<Conn: Connection> Slot<Conn> {
     #[instrument(
         level = "trace",
         skip(self, connector),
+        fields(pool_name = self.inner.pool_name.as_str(), slot_id = slot_id.as_u64()),
         name = "Slot::validate_health_if_connected"
     )]
     async fn validate_health_if_connected(
@@ -647,6 +672,11 @@ impl<Conn: Connection> SetWorker<Conn> {
 
     // Creates a new Slot, which always starts as "Connecting", and spawn a task
     // to actually connect to the backend and monitor slot health.
+    #[instrument(
+        skip(self)
+        fields(pool_name = self.pool_name.as_str()),
+        name = "SetWorker::create_slot"
+    )]
     fn create_slot(&mut self, slot_id: SlotId) {
         let (terminate_tx, mut terminate_rx) = tokio::sync::oneshot::channel();
         let slot = Slot {
@@ -783,7 +813,11 @@ impl<Conn: Connection> SetWorker<Conn> {
     // Borrows a connection out of the first unclaimed slot.
     //
     // Returns a Handle which has enough context to put the claim back,
-    // once it's dropped by the client.
+    #[instrument(
+        skip(self, permit)
+        fields(pool_name = self.pool_name.as_str()),
+        name = "SetWorker::take_connected_unclaimed_slot"
+    )]
     fn take_connected_unclaimed_slot(
         &mut self,
         permit: mpsc::OwnedPermit<BorrowedConnection<Conn>>,
@@ -791,9 +825,9 @@ impl<Conn: Connection> SetWorker<Conn> {
     ) -> Option<claim::Handle<Conn>> {
         for (id, slot) in &mut self.slots {
             let guarded = slot.inner.guarded.lock().unwrap();
-            event!(Level::TRACE, id = id.as_u64(), state = ?guarded.state, "Considering slot");
+            event!(Level::TRACE, slot_id = id.as_u64(), state = ?guarded.state, "Considering slot");
             if matches!(guarded.state, State::ConnectedUnclaimed(_)) {
-                event!(Level::TRACE, id = id.as_u64(), "Found unclaimed slot");
+                event!(Level::TRACE, slot_id = id.as_u64(), "Found unclaimed slot");
                 // We intentionally "take the connection out" of the slot and
                 // "place it into a claim::Handle" in the same method.
                 //

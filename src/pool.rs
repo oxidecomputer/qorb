@@ -83,15 +83,15 @@ impl serde::Serialize for BackendStats {
 
 /// The name of the pool
 #[derive(Clone, Debug)]
-pub(crate) struct Name(Arc<String>);
+pub(crate) struct Name(Arc<str>);
 
 impl Name {
-    pub(crate) fn new<S: ToString>(name: S) -> Self {
-        Self(Arc::new(name.to_string()))
+    pub(crate) fn new<S: Into<Arc<str>>>(name: S) -> Self {
+        Self(name.into())
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.0
     }
 }
 
