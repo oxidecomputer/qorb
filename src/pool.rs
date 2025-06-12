@@ -95,6 +95,12 @@ impl Name {
     }
 }
 
+impl std::fmt::Display for Name {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 // A claim request that could not complete immediately
 struct ClaimRequest<Conn: Connection> {
     id: ClaimId,

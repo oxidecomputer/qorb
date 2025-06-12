@@ -152,7 +152,7 @@ impl<Conn: Connection> SlotInner<Conn> {
         let set_online = || {
             event!(
                 Level::INFO,
-                pool_name = self.pool_name.as_str(),
+                pool_name = %self.pool_name,
                 "state_transition: Set Online"
             );
             inner.status_tx.send_replace(SetState::Online {
@@ -162,7 +162,7 @@ impl<Conn: Connection> SlotInner<Conn> {
         let set_offline = || {
             event!(
                 Level::INFO,
-                pool_name = self.pool_name.as_str(),
+                pool_name = %self.pool_name,
                 "state_transition: Set Offline"
             );
             inner.status_tx.send_replace(SetState::Offline);
@@ -674,7 +674,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     // to actually connect to the backend and monitor slot health.
     #[instrument(
         skip(self)
-        fields(pool_name = self.pool_name.as_str()),
+        fields(pool_name = %self.pool_name),
         name = "SetWorker::create_slot"
     )]
     fn create_slot(&mut self, slot_id: SlotId) {
@@ -815,7 +815,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     // Returns a Handle which has enough context to put the claim back,
     #[instrument(
         skip(self, permit)
-        fields(pool_name = self.pool_name.as_str()),
+        fields(pool_name = %self.pool_name),
         name = "SetWorker::take_connected_unclaimed_slot"
     )]
     fn take_connected_unclaimed_slot(
