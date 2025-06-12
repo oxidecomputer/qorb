@@ -3,9 +3,11 @@ use crate::backend::{self, Backend, SharedConnector};
 use crate::backoff::ExponentialBackoff;
 use crate::claim;
 use crate::policy::SetConfig;
+use crate::pool;
 #[cfg(feature = "probes")]
 use crate::probes;
 use crate::window_counter::WindowedCounter;
+use crate::ClaimId;
 
 use debug_ignore::DebugIgnore;
 use derive_where::derive_where;
@@ -113,6 +115,9 @@ struct SlotInner<Conn: Connection> {
 
     // This "failure_window" is shared with all slots in the slot set.
     failure_window: Arc<WindowedCounter>,
+
+    // Shared with all slots in the pool.
+    pool_name: pool::Name,
 }
 
 impl<Conn: Connection> SlotInner<Conn> {
@@ -221,6 +226,7 @@ impl<Conn: Connection> Slot<Conn> {
     // Returns "false" if explicitly told to exit.
     async fn loop_until_connected(
         &self,
+        slot_id: SlotId,
         config: &SetConfig,
         connector: &SharedConnector<Conn>,
         backend: &Backend,
@@ -234,7 +240,7 @@ impl<Conn: Connection> Slot<Conn> {
                 _ = &mut *terminate_rx => {
                     return false;
                 }
-                result = Self::do_connect(connector, backend) => {
+                result = self.do_connect(slot_id, connector, backend) => {
                     match result {
                         Ok(conn) => {
                             self.inner.state_transition(
@@ -257,18 +263,33 @@ impl<Conn: Connection> Slot<Conn> {
     }
 
     async fn do_connect(
+        &self,
+        id: SlotId,
         connector: &SharedConnector<Conn>,
         backend: &Backend,
     ) -> Result<Conn, backend::Error> {
         #[cfg(feature = "probes")]
-        let id = usdt::UniqueId::new();
-        #[cfg(feature = "probes")]
-        probes::connect__start!(|| (&id, backend.address.to_string()));
+        probes::connect__start!(|| {
+            (
+                self.inner.pool_name.as_str(),
+                id.as_u64(),
+                backend.address.to_string(),
+            )
+        });
         let res = connector.connect(backend).await;
         #[cfg(feature = "probes")]
         match &res {
-            Ok(_) => probes::connect__done!(|| &id),
-            Err(e) => probes::connect__failed!(|| (&id, e.to_string())),
+            Ok(_) => probes::connect__done!(|| (
+                self.inner.pool_name.as_str(),
+                id.as_u64(),
+                backend.address.to_string()
+            )),
+            Err(e) => probes::connect__failed!(|| (
+                self.inner.pool_name.as_str(),
+                id.as_u64(),
+                backend.address.to_string(),
+                e.to_string()
+            )),
         }
         res
     }
@@ -280,6 +301,7 @@ impl<Conn: Connection> Slot<Conn> {
     )]
     async fn recycle_if_needed(
         &self,
+        slot_id: SlotId,
         connector: &SharedConnector<Conn>,
         timeout: Duration,
         backend: &Backend,
@@ -300,9 +322,11 @@ impl<Conn: Connection> Slot<Conn> {
         };
 
         #[cfg(feature = "probes")]
-        let id = usdt::UniqueId::new();
-        #[cfg(feature = "probes")]
-        probes::recycle__start!(|| (&id, backend.address.to_string()));
+        probes::recycle__start!(|| (
+            self.inner.pool_name.as_str(),
+            slot_id.as_u64(),
+            backend.address.to_string()
+        ));
 
         let result = tokio::time::timeout(timeout, connector.on_recycle(&mut conn)).await;
 
@@ -310,21 +334,29 @@ impl<Conn: Connection> Slot<Conn> {
         match result {
             Ok(Ok(())) => {
                 #[cfg(feature = "probes")]
-                probes::recycle__done!(|| &id);
+                probes::recycle__done!(|| (self.inner.pool_name.as_str(), slot_id.as_u64()));
                 event!(Level::TRACE, "Connection recycled successfully");
                 self.inner
                     .state_transition(slot, State::ConnectedUnclaimed(DebugIgnore(conn)));
             }
             Ok(Err(err)) => {
                 #[cfg(feature = "probes")]
-                probes::recycle__failed!(|| (&id, err.to_string()));
+                probes::recycle__failed!(|| (
+                    self.inner.pool_name.as_str(),
+                    slot_id.as_u64(),
+                    err.to_string()
+                ));
                 event!(Level::WARN, ?err, "Connection failed during recycle check");
                 self.inner.failure_window.add(1);
                 self.inner.state_transition(slot, State::Connecting);
             }
             Err(_) => {
                 #[cfg(feature = "probes")]
-                probes::recycle__failed!(|| (&id, "Timeout"));
+                probes::recycle__failed!(|| (
+                    self.inner.pool_name.as_str(),
+                    slot_id.as_u64(),
+                    "Timeout"
+                ));
                 event!(Level::WARN, "Connection timed out during recycle check");
                 self.inner.failure_window.add(1);
                 self.inner.state_transition(slot, State::Connecting);
@@ -339,6 +371,7 @@ impl<Conn: Connection> Slot<Conn> {
     )]
     async fn validate_health_if_connected(
         &self,
+        slot_id: SlotId,
         connector: &SharedConnector<Conn>,
         timeout: Duration,
         backend: &Backend,
@@ -359,9 +392,11 @@ impl<Conn: Connection> Slot<Conn> {
         };
 
         #[cfg(feature = "probes")]
-        let id = usdt::UniqueId::new();
-        #[cfg(feature = "probes")]
-        probes::health__check__start!(|| (&id, backend.address.to_string()));
+        probes::health__check__start!(|| (
+            self.inner.pool_name.as_str(),
+            slot_id.as_u64(),
+            backend.address.to_string()
+        ));
 
         // It's important that we don't hold the slot lock across an
         // await point. To avoid this issue, we actually take the
@@ -377,21 +412,29 @@ impl<Conn: Connection> Slot<Conn> {
         match result {
             Ok(Ok(())) => {
                 #[cfg(feature = "probes")]
-                probes::health__check__done!(|| &id);
+                probes::health__check__done!(|| (self.inner.pool_name.as_str(), slot_id.as_u64()));
                 event!(Level::TRACE, "Connection remains healthy");
                 self.inner
                     .state_transition(slot, State::ConnectedUnclaimed(DebugIgnore(conn)));
             }
             Ok(Err(err)) => {
                 #[cfg(feature = "probes")]
-                probes::health__check__failed!(|| (&id, err.to_string()));
+                probes::health__check__failed!(|| (
+                    self.inner.pool_name.as_str(),
+                    slot_id.as_u64(),
+                    err.to_string()
+                ));
                 event!(Level::WARN, ?err, "Connection failed during health check");
                 self.inner.failure_window.add(1);
                 self.inner.state_transition(slot, State::Connecting);
             }
             Err(_) => {
                 #[cfg(feature = "probes")]
-                probes::health__check__failed!(|| (&id, "Timeout"));
+                probes::health__check__failed!(|| (
+                    self.inner.pool_name.as_str(),
+                    slot_id.as_u64(),
+                    "Timeout"
+                ));
                 event!(Level::WARN, "Connection timed out during health check");
                 self.inner.failure_window.add(1);
                 self.inner.state_transition(slot, State::Connecting);
@@ -402,7 +445,28 @@ impl<Conn: Connection> Slot<Conn> {
 
 // An arbitrary opaque identifier for a slot, to distinguish it from
 // other slots which already exist.
-type SlotId = usize;
+#[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq)]
+pub(crate) struct SlotId(u64);
+
+impl SlotId {
+    // The slot can be created by first shifting up a "set_id".
+    //
+    // This uses the upper 16 bits to identify "which backend", and the
+    // lower 48 bits to identify "which slot within that backend".
+    //
+    // Admittedly: We're only actually using SlotIds within a single
+    // set, so overflowing would not result in correctness issues.
+    //
+    // However, without overflow, this makes "SlotId"s more likely
+    // to be globally unique, which improves instrumentation.
+    pub(crate) fn first(set_id: u16) -> Self {
+        Self((set_id as u64) << 48)
+    }
+
+    pub(crate) fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
 
 /// A wrapper around a connection that gives the slot set enough context
 /// to put it back in the correct spot when the client gives it back to us.
@@ -414,6 +478,10 @@ pub(crate) struct BorrowedConnection<Conn: Connection> {
 impl<Conn: Connection> BorrowedConnection<Conn> {
     pub(crate) fn new(conn: Conn, id: SlotId) -> Self {
         Self { conn, id }
+    }
+
+    pub(crate) fn id(&self) -> SlotId {
+        self.id
     }
 }
 
@@ -490,6 +558,7 @@ impl Stats {
 
 enum SetRequest<Conn: Connection> {
     Claim {
+        id: ClaimId,
         tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>,
     },
     SetWantedCount {
@@ -499,6 +568,7 @@ enum SetRequest<Conn: Connection> {
 
 // Owns and runs work on behalf of a [Set].
 struct SetWorker<Conn: Connection> {
+    pool_name: pool::Name,
     name: backend::Name,
     backend: Backend,
     config: SetConfig,
@@ -540,6 +610,8 @@ struct SetWorker<Conn: Connection> {
 impl<Conn: Connection> SetWorker<Conn> {
     #[allow(clippy::too_many_arguments)]
     fn new(
+        pool_name: pool::Name,
+        set_id: u16,
         name: backend::Name,
         rx: mpsc::Receiver<SetRequest<Conn>>,
         terminate_rx: tokio::sync::oneshot::Receiver<()>,
@@ -553,6 +625,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     ) -> Self {
         let (slot_tx, slot_rx) = mpsc::channel(config.max_count);
         let mut set = Self {
+            pool_name,
             name,
             backend,
             config,
@@ -566,7 +639,7 @@ impl<Conn: Connection> SetWorker<Conn> {
             slot_tx,
             slot_rx,
             slots: BTreeMap::new(),
-            next_slot_id: 0,
+            next_slot_id: SlotId::first(set_id),
         };
         set.set_wanted_count(wanted_count);
         set
@@ -587,6 +660,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                 recycling_needed: Notify::new(),
                 stats: self.stats.clone(),
                 failure_window: self.failure_window.clone(),
+                pool_name: self.pool_name.clone(),
             }),
         };
         let slot = self.slots.entry(slot_id).or_insert(slot).clone();
@@ -604,7 +678,11 @@ impl<Conn: Connection> SetWorker<Conn> {
                 let mut interval = interval(config.health_interval);
 
                 loop {
-                    event!(Level::TRACE, slot_id, "Starting Slot work loop");
+                    event!(
+                        Level::TRACE,
+                        slot_id = slot_id.as_u64(),
+                        "Starting Slot work loop"
+                    );
                     enum Work {
                         DoConnect,
                         DoMonitor,
@@ -631,10 +709,15 @@ impl<Conn: Connection> SetWorker<Conn> {
 
                     match work {
                         Work::DoConnect => {
-                            let span = span!(Level::TRACE, "Slot worker connecting", slot_id);
+                            let span = span!(
+                                Level::TRACE,
+                                "Slot worker connecting",
+                                slot_id = slot_id.as_u64()
+                            );
                             let connected = async {
                                 if !slot
                                     .loop_until_connected(
+                                        slot_id,
                                         &config,
                                         &connector,
                                         &backend,
@@ -646,7 +729,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                                     // before it connected. Bail.
                                     event!(
                                         Level::TRACE,
-                                        slot_id,
+                                        slot_id = slot_id.as_u64(),
                                         "Terminating instead of connecting"
                                     );
                                     return false;
@@ -667,11 +750,12 @@ impl<Conn: Connection> SetWorker<Conn> {
                                 _ = &mut terminate_rx => {
                                     // If we've been instructed to bail out,
                                     // do that immediately.
-                                    event!(Level::TRACE, slot_id, "Terminating while monitoring");
+                                    event!(Level::TRACE, slot_id = slot_id.as_u64(), "Terminating while monitoring");
                                     return;
                                 },
                                 _ = interval.tick() => {
                                     slot.validate_health_if_connected(
+                                        slot_id,
                                         &connector,
                                         config.health_check_timeout,
                                         &backend,
@@ -682,6 +766,7 @@ impl<Conn: Connection> SetWorker<Conn> {
                                 },
                                 _ = slot.inner.recycling_needed.notified() => {
                                     slot.recycle_if_needed(
+                                        slot_id,
                                         &connector,
                                         config.health_check_timeout,
                                         &backend,
@@ -702,12 +787,13 @@ impl<Conn: Connection> SetWorker<Conn> {
     fn take_connected_unclaimed_slot(
         &mut self,
         permit: mpsc::OwnedPermit<BorrowedConnection<Conn>>,
+        claim_id: ClaimId,
     ) -> Option<claim::Handle<Conn>> {
         for (id, slot) in &mut self.slots {
             let guarded = slot.inner.guarded.lock().unwrap();
-            event!(Level::TRACE, id, state = ?guarded.state, "Considering slot");
+            event!(Level::TRACE, id = id.as_u64(), state = ?guarded.state, "Considering slot");
             if matches!(guarded.state, State::ConnectedUnclaimed(_)) {
-                event!(Level::TRACE, id, "Found unclaimed slot");
+                event!(Level::TRACE, id = id.as_u64(), "Found unclaimed slot");
                 // We intentionally "take the connection out" of the slot and
                 // "place it into a claim::Handle" in the same method.
                 //
@@ -726,7 +812,12 @@ impl<Conn: Connection> SetWorker<Conn> {
 
                 #[cfg(feature = "probes")]
                 crate::probes::handle__claimed!(|| {
-                    (borrowed_conn.id, self.backend.address.to_string())
+                    (
+                        self.pool_name.as_str(),
+                        claim_id.0,
+                        borrowed_conn.id.as_u64(),
+                        self.backend.address.to_string(),
+                    )
                 });
 
                 // The "drop" method of the claim::Handle will return it to
@@ -743,7 +834,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         level = "trace",
         skip(self, borrowed_conn),
         fields(
-            slot_id = borrowed_conn.id,
+            slot_id = borrowed_conn.id.as_u64(),
             name = ?self.name,
         ),
         name = "SetWorker::recycle_connection"
@@ -751,7 +842,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     fn recycle_connection(&mut self, borrowed_conn: BorrowedConnection<Conn>) {
         let slot_id = borrowed_conn.id;
         #[cfg(feature = "probes")]
-        crate::probes::handle__returned!(|| slot_id);
+        crate::probes::handle__returned!(|| (self.pool_name.as_str(), slot_id.as_u64()));
         let inner = self
             .slots
             .get_mut(&slot_id)
@@ -848,14 +939,14 @@ impl<Conn: Connection> SetWorker<Conn> {
                 }
 
                 for key in to_remove {
-                    event!(Level::TRACE, slot_id = key, "Removing slot");
+                    event!(Level::TRACE, slot_id = key.as_u64(), "Removing slot");
                     let Some(slot) = self.slots.remove(&key) else {
                         continue;
                     };
                     let Some(handle) = slot.inner.guarded.lock().unwrap().handle.take() else {
                         continue;
                     };
-                    event!(Level::TRACE, slot_id = key, "Aborting task");
+                    event!(Level::TRACE, slot_id = key.as_u64(), "Aborting task");
                     handle.abort();
                 }
             }
@@ -867,11 +958,11 @@ impl<Conn: Connection> SetWorker<Conn> {
                     current = self.slots.len(),
                     "Increasing slot count"
                 );
-                let new_slots = desired - self.slots.len();
-                for slot_id in self.next_slot_id..self.next_slot_id + new_slots {
-                    self.create_slot(slot_id);
+                let new_slots = (desired - self.slots.len()) as u64;
+                for slot_id in self.next_slot_id.0..self.next_slot_id.0 + new_slots {
+                    self.create_slot(SlotId(slot_id));
                 }
-                self.next_slot_id += new_slots;
+                self.next_slot_id.0 += new_slots;
             }
             Equal => {}
         }
@@ -884,19 +975,41 @@ impl<Conn: Connection> SetWorker<Conn> {
         name = "SetWorker::claim",
         fields(name = ?self.name),
     )]
-    async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
+    async fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
+        #[cfg(feature = "probes")]
+        probes::slot__set__claim__start!(|| (
+            self.pool_name.as_str(),
+            id.0,
+            self.backend.address.to_string()
+        ));
+
         loop {
             // Before we vend out the slot's connection to a client, make sure that
             // we have space to take it back once they're done with it.
             let Ok(permit) = self.slot_tx.clone().try_reserve_owned() else {
                 event!(Level::TRACE, "Could not reserve slot_tx permit");
+
+                #[cfg(feature = "probes")]
+                probes::slot__set__claim__failed!(|| (
+                    self.pool_name.as_str(),
+                    id.0,
+                    "Could not reserve slot_tx permit; all slots used"
+                ));
+
                 // This is more of an "all slots in-use" error,
                 // but it should look the same to clients.
                 return Err(Error::NoSlotsReady);
             };
 
-            let Some(mut handle) = self.take_connected_unclaimed_slot(permit) else {
+            let Some(mut handle) = self.take_connected_unclaimed_slot(permit, id) else {
                 event!(Level::TRACE, "Failed to take unclaimed slot");
+
+                #[cfg(feature = "probes")]
+                probes::slot__set__claim__failed!(|| (
+                    self.pool_name.as_str(),
+                    id.0,
+                    "No unclaimed slots"
+                ));
                 return Err(Error::NoSlotsReady);
             };
 
@@ -908,12 +1021,31 @@ impl<Conn: Connection> SetWorker<Conn> {
 
             let Ok(result) = result else {
                 event!(Level::TRACE, "Timeout performing 'on_acquire' on claim");
+                #[cfg(feature = "probes")]
+                probes::slot__set__claim__failed!(|| (
+                    self.pool_name.as_str(),
+                    id.0,
+                    "Timeout from 'on_acquire'"
+                ));
                 continue;
             };
             let Ok(()) = result else {
                 event!(Level::TRACE, "Failed performing 'on_acquire' on claim");
+                #[cfg(feature = "probes")]
+                probes::slot__set__claim__failed!(|| (
+                    self.pool_name.as_str(),
+                    id.0,
+                    "Failed 'on_acquire'"
+                ));
                 continue;
             };
+
+            #[cfg(feature = "probes")]
+            probes::slot__set__claim__done!(|| (
+                self.pool_name.as_str(),
+                id.0,
+                handle.slot_id().as_u64()
+            ));
 
             return Ok(handle);
         }
@@ -947,8 +1079,8 @@ impl<Conn: Connection> SetWorker<Conn> {
                 // Handle requests from clients
                 request = self.rx.recv() => {
                     match request {
-                        Some(SetRequest::Claim { tx }) => {
-                            let result = self.claim().await;
+                        Some(SetRequest::Claim { id, tx }) => {
+                            let result = self.claim(id).await;
                             let _ = tx.send(result);
                         },
                         Some(SetRequest::SetWantedCount { count }) => {
@@ -1024,6 +1156,8 @@ impl<Conn: Connection> Set<Conn> {
     ///
     /// These tasks are stopped when [Set] is dropped.
     pub(crate) fn new(
+        set_id: u16,
+        pool_name: pool::Name,
         config: SetConfig,
         wanted_count: usize,
         name: backend::Name,
@@ -1042,6 +1176,8 @@ impl<Conn: Connection> Set<Conn> {
             let name = name.clone();
             async move {
                 let mut worker = SetWorker::new(
+                    pool_name,
+                    set_id,
                     name,
                     rx,
                     terminate_rx,
@@ -1100,11 +1236,11 @@ impl<Conn: Connection> Set<Conn> {
         name = "Set::claim",
         fields(name = ?self.name),
     )]
-    pub(crate) async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
+    pub(crate) async fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
 
         self.tx
-            .send(SetRequest::Claim { tx })
+            .send(SetRequest::Claim { id, tx })
             .await
             .map_err(|_| Error::SlotWorkerTerminated)?;
 
@@ -1311,6 +1447,8 @@ mod test {
     async fn test_one_claim() {
         setup_tracing_subscriber();
         let mut set = Set::new(
+            0,
+            pool::Name::new("my-pool"),
             SetConfig::default(),
             5,
             backend::Name::new("Test set"),
@@ -1324,13 +1462,15 @@ mod test {
             .await
             .unwrap();
 
-        let _conn = set.claim().await.unwrap();
+        let _conn = set.claim(ClaimId::new()).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_drain_slots() {
         setup_tracing_subscriber();
         let mut set = Set::new(
+            0,
+            pool::Name::new("my-pool"),
             SetConfig::default(),
             3,
             backend::Name::new("Test set"),
@@ -1345,7 +1485,7 @@ mod test {
             .unwrap();
 
         // Grab a connection, then set the "Wanted" count to zero.
-        let conn = set.claim().await.unwrap();
+        let conn = set.claim(ClaimId::new()).await.unwrap();
         set.set_wanted_count(0).await.unwrap();
 
         // Let the connections drain
@@ -1374,6 +1514,8 @@ mod test {
     async fn test_no_slots_add_some_later() {
         setup_tracing_subscriber();
         let mut set = Set::new(
+            0,
+            pool::Name::new("my-pool"),
             SetConfig::default(),
             0,
             backend::Name::new("Test set"),
@@ -1382,7 +1524,7 @@ mod test {
         );
 
         // We start with nothing available
-        set.claim()
+        set.claim(ClaimId::new())
             .await
             .map(|_| ())
             .expect_err("Should not be able to get claims yet");
@@ -1398,13 +1540,15 @@ mod test {
             .unwrap();
 
         // When this completes, the connections may be claimed
-        let _conn = set.claim().await.unwrap();
+        let _conn = set.claim(ClaimId::new()).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_all_claims() {
         setup_tracing_subscriber();
         let mut set = Set::new(
+            0,
+            pool::Name::new("my-pool"),
             SetConfig::default(),
             3,
             backend::Name::from("Test set"),
@@ -1423,11 +1567,11 @@ mod test {
             }
         }
 
-        let _conn1 = set.claim().await.unwrap();
-        let _conn2 = set.claim().await.unwrap();
-        let conn3 = set.claim().await.unwrap();
+        let _conn1 = set.claim(ClaimId::new()).await.unwrap();
+        let _conn2 = set.claim(ClaimId::new()).await.unwrap();
+        let conn3 = set.claim(ClaimId::new()).await.unwrap();
 
-        set.claim()
+        set.claim(ClaimId::new())
             .await
             .map(|_| ())
             .expect_err("We should fail to acquire a 4th claim from 3 slot set");
@@ -1446,7 +1590,7 @@ mod test {
             }
         }
 
-        let _conn4 = set.claim().await.unwrap();
+        let _conn4 = set.claim(ClaimId::new()).await.unwrap();
     }
 
     #[tokio::test]
@@ -1456,6 +1600,8 @@ mod test {
         let connector = Arc::new(TestConnector::new());
 
         let mut set = Set::new(
+            0,
+            pool::Name::new("my-pool"),
             SetConfig {
                 max_count: 3,
                 min_connection_backoff: Duration::from_millis(1),
@@ -1497,13 +1643,13 @@ mod test {
         ));
 
         // Grab three connections
-        let _claim1 = set.claim().await.expect("Failed to claim");
-        let _claim2 = set.claim().await.expect("Failed to claim");
-        let claim3 = set.claim().await.expect("Failed to claim");
+        let _claim1 = set.claim(ClaimId::new()).await.expect("Failed to claim");
+        let _claim2 = set.claim(ClaimId::new()).await.expect("Failed to claim");
+        let claim3 = set.claim(ClaimId::new()).await.expect("Failed to claim");
 
         // Cannot claim the fourth connection, this slot set is all used.
         assert!(matches!(
-            set.claim()
+            set.claim(ClaimId::new())
                 .await
                 .map(|_| ())
                 .expect_err("Should have reached claim capacity"),
@@ -1551,6 +1697,8 @@ mod test {
         connector.set_connectable(false);
 
         let set = Set::new(
+            0,
+            pool::Name::new("my-pool"),
             SetConfig {
                 max_count: 3,
                 min_connection_backoff: Duration::from_millis(1),
@@ -1610,6 +1758,8 @@ mod test {
         let wanted_count = 5;
         let connector = Arc::new(TestConnector::new());
         let mut set = Set::new(
+            0,
+            pool::Name::new("my-pool"),
             SetConfig {
                 // Make it significantly less likely to race with a health
                 // check.
@@ -1634,7 +1784,7 @@ mod test {
         }
 
         // Grab one of the slots. Inspect the state, validating it is connected.
-        let conn = set.claim().await.unwrap();
+        let conn = set.claim(ClaimId::new()).await.unwrap();
         let raw_conn = conn.clone();
         assert_eq!(raw_conn.get_state(), TestConnectionState::Connected);
         drop(conn);
@@ -1656,7 +1806,7 @@ mod test {
         assert_eq!(raw_conn.get_state(), TestConnectionState::Recycled);
 
         connector.set_recyclable(false);
-        let conn = set.claim().await.unwrap();
+        let conn = set.claim(ClaimId::new()).await.unwrap();
         let raw_conn = conn.clone();
         assert_eq!(raw_conn.get_state(), TestConnectionState::Recycled);
         drop(conn);
@@ -1689,6 +1839,8 @@ mod test {
         let connector = Arc::new(TestConnector::new());
         let health_interval = Duration::from_millis(1);
         let mut set = Set::new(
+            0,
+            pool::Name::new("my-pool"),
             SetConfig {
                 health_interval,
                 spread: Duration::ZERO,
@@ -1709,7 +1861,7 @@ mod test {
         //
         // This means no new connections, and existing connections will die
         // when health checked.
-        let conn = set.claim().await.unwrap();
+        let conn = set.claim(ClaimId::new()).await.unwrap();
         connector.set_connectable(false);
         connector.set_valid(false);
         let raw_conn = conn.clone();
@@ -1739,6 +1891,8 @@ mod test {
     async fn test_terminate() {
         setup_tracing_subscriber();
         let mut set = Set::new(
+            0,
+            pool::Name::new("my-pool"),
             SetConfig::default(),
             5,
             backend::Name::new("Test set"),
@@ -1752,13 +1906,13 @@ mod test {
             .await
             .unwrap();
 
-        let conn = set.claim().await.unwrap();
+        let conn = set.claim(ClaimId::new()).await.unwrap();
 
         // We should be able to terminate, even with a claim out.
         set.terminate().await;
 
         assert!(matches!(
-            set.claim().await.map(|_| ()).unwrap_err(),
+            set.claim(ClaimId::new()).await.map(|_| ()).unwrap_err(),
             Error::SlotWorkerTerminated,
         ));
         assert!(matches!(
@@ -1843,6 +1997,8 @@ mod test {
 
             let connector = Arc::new(crate::test_utils::SlowConnector::new());
             let mut set = Set::new(
+                0,
+                pool::Name::new("my-pool"),
                 SetConfig::default(),
                 config.wanted,
                 backend::Name::new("Test set"),
@@ -1859,7 +2015,7 @@ mod test {
             // Claim some of the handles
             let mut handles = vec![];
             for _ in 0..config.claimed {
-                handles.push(set.claim().await.unwrap());
+                handles.push(set.claim(ClaimId::new()).await.unwrap());
             }
 
             // All future connections should be slow!
@@ -1875,7 +2031,7 @@ mod test {
             drop(handles);
 
             assert!(matches!(
-                set.claim().await.map(|_| ()).unwrap_err(),
+                set.claim(ClaimId::new()).await.map(|_| ()).unwrap_err(),
                 Error::SlotWorkerTerminated,
             ));
         }

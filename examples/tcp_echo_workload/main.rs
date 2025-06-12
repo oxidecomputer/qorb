@@ -170,7 +170,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Actually make the pool!
     let pool = Arc::new(
-        Pool::new(resolver, backend_connector, policy).expect("USDT probe registration failed"),
+        Pool::new("my-pool".to_string(), resolver, backend_connector, policy)
+            .expect("USDT probe registration failed"),
     );
 
     #[cfg(feature = "qtop")]

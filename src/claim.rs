@@ -24,6 +24,10 @@ impl<Conn: Connection> Handle<Conn> {
             permit: Some(permit),
         }
     }
+
+    pub(crate) fn slot_id(&self) -> crate::slot::SlotId {
+        self.inner.as_ref().map(|inner| inner.id()).unwrap()
+    }
 }
 
 impl<Conn> std::ops::Deref for Handle<Conn>

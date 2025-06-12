@@ -10,6 +10,7 @@ use crate::probes;
 use crate::rebalancer;
 use crate::resolver;
 use crate::slot;
+use crate::ClaimId;
 
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -55,6 +56,7 @@ impl Error {
 
 enum Request<Conn: Connection> {
     Claim {
+        id: ClaimId,
         tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>,
     },
     Terminate,
@@ -79,16 +81,33 @@ impl serde::Serialize for BackendStats {
     }
 }
 
+/// The name of the pool
+#[derive(Clone, Debug)]
+pub(crate) struct Name(Arc<String>);
+
+impl Name {
+    pub(crate) fn new<S: ToString>(name: S) -> Self {
+        Self(Arc::new(name.to_string()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 // A claim request that could not complete immediately
 struct ClaimRequest<Conn: Connection> {
+    id: ClaimId,
     tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>,
     deadline: tokio::time::Instant,
 }
 
 struct PoolInner<Conn: Connection> {
+    name: Name,
     backend_connector: backend::SharedConnector<Conn>,
 
     resolver: resolver::BoxedResolver,
+    next_backend_id: u16,
     slots: HashMap<backend::Name, slot::Set<Conn>>,
     priority_list: PriorityList<backend::Name>,
 
@@ -105,6 +124,7 @@ struct PoolInner<Conn: Connection> {
 
 impl<Conn: Connection> PoolInner<Conn> {
     fn new(
+        name: Name,
         resolver: resolver::BoxedResolver,
         backend_connector: backend::SharedConnector<Conn>,
         policy: Policy,
@@ -112,8 +132,10 @@ impl<Conn: Connection> PoolInner<Conn> {
         stats_tx: watch::Sender<HashMap<backend::Name, BackendStats>>,
     ) -> Self {
         Self {
+            name,
             backend_connector,
             resolver,
+            next_backend_id: 0,
             slots: HashMap::new(),
             priority_list: PriorityList::new(),
             request_queue: VecDeque::new(),
@@ -168,8 +190,12 @@ impl<Conn: Connection> PoolInner<Conn> {
             } else {
                 0
             };
+            let set_id = self.next_backend_id;
+            self.next_backend_id = self.next_backend_id.wrapping_add(1);
 
             let set = slot::Set::new(
+                set_id,
+                self.name.clone(),
                 self.policy.set_config.clone(),
                 initial_slot_count,
                 name.clone(),
@@ -253,8 +279,8 @@ impl<Conn: Connection> PoolInner<Conn> {
                 // Handle requests from clients
                 request = self.rx.recv() => {
                     match request {
-                        Some(Request::Claim { tx }) => {
-                            self.claim_or_enqueue(tx).await
+                        Some(Request::Claim { id, tx }) => {
+                            self.claim_or_enqueue(id, tx).await
                         }
                         // The caller has explicitly asked us to terminate, and
                         // we should respond to them once we've stopped doing
@@ -263,7 +289,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                             self.terminate().await;
                             return;
                         },
-                        // The caller has abandoned their connecion to the pool.
+                        // The caller has abandoned their connection to the pool.
                         //
                         // We stop handling new requests, but have no one to
                         // notify. Given that the caller no longer needs the
@@ -310,8 +336,12 @@ impl<Conn: Connection> PoolInner<Conn> {
         }
     }
 
-    async fn claim_or_enqueue(&mut self, tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>) {
-        let result = self.claim().await;
+    async fn claim_or_enqueue(
+        &mut self,
+        id: ClaimId,
+        tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>,
+    ) {
+        let result = self.claim(id).await;
         if result.is_ok() {
             let _ = tx.send(result);
             return;
@@ -322,6 +352,7 @@ impl<Conn: Connection> PoolInner<Conn> {
         // online later.
         // - Start the clock on a timeout.
         self.request_queue.push_back(ClaimRequest {
+            id,
             tx,
             deadline: tokio::time::Instant::now() + self.policy.claim_timeout,
         });
@@ -333,7 +364,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                 return;
             };
 
-            let result = self.claim().await;
+            let result = self.claim(request.id).await;
             if result.is_ok() {
                 let _ = request.tx.send(result);
             } else {
@@ -358,6 +389,15 @@ impl<Conn: Connection> PoolInner<Conn> {
 
     #[instrument(skip(self), name = "PoolInner::rebalance")]
     async fn rebalance(&mut self) {
+        #[cfg(feature = "probes")]
+        probes::rebalance__start!(|| self.name.as_str());
+        self.rebalance_inner().await;
+
+        #[cfg(feature = "probes")]
+        probes::rebalance__done!(|| self.name.as_str());
+    }
+
+    async fn rebalance_inner(&mut self) {
         let mut questionable_backend_count = 0;
         let mut usable_backends = vec![];
 
@@ -426,9 +466,12 @@ impl<Conn: Connection> PoolInner<Conn> {
         self.priority_list = new_priority_list;
     }
 
-    async fn claim(&mut self) -> Result<claim::Handle<Conn>, Error> {
+    async fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
         let mut attempted_backend = vec![];
         let mut result = Err(Error::NoBackends);
+
+        #[cfg(feature = "probes")]
+        probes::pool__claim__start!(|| (self.name.as_str(), id.0));
 
         loop {
             // Whenever we consider a new backend, add it to the
@@ -455,7 +498,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             //
             // Either way, put this backend back in the priority list after
             // we're done with it.
-            let Ok(claim) = set.claim().await else {
+            let Ok(claim) = set.claim(id).await else {
                 event!(Level::DEBUG, "Failed to actually get claim for backend");
                 rebalancer::claimed_err(&mut weighted_backend);
                 attempted_backend.push(weighted_backend);
@@ -468,6 +511,14 @@ impl<Conn: Connection> PoolInner<Conn> {
             break;
         }
 
+        #[cfg(feature = "probes")]
+        match &result {
+            Ok(handle) => {
+                probes::pool__claim__done!(|| (self.name.as_str(), id.0, handle.slot_id().as_u64()))
+            }
+            Err(_) => probes::pool__claim__failed!(|| (self.name.as_str(), id.0)),
+        }
+
         self.priority_list.extend(attempted_backend.into_iter());
         result
     }
@@ -475,6 +526,7 @@ impl<Conn: Connection> PoolInner<Conn> {
 
 /// Manages a set of connections to a service
 pub struct Pool<Conn: Connection> {
+    name: Name,
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     tx: mpsc::Sender<Request<Conn>>,
     stats: Stats,
@@ -521,6 +573,7 @@ impl<Conn: Connection> RegistrationError<Conn> {
 impl<Conn: Connection + Send + 'static> Pool<Conn> {
     /// Creates a new connection pool.
     ///
+    /// - name: The name of this pool, for instrumentation.
     /// - resolver: Describes how backends should be found for the service.
     /// - backend_connector: Describes how the connections to a specific
     /// backend should be made.
@@ -550,7 +603,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     ///
     /// // Create the connection pool itself.
     /// let policy = Policy::default();
-    /// let pool = Pool::new(resolver, connector, policy).unwrap();
+    /// let pool = Pool::new("my-pool".to_string(), resolver, connector, policy).unwrap();
     ///
     /// // Grab a connection from the pool.
     /// // Note that it may take a moment for the pool to create connections
@@ -577,18 +630,29 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     /// infallible.
     #[instrument(skip(resolver, backend_connector), name = "Pool::new")]
     pub fn new(
+        name: String,
         resolver: resolver::BoxedResolver,
         backend_connector: backend::SharedConnector<Conn>,
         policy: Policy,
     ) -> Result<Self, RegistrationError<Conn>> {
         let (tx, rx) = mpsc::channel(1);
         let (stats_tx, stats_rx) = watch::channel(HashMap::default());
+        let name = Name::new(name);
+        let name_clone = name.clone();
         let handle = tokio::task::spawn(async move {
-            let worker = PoolInner::new(resolver, backend_connector, policy, rx, stats_tx);
+            let worker = PoolInner::new(
+                name_clone,
+                resolver,
+                backend_connector,
+                policy,
+                rx,
+                stats_tx,
+            );
             worker.run().await;
         });
 
         let self_ = Self {
+            name,
             handle: Mutex::new(Some(handle)),
             tx,
             stats: Stats {
@@ -625,20 +689,21 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
     /// Acquires a handle to a connection within the connection pool.
     #[instrument(level = "debug", skip(self), err, name = "Pool::claim")]
     pub async fn claim(&self) -> Result<claim::Handle<Conn>, Error> {
+        let id = ClaimId::new();
         #[cfg(feature = "probes")]
-        let id = usdt::UniqueId::new();
-        #[cfg(feature = "probes")]
-        probes::claim__start!(|| &id);
-        let res = self.do_claim().await;
+        probes::claim__start!(|| (self.name.as_str(), id.0));
+        let res = self.do_claim(id).await;
         #[cfg(feature = "probes")]
         match &res {
-            Ok(_) => probes::claim__done!(|| &id),
-            Err(e) => probes::claim__failed!(|| (&id, e.as_str())),
+            Ok(handle) => {
+                probes::claim__done!(|| (self.name.as_str(), id.0, handle.slot_id().as_u64()))
+            }
+            Err(e) => probes::claim__failed!(|| (self.name.as_str(), id.0, e.as_str())),
         }
         res
     }
 
-    async fn do_claim(&self) -> Result<claim::Handle<Conn>, Error> {
+    async fn do_claim(&self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
         let (tx, rx) = oneshot::channel();
 
         // TODO: The work of "on_acquire" could be done here? Would prevent the
@@ -650,7 +715,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
         // if there were multiple callers.
 
         self.tx
-            .send(Request::Claim { tx })
+            .send(Request::Claim { id, tx })
             .await
             .map_err(|_| Error::Terminated)?;
         let claim = rx.await.map_err(|_| Error::Terminated)?;
@@ -754,7 +819,13 @@ mod test {
             Backend::new(address),
         )]));
 
-        let pool = Pool::new(resolver, connector, Policy::default()).unwrap();
+        let pool = Pool::new(
+            "my-pool".to_string(),
+            resolver,
+            connector,
+            Policy::default(),
+        )
+        .unwrap();
         let handle = pool.claim().await.expect("Failed to get claim");
 
         assert_eq!(handle.id, 1);
@@ -769,7 +840,13 @@ mod test {
         let connector = Arc::new(TestConnector::new());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
-        let pool = Pool::new(resolver.clone(), connector, Policy::default()).unwrap();
+        let pool = Pool::new(
+            "my-pool".to_string(),
+            resolver.clone(),
+            connector,
+            Policy::default(),
+        )
+        .unwrap();
 
         let join_handle = tokio::task::spawn(async move {
             let handle = pool.claim().await.expect("Failed to get claim");
@@ -799,6 +876,7 @@ mod test {
         )]));
 
         let pool = Pool::new(
+            "my-pool".to_string(),
             resolver,
             connector,
             Policy {
@@ -859,6 +937,7 @@ mod test {
             Backend::new(address1),
         )]));
         let pool = Pool::new(
+            "my-pool".to_string(),
             resolver.clone(),
             connector,
             Policy {
@@ -933,7 +1012,13 @@ mod test {
             Backend::new(address),
         )]));
 
-        let pool = Pool::new(resolver, connector, Policy::default()).unwrap();
+        let pool = Pool::new(
+            "my-pool".to_string(),
+            resolver,
+            connector,
+            Policy::default(),
+        )
+        .unwrap();
         let handle = pool.claim().await.expect("Failed to get claim");
 
         assert_eq!(handle.id, 1);
@@ -973,7 +1058,13 @@ mod test {
             Backend::new(address),
         )]));
 
-        let pool = Pool::new(resolver, connector.clone(), Policy::default()).unwrap();
+        let pool = Pool::new(
+            "my-pool".to_string(),
+            resolver,
+            connector.clone(),
+            Policy::default(),
+        )
+        .unwrap();
         let _handle = pool.claim().await.expect("Failed to get claim");
 
         // Create a large delay, which terminate() should skip.
@@ -1007,7 +1098,13 @@ mod test {
         // Create a large delay, which terminate() should skip.
         connector.stall();
 
-        let pool = Pool::new(resolver, connector.clone(), Policy::default()).unwrap();
+        let pool = Pool::new(
+            "my-pool".to_string(),
+            resolver,
+            connector.clone(),
+            Policy::default(),
+        )
+        .unwrap();
 
         pool.terminate().await.unwrap();
         connector.panic_on_access();
@@ -1031,6 +1128,7 @@ mod test {
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
         let pool = Pool::new(
+            "my-pool".to_string(),
             Box::new(resolver.clone()),
             connector.clone(),
             Policy {
@@ -1133,6 +1231,7 @@ mod test {
         let resolver = Box::new(FixedResolver::new([server_addr]));
         let connector = Arc::new(TcpConnector {});
         let pool = Pool::new(
+            "my-pool".to_string(),
             resolver,
             connector,
             Policy {

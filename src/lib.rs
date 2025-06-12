@@ -28,9 +28,16 @@
 //! - `connect-start`: Fires before attempting a connection to a backend.
 //! - `connect-done`: Fires after successfully connecting to a backend.
 //! - `connect-failed`: Fires after failing to connect to a backend.
+//! - `pool-claim-start`: Fires when a pool tries to make a claim, on behalf of
+//!   a user-requested claim-start.
+//! - `pool-claim-done`: Fires when a pool successfully makes a claim.
+//! - `pool-claim-failed`: Fires when a pool cannot make a claim.
+//! - `slot-set-claim-start`: Fires when a claim has been made to a backend.
+//! - `slot-set-claim-done`: Fires when a backend returns a claim.
+//! - `slot-set-claim-failed`: Fires when a backend cannot return a claim.
 //! - `handle-claimed`: Fires after claiming a handle from the pool, before
 //!   returning it to the client.
-//! - `handle-recycled`: Fires when a handle is returned to the pool, after it
+//! - `handle-returned`: Fires when a handle is returned to the pool, after it
 //!   is dropped.
 //! - `health-check-start`: Fires when a health check for a backend starts.
 //! - `health-check-done`: Fires when a health check for a backend completes
@@ -39,6 +46,8 @@
 //! - `recycle-start`: Fires before attempting to recycle a connection.
 //! - `recycle-done`: Fires after successsfully recycling a connection.
 //! - `recycle-failed`: Fires when failing to recycle a connection.
+//! - `rebalance-start`: Fires when rebalancing the connection pool.
+//! - `rebalance-done`: Fires when the connection pool is done rebalancing.
 //!
 //! The existence of the probes is behind the `"probes"` feature, which is
 //! enabled by default. Probes are zero-cost unless they are explicitly enabled,
@@ -83,54 +92,104 @@ mod window_counter;
 pub mod connectors;
 pub mod resolvers;
 
+/// Uniquely identifies a claim
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ClaimId(pub u64);
+
+impl ClaimId {
+    fn new() -> Self {
+        let id = usdt::UniqueId::new().as_u64();
+        Self(id)
+    }
+}
+
+impl Default for ClaimId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// USDT probes for tracing how qorb makes pools and hands out claims.
 #[cfg(feature = "probes")]
 #[usdt::provider(provider = "qorb")]
 mod probes {
     /// Fires right before attempting to acquire a claim from the pool.
-    fn claim__start(id: &usdt::UniqueId) {}
+    fn claim__start(pool: &str, claim_id: u64) {}
 
     /// Fires when a claim is successfully acquired from the pool.
-    fn claim__done(id: &usdt::UniqueId) {}
+    ///
+    /// Also identifies the underlying slot which is being used.
+    fn claim__done(pool: &str, claim_id: u64, slot_id: u64) {}
 
     /// Fires when we _fail_ to acquire a claim from the pool, with a string
     /// identifying the reason.
-    fn claim__failed(id: &usdt::UniqueId, reason: &str) {}
+    fn claim__failed(pool: &str, claim_id: u64, reason: &str) {}
 
     /// Fires right before attempting to make a connection, with the address
     /// we're connecting to.
-    fn connect__start(id: &usdt::UniqueId, addr: &str) {}
+    fn connect__start(pool: &str, slot_id: u64, addr: &str) {}
 
     /// Fires just after successfully making a connection.
-    fn connect__done(id: &usdt::UniqueId) {}
+    fn connect__done(pool: &str, slot_id: u64, addr: &str) {}
 
     /// Fires just after failing to make a connectiona, with a string
     /// identifying the reason.
-    fn connect__failed(id: &usdt::UniqueId, reason: &str) {}
+    fn connect__failed(pool: &str, slot_id: u64, addr: &str, reason: &str) {}
+
+    /// Fires when the pool is attempting to make a claim.
+    ///
+    /// This issimilar to "claim__start", but it follows the internal
+    /// pool-specific task, which may happen multiple times if e.g.
+    /// waiting for a backend to be ready.
+    fn pool__claim__start(pool: &str, claim_id: u64) {}
+
+    /// Fires when the pool has made a claim successfully.
+    fn pool__claim__done(pool: &str, claim_id: u64, slot_id: u64) {}
+
+    /// Fires when the pool has failed to make any claim.
+    fn pool__claim__failed(pool: &str, claim_id: u64) {}
+
+    /// Fires when a claim request has been made to a specific backend
+    fn slot__set__claim__start(pool: &str, claim_id: u64, addr: &str) {}
+
+    /// Fires when a slot claim to a specific backend completes successfully
+    fn slot__set__claim__done(pool: &str, claim_id: u64, slot_id: u64) {}
+
+    /// Fires when a slot claim to a specific backend fails
+    fn slot__set__claim__failed(pool: &str, claim_id: u64, reason: &str) {}
 
     /// Fires when qorb creates a new handle, before returning it in a call to
     /// `qorb::Pool::claim()`. This includes an ID for the handle, and the
     /// address of the backend the handle is connected to.
-    fn handle__claimed(id: usize, addr: &str) {}
+    ///
+    /// This fires within the "slot set", the moment the slot has been
+    /// grabbed successfully.
+    fn handle__claimed(pool: &str, claim_id: u64, slot_id: u64, addr: &str) {}
 
     /// Fires when a handle is returned to qorb, usually when it is dropped.
-    fn handle__returned(id: usize) {}
+    fn handle__returned(pool: &str, slot_id: u64) {}
 
     /// Fires just before we start a health-check to a backend.
-    fn health__check__start(id: &usdt::UniqueId, addr: &str) {}
+    fn health__check__start(pool: &str, slot_id: u64, addr: &str) {}
 
     /// Fires after a successful health-check to a backend.
-    fn health__check__done(id: &usdt::UniqueId) {}
+    fn health__check__done(pool: &str, slot_id: u64) {}
 
     /// Fires after a failed health-check to a backend.
-    fn health__check__failed(id: &usdt::UniqueId, reason: &str) {}
+    fn health__check__failed(pool: &str, slot_id: u64, reason: &str) {}
 
     /// Fires just before we recycle a connection to a backend.
-    fn recycle__start(id: &usdt::UniqueId, addr: &str) {}
+    fn recycle__start(pool: &str, slot_id: u64, addr: &str) {}
 
     /// Fires after successfully recycling a connection to a backend.
-    fn recycle__done(id: &usdt::UniqueId) {}
+    fn recycle__done(pool: &str, slot_id: u64) {}
 
     /// Fires after failing to recycle a connection to a backend.
-    fn recycle__failed(id: &usdt::UniqueId, reason: &str) {}
+    fn recycle__failed(pool: &str, slot_id: u64, reason: &str) {}
+
+    /// Fires when the connection pool is rebalancing
+    fn rebalance__start(pool: &str) {}
+
+    /// Fires when the connection pool has finished rebalancing
+    fn rebalance__done(pool: &str) {}
 }
