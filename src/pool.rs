@@ -1446,7 +1446,7 @@ mod test {
             // If we aren't able to let the "fast half" of tasks through,
             // we'll get stuck behind the way-too-long "health_check_timeout"
             // set in the Policy above.
-            if concurrent_tasks.len() <= TOTAL_SLOTS / 2 {
+            if concurrent_tasks.len() == TOTAL_SLOTS / 2 {
                 tx.send(true).unwrap();
             }
         }
