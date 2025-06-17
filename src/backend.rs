@@ -81,6 +81,15 @@ pub trait Connector: Send + Sync {
     /// care not to be "lazy" - if this connection method succeeds, but
     /// "Self::is_valid" would fail, the connections in the pool will
     /// churn between "connecting" and "failing health checks".
+    ///
+    /// ## Cancel Safety
+    ///
+    /// The future returned by `connect` may be cancelled by the `qorb` pool if
+    /// the slot is dropped. If this occurs and a connection has already been
+    /// established, the connection should be closed. If the connection is not
+    /// yet established, the attempt to establish it should also be cancelled.
+    /// In both cases, any cleanup logic required by the type of connection
+    /// should be performed when the `connect` future is dropped.
     async fn connect(&self, backend: &Backend) -> Result<Self::Connection, Error>;
 
     /// Determines if the connection to a backend is still valid.
@@ -91,16 +100,33 @@ pub trait Connector: Send + Sync {
     /// timing out.
     ///
     /// By default this method does nothing.
+    ///
+    /// ## Cancel Safety
+    ///
+    /// The future returned by `is_valid` may be cancelled by the `qorb` pool if
+    /// the slot is dropped, or the health check timeout has passed.
+    /// In these cases, the connection will be dropped.
     async fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), Error> {
         Ok(())
     }
 
     /// Performs validation or setup on the connection as it is being claimed.
     ///
+    /// This method is called on connections within the pool as they are being
+    /// claimed, and can run for
+    /// [crate::policy::SetConfig::health_check_timeout] before timing out.
+    ///
     /// Regardless of whether this method fails or not, "on_recycle" is still
     /// invoked for the connection when it is later returned to the pool.
     ///
     /// By default this method does nothing.
+    ///
+    /// ## Cancel Safety
+    ///
+    /// The future returned by `on_acquire` may be cancelled by the `qorb` pool
+    /// if the health check timeout has passed. If this occurs, the connection
+    /// itself will be passed to `on_recycle`, which can decide whether or
+    /// not the connection should remain valid.
     async fn on_acquire(&self, _conn: &mut Self::Connection) -> Result<(), Error> {
         Ok(())
     }
@@ -113,6 +139,12 @@ pub trait Connector: Send + Sync {
     /// [crate::policy::SetConfig::health_check_timeout] before timing out.
     ///
     /// By default this method calls [Self::is_valid].
+    ///
+    /// ## Cancel Safety
+    ///
+    /// The future returned by `on_recycle` may be cancelled by the `qorb` pool
+    /// if the health check timeout has passed or the slot has been dropped. If
+    /// this occurs, the connection will be dropped.
     async fn on_recycle(&self, conn: &mut Self::Connection) -> Result<(), Error> {
         self.is_valid(conn).await
     }

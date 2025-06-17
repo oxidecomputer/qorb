@@ -1080,7 +1080,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         name = "SetWorker::claim",
         fields(name = ?self.name),
     )]
-    async fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
+    fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
         #[cfg(feature = "probes")]
         probes::slot__set__claim__start!(|| (
             self.pool_name.as_str(),
@@ -1088,71 +1088,58 @@ impl<Conn: Connection> SetWorker<Conn> {
             self.backend.address.to_string()
         ));
 
-        loop {
-            // Before we vend out the slot's connection to a client, make sure that
-            // we have space to take it back once they're done with it.
-            let Ok(permit) = self.slot_tx.clone().try_reserve_owned() else {
-                event!(Level::TRACE, "Could not reserve slot_tx permit");
-
-                #[cfg(feature = "probes")]
-                probes::slot__set__claim__failed!(|| (
-                    self.pool_name.as_str(),
-                    id.0,
-                    "Could not reserve slot_tx permit; all slots used"
-                ));
-
-                // This is more of an "all slots in-use" error,
-                // but it should look the same to clients.
-                return Err(Error::NoSlotsReady);
-            };
-
-            let Some(mut handle) = self.take_connected_unclaimed_slot(permit, id) else {
-                event!(Level::TRACE, "Failed to take unclaimed slot");
-
-                #[cfg(feature = "probes")]
-                probes::slot__set__claim__failed!(|| (
-                    self.pool_name.as_str(),
-                    id.0,
-                    "No unclaimed slots"
-                ));
-                return Err(Error::NoSlotsReady);
-            };
-
-            let result = tokio::time::timeout(
-                self.config.health_check_timeout,
-                self.backend_connector.on_acquire(&mut handle),
-            )
-            .await;
-
-            let Ok(result) = result else {
-                event!(Level::TRACE, "Timeout performing 'on_acquire' on claim");
-                #[cfg(feature = "probes")]
-                probes::slot__set__claim__failed!(|| (
-                    self.pool_name.as_str(),
-                    id.0,
-                    "Timeout from 'on_acquire'"
-                ));
-                continue;
-            };
-            let Ok(()) = result else {
-                event!(Level::TRACE, "Failed performing 'on_acquire' on claim");
-                #[cfg(feature = "probes")]
-                probes::slot__set__claim__failed!(|| (
-                    self.pool_name.as_str(),
-                    id.0,
-                    "Failed 'on_acquire'"
-                ));
-                continue;
-            };
+        // Before we vend out the slot's connection to a client, make sure that
+        // we have space to take it back once they're done with it.
+        let Ok(permit) = self.slot_tx.clone().try_reserve_owned() else {
+            event!(Level::TRACE, "Could not reserve slot_tx permit");
 
             #[cfg(feature = "probes")]
-            probes::slot__set__claim__done!(|| (
+            probes::slot__set__claim__failed!(|| (
                 self.pool_name.as_str(),
                 id.0,
-                handle.slot_id().as_u64()
+                "Could not reserve slot_tx permit; all slots used"
             ));
 
-            return Ok(handle);
+            // This is more of an "all slots in-use" error,
+            // but it should look the same to clients.
+            return Err(Error::NoSlotsReady);
+        };
+
+        let Some(handle) = self.take_connected_unclaimed_slot(permit, id) else {
+            event!(Level::TRACE, "Failed to take unclaimed slot");
+
+            #[cfg(feature = "probes")]
+            probes::slot__set__claim__failed!(|| (
+                self.pool_name.as_str(),
+                id.0,
+                "No unclaimed slots"
+            ));
+            return Err(Error::NoSlotsReady);
+        };
+
+        #[cfg(feature = "probes")]
+        probes::slot__set__claim__done!(|| (
+            self.pool_name.as_str(),
+            id.0,
+            handle.slot_id().as_u64()
+        ));
+
+        return Ok(handle);
+    }
+
+    // Note that this function is not asynchronous.
+    //
+    // This is intentional: We should not be await-ing in the SetWorker
+    // task when servicing client requests.
+    fn handle_client_request(&mut self, request: SetRequest<Conn>) {
+        match request {
+            SetRequest::Claim { id, tx } => {
+                let result = self.claim(id);
+                let _ = tx.send(result);
+            }
+            SetRequest::SetWantedCount { count } => {
+                self.set_wanted_count(count);
+            }
         }
     }
 
@@ -1183,20 +1170,13 @@ impl<Conn: Connection> SetWorker<Conn> {
                 },
                 // Handle requests from clients
                 request = self.rx.recv() => {
-                    match request {
-                        Some(SetRequest::Claim { id, tx }) => {
-                            let result = self.claim(id).await;
-                            let _ = tx.send(result);
-                        },
-                        Some(SetRequest::SetWantedCount { count }) => {
-                            self.set_wanted_count(count);
-                        },
+                    if let Some(request) = request {
+                        self.handle_client_request(request);
+                    } else {
                         // All clients have gone away, so terminate the set.
-                        None => {
-                            // Break out of the loop rather than return, so that the
-                            // termination code runs.
-                            break;
-                        },
+                        // Break out of the loop rather than return, so that the
+                        // termination code runs.
+                        break;
                     }
                 }
             }
@@ -2111,15 +2091,21 @@ mod test {
                 connector.clone(),
             );
 
-            // Let the connections fill up
-            set.monitor()
-                .wait_for(|state| matches!(state, SetState::Online { .. }))
-                .await
-                .unwrap();
-
             // Claim some of the handles
             let mut handles = vec![];
             for _ in 0..config.claimed {
+                // Claim connections as they're available
+                set.monitor()
+                    .wait_for(|state| {
+                        matches!(
+                            state,
+                            SetState::Online {
+                                has_unclaimed_slots: true
+                            }
+                        )
+                    })
+                    .await
+                    .unwrap();
                 handles.push(set.claim(ClaimId::new()).await.unwrap());
             }
 

@@ -36,10 +36,13 @@ impl pool::Stats {
             let claims = self.claims.load(Ordering::Relaxed);
             let claims_per_interval = claims - claims_last;
             claims_last = claims;
-            ws.send(Message::Binary(serde_json::to_vec(&serde_json::json!({
-                "claims": claims_per_interval,
-                "sets": &cache,
-            }))?))
+            ws.send(Message::Binary(
+                serde_json::to_vec(&serde_json::json!({
+                    "claims": claims_per_interval,
+                    "sets": &cache,
+                }))?
+                .into(),
+            ))
             .await?;
 
             tokio::select! {

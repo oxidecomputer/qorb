@@ -535,6 +535,8 @@ pub struct Pool<Conn: Connection> {
     #[cfg_attr(not(feature = "probes"), allow(dead_code))]
     name: Name,
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    backend_connector: backend::SharedConnector<Conn>,
+    policy: Policy,
     tx: mpsc::Sender<Request<Conn>>,
     stats: Stats,
 }
@@ -645,13 +647,15 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
         let (tx, rx) = mpsc::channel(1);
         let (stats_tx, stats_rx) = watch::channel(HashMap::default());
         let name = Name::new(name);
+        let backend_connector_clone = backend_connector.clone();
+        let policy_clone = policy.clone();
         let name_clone = name.clone();
         let handle = tokio::task::spawn(async move {
             let worker = PoolInner::new(
                 name_clone,
                 resolver,
-                backend_connector,
-                policy,
+                backend_connector_clone,
+                policy_clone,
                 rx,
                 stats_tx,
             );
@@ -661,6 +665,8 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
         let self_ = Self {
             name,
             handle: Mutex::new(Some(handle)),
+            backend_connector,
+            policy,
             tx,
             stats: Stats {
                 rx: stats_rx,
@@ -710,24 +716,66 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
         res
     }
 
+    // Acquiring a claim has two phases:
+    //
+    // 1. A request is made to the pool, to navigate backends and find a viable
+    //    claim which is believed to be connected.
+    // 2. Once such a claim is identified, it's returned to this calling task,
+    //    where the "Connector::on_acquire" method is invoked.
+    //
+    // We perform "on_acquire" seperately from the claim acquisition to ensure
+    // that the call to "on_acquire" does not limit access other claim requests
+    // in the pool.
     async fn do_claim(&self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
-        let (tx, rx) = oneshot::channel();
+        loop {
+            let (tx, rx) = oneshot::channel();
+            self.tx
+                .send(Request::Claim { id, tx })
+                .await
+                .map_err(|_| Error::Terminated)?;
+            let mut claim = rx.await.map_err(|_| Error::Terminated)??;
 
-        // TODO: The work of "on_acquire" could be done here? Would prevent the
-        // slot set from blocking, and we'd also be able to loop. Picking a new
-        // backend might also be the right call if "on_acquire" is failing?
-        //
-        // There is admittedly a question of "fairness" within a queue of
-        // claims; looping at this point would send us to the back of the queue
-        // if there were multiple callers.
+            // We execute the "Connector::on_acquire" work here.
+            //
+            // Notably, this can fail: If it does, we drop the claim,
+            // and try to acquire another one.
+            //
+            // TODO: There isn't much "fairness" in this error case - if
+            // "on_acquire" is failing, the caller will go to the back of
+            // the queue of requests. However, it's (probably) not their fault
+            // the the connection setup failed - it may be worth building
+            // some mechanism to put them back in the front of the queue.
 
-        self.tx
-            .send(Request::Claim { id, tx })
-            .await
-            .map_err(|_| Error::Terminated)?;
-        let claim = rx.await.map_err(|_| Error::Terminated)?;
-        self.stats.claims.fetch_add(1, Ordering::Relaxed);
-        claim
+            let result = tokio::time::timeout(
+                self.policy.set_config.health_check_timeout,
+                self.backend_connector.on_acquire(&mut claim),
+            )
+            .await;
+
+            let Ok(result) = result else {
+                event!(Level::TRACE, "Timeout performing 'on_acquire' on claim");
+                #[cfg(feature = "probes")]
+                probes::claim__acquire__failed!(|| (
+                    self.name.as_str(),
+                    id.0,
+                    "Timeout performing 'on_acquire'"
+                ));
+                continue;
+            };
+            if let Err(err) = result {
+                event!(Level::TRACE, error=%err, "Failed performing 'on_acquire' on claim");
+                #[cfg(feature = "probes")]
+                probes::claim__acquire__failed!(|| (
+                    self.name.as_str(),
+                    id.0,
+                    format!("Failed 'on_acquire': {err}"),
+                ));
+                continue;
+            }
+
+            self.stats.claims.fetch_add(1, Ordering::Relaxed);
+            return Ok(claim);
+        }
     }
 }
 
@@ -753,6 +801,7 @@ mod test {
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio::time::error::Elapsed;
@@ -1281,5 +1330,126 @@ mod test {
         .expect("pool dropped connections");
 
         server_handle.abort();
+    }
+
+    /// Validates a slow connector cannot block other concurrent claims.
+    #[tokio::test]
+    async fn test_claim_with_slow_connector() {
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::watch;
+
+        let _ = tracing_subscriber::fmt::try_init();
+
+        // Create a connector that simulates slow on_acquire operations
+        struct SlowAcquireConnector {
+            on_acquire_rx: watch::Receiver<bool>,
+            next_acquire_should_block: AtomicBool,
+        }
+
+        impl SlowAcquireConnector {
+            fn new(barrier: watch::Receiver<bool>) -> Self {
+                Self {
+                    on_acquire_rx: barrier,
+                    next_acquire_should_block: AtomicBool::new(true),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl Connector for SlowAcquireConnector {
+            type Connection = ();
+
+            async fn connect(&self, _: &Backend) -> Result<Self::Connection, backend::Error> {
+                Ok(())
+            }
+
+            async fn is_valid(&self, _: &mut Self::Connection) -> Result<(), backend::Error> {
+                Ok(())
+            }
+
+            async fn on_acquire(&self, _conn: &mut Self::Connection) -> Result<(), backend::Error> {
+                // Half the connections will block, the other half will not
+                let blocking = self.next_acquire_should_block.fetch_not(Ordering::SeqCst);
+                if blocking {
+                    let rx = self.on_acquire_rx.clone();
+                    rx.clone().changed().await.unwrap();
+                    assert!(*rx.borrow());
+                }
+                Ok(())
+            }
+
+            async fn on_recycle(&self, _: &mut Self::Connection) -> Result<(), backend::Error> {
+                Ok(())
+            }
+        }
+
+        // Create four backends, configure them to have 8 slots each.
+        //
+        // This is a little arbitrary - we want multiple slots sets, and
+        // we don't want changing defaults to cause this test to break.
+        let backends = (0..4)
+            .map(|i| {
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 16000 + i);
+                (backend::Name::new(addr), Backend { address: addr })
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let resolver = TestResolver::new();
+        resolver.replace(backends);
+        let (tx, rx) = watch::channel(false);
+        let connector = Arc::new(SlowAcquireConnector::new(rx));
+
+        const TOTAL_SLOTS: usize = 32;
+
+        let pool = Arc::new(
+            Pool::new(
+                "slow-connector-test".to_string(),
+                Box::new(resolver),
+                connector.clone(),
+                Policy {
+                    max_slots: TOTAL_SLOTS,
+                    set_config: SetConfig {
+                        max_count: 8,
+                        // This is the timeout also used by "on_acquire".
+                        //
+                        // Make it unreasonably large, so it's notable when this
+                        // test stalls out.
+                        health_check_timeout: Duration::from_secs(10000),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("pool creation should succeed"),
+        );
+
+        // Spawn the request for all slots concurrently.
+        //
+        // We expect that half of them will succeed immediately,
+        // the other half will be stuck in "on_acquire".
+        let mut concurrent_tasks = futures::stream::FuturesUnordered::new();
+        for _ in 0..TOTAL_SLOTS {
+            let pool_clone = pool.clone();
+            let task = tokio::spawn(async move {
+                let handle = pool_clone.claim().await.expect("claim should succeed");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                drop(handle);
+            });
+            concurrent_tasks.push(task);
+        }
+
+        while let Some(result) = concurrent_tasks.next().await {
+            result.expect("task should complete");
+
+            // When we get to this point - where the "fast half" of tasks
+            // has completed - we can let the blocked tasks proceed.
+            //
+            // If we aren't able to let the "fast half" of tasks through,
+            // we'll get stuck behind the way-too-long "health_check_timeout"
+            // set in the Policy above.
+            if concurrent_tasks.len() == TOTAL_SLOTS / 2 {
+                tx.send(true).unwrap();
+            }
+        }
     }
 }
