@@ -81,6 +81,8 @@ pub trait Connector: Send + Sync {
     /// care not to be "lazy" - if this connection method succeeds, but
     /// "Self::is_valid" would fail, the connections in the pool will
     /// churn between "connecting" and "failing health checks".
+    ///
+    /// This function must be cancel-safe.
     async fn connect(&self, backend: &Backend) -> Result<Self::Connection, Error>;
 
     /// Determines if the connection to a backend is still valid.
@@ -91,16 +93,24 @@ pub trait Connector: Send + Sync {
     /// timing out.
     ///
     /// By default this method does nothing.
+    ///
+    /// This function must be cancel-safe.
     async fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), Error> {
         Ok(())
     }
 
     /// Performs validation or setup on the connection as it is being claimed.
     ///
+    /// This method is called on connections within the pool as they are being
+    /// claimed, and can run for
+    /// [crate::policy::SetConfig::health_check_timeout] before timing out.
+    ///
     /// Regardless of whether this method fails or not, "on_recycle" is still
     /// invoked for the connection when it is later returned to the pool.
     ///
     /// By default this method does nothing.
+    ///
+    /// This function must be cancel-safe.
     async fn on_acquire(&self, _conn: &mut Self::Connection) -> Result<(), Error> {
         Ok(())
     }
@@ -113,6 +123,8 @@ pub trait Connector: Send + Sync {
     /// [crate::policy::SetConfig::health_check_timeout] before timing out.
     ///
     /// By default this method calls [Self::is_valid].
+    ///
+    /// This function must be cancel-safe.
     async fn on_recycle(&self, conn: &mut Self::Connection) -> Result<(), Error> {
         self.is_valid(conn).await
     }
