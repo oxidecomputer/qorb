@@ -81,6 +81,7 @@ impl<Conn: Connection> State<Conn> {
 }
 
 impl<Conn: Connection> State<Conn> {
+    #[cfg(feature = "probes")]
     fn as_str(&self) -> &'static str {
         match self {
             State::Connecting => "Connecting",
@@ -140,8 +141,8 @@ impl<Conn: Connection> SlotInner<Conn> {
     // emits a SetState on [Self::status_tx].
     fn state_transition(
         &self,
-        slot_id: SlotId,
-        backend: &Backend,
+        #[cfg_attr(not(feature = "probes"), allow(unused_variables))] slot_id: SlotId,
+        #[cfg_attr(not(feature = "probes"), allow(unused_variables))] backend: &Backend,
         mut inner: std::sync::MutexGuard<SlotInnerGuarded<Conn>>,
         new: State<Conn>,
     ) -> State<Conn> {
@@ -167,11 +168,7 @@ impl<Conn: Connection> SlotInner<Conn> {
                 slot_id.as_u64(),
                 old.as_str(),
                 new_str,
-                stats.connecting_slots,
-                stats.unclaimed_slots,
-                stats.checking_slots,
-                stats.claimed_slots,
-                stats.total_claims,
+                stats.clone(),
             )
         });
 
@@ -321,7 +318,7 @@ impl<Conn: Connection> Slot<Conn> {
 
     async fn do_connect(
         &self,
-        id: SlotId,
+        #[cfg_attr(not(feature = "probes"), allow(unused_variables))] id: SlotId,
         connector: &SharedConnector<Conn>,
         backend: &Backend,
     ) -> Result<Conn, backend::Error> {
@@ -568,6 +565,7 @@ impl<Conn: Connection> BorrowedConnection<Conn> {
         Self { conn, id }
     }
 
+    #[cfg(feature = "probes")]
     pub(crate) fn id(&self) -> SlotId {
         self.id
     }

@@ -109,11 +109,13 @@ async fn main() -> anyhow::Result<()> {
 
     let mut trace_level = Tracing::Off;
     let mut bootstrap_address = "[::1]:1234".parse()?;
+    #[cfg(feature = "probes")]
     let mut enable_probes = false;
     for arg in &args[1..] {
         match arg.as_str() {
             "--tracing" => trace_level = Tracing::On,
             "--super-tracing" => trace_level = Tracing::ReallyOn,
+            #[cfg(feature = "probes")]
             "--probes" => enable_probes = true,
             "--help" => {
                 usage(&args);

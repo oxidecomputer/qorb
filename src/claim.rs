@@ -25,6 +25,7 @@ impl<Conn: Connection> Handle<Conn> {
         }
     }
 
+    #[cfg(feature = "probes")]
     pub(crate) fn slot_id(&self) -> crate::slot::SlotId {
         self.inner.as_ref().map(|inner| inner.id()).unwrap()
     }

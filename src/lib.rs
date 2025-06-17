@@ -96,14 +96,27 @@ mod window_counter;
 pub mod connectors;
 pub mod resolvers;
 
-/// Uniquely identifies a claim
+/// Uniquely identifies a claim for probes
+#[cfg(feature = "probes")]
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ClaimId(pub u64);
 
+#[cfg(not(feature = "probes"))]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ClaimId;
+
+#[cfg(feature = "probes")]
 impl ClaimId {
     fn new() -> Self {
         let id = usdt::UniqueId::new().as_u64();
         Self(id)
+    }
+}
+
+#[cfg(not(feature = "probes"))]
+impl ClaimId {
+    fn new() -> Self {
+        Self
     }
 }
 
@@ -177,17 +190,20 @@ mod probes {
     fn slot__set__offline(pool: &str, addr: &str) {}
 
     /// Fires whenever stats for a slot set are updated.
+    ///
+    /// "addr" identifies the address of the backend being used
+    /// "slot_id" identifies which slot is undergoing a state change
+    /// "old" is the name of the old state
+    /// "new" is the name of the new state
+    /// "stats" is serialized as a JSON object, and contains information
+    /// about all slots within this backend.
     fn slot__state__change(
         pool: &str,
         addr: &str,
         slot_id: u64,
         old: &str,
         new: &str,
-        connecting_slots: usize,
-        unclaimed_slots: usize,
-        checking_slots: usize,
-        claimed_slots: usize,
-        total_slots: usize,
+        stats: &crate::slot::Stats,
     ) {
     }
 
