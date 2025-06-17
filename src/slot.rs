@@ -167,11 +167,7 @@ impl<Conn: Connection> SlotInner<Conn> {
                 slot_id.as_u64(),
                 old.as_str(),
                 new_str,
-                stats.connecting_slots,
-                stats.unclaimed_slots,
-                stats.checking_slots,
-                stats.claimed_slots,
-                stats.total_claims,
+                stats.clone(),
             )
         });
 

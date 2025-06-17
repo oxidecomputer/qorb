@@ -180,11 +180,7 @@ mod probes {
         slot_id: u64,
         old: &str,
         new: &str,
-        connecting_slots: usize,
-        unclaimed_slots: usize,
-        checking_slots: usize,
-        claimed_slots: usize,
-        total_slots: usize,
+        stats: &crate::slot::Stats,
     ) {
     }
 
