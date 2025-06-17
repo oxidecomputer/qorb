@@ -109,11 +109,13 @@ async fn main() -> anyhow::Result<()> {
 
     let mut trace_level = Tracing::Off;
     let mut bootstrap_address = "[::1]:1234".parse()?;
+    #[cfg(feature = "probes")]
     let mut enable_probes = false;
     for arg in &args[1..] {
         match arg.as_str() {
             "--tracing" => trace_level = Tracing::On,
             "--super-tracing" => trace_level = Tracing::ReallyOn,
+            #[cfg(feature = "probes")]
             "--probes" => enable_probes = true,
             "--help" => {
                 usage(&args);
@@ -170,7 +172,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Actually make the pool!
     let pool = Arc::new(
-        Pool::new(resolver, backend_connector, policy).expect("USDT probe registration failed"),
+        Pool::new("my-pool".to_string(), resolver, backend_connector, policy)
+            .expect("USDT probe registration failed"),
     );
 
     #[cfg(feature = "qtop")]

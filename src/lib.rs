@@ -28,9 +28,20 @@
 //! - `connect-start`: Fires before attempting a connection to a backend.
 //! - `connect-done`: Fires after successfully connecting to a backend.
 //! - `connect-failed`: Fires after failing to connect to a backend.
+//! - `pool-claim-start`: Fires when a pool tries to make a claim, on behalf of
+//!   a user-requested claim-start.
+//! - `pool-claim-done`: Fires when a pool successfully makes a claim.
+//! - `pool-claim-failed`: Fires when a pool cannot make a claim.
+//! - `slot-set-claim-start`: Fires when a claim has been made to a backend.
+//! - `slot-set-claim-done`: Fires when a backend returns a claim.
+//! - `slot-set-claim-failed`: Fires when a backend cannot return a claim.
+//! - `slot-set-online`: Fires when a backend becomes online.
+//! - `slot-set-offline`: Fires when a backend becomes offline.
+//! - `slot-state-change`: Fires when a slot has a state change, and emits
+//!   stats for the backend.
 //! - `handle-claimed`: Fires after claiming a handle from the pool, before
 //!   returning it to the client.
-//! - `handle-recycled`: Fires when a handle is returned to the pool, after it
+//! - `handle-returned`: Fires when a handle is returned to the pool, after it
 //!   is dropped.
 //! - `health-check-start`: Fires when a health check for a backend starts.
 //! - `health-check-done`: Fires when a health check for a backend completes
@@ -39,6 +50,8 @@
 //! - `recycle-start`: Fires before attempting to recycle a connection.
 //! - `recycle-done`: Fires after successsfully recycling a connection.
 //! - `recycle-failed`: Fires when failing to recycle a connection.
+//! - `rebalance-start`: Fires when rebalancing the connection pool.
+//! - `rebalance-done`: Fires when the connection pool is done rebalancing.
 //!
 //! The existence of the probes is behind the `"probes"` feature, which is
 //! enabled by default. Probes are zero-cost unless they are explicitly enabled,
@@ -83,54 +96,146 @@ mod window_counter;
 pub mod connectors;
 pub mod resolvers;
 
+/// Uniquely identifies a claim for probes
+#[cfg(feature = "probes")]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ClaimId(pub u64);
+
+#[cfg(not(feature = "probes"))]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ClaimId;
+
+#[cfg(feature = "probes")]
+impl ClaimId {
+    fn new() -> Self {
+        let id = usdt::UniqueId::new().as_u64();
+        Self(id)
+    }
+}
+
+#[cfg(not(feature = "probes"))]
+impl ClaimId {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ClaimId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// USDT probes for tracing how qorb makes pools and hands out claims.
 #[cfg(feature = "probes")]
 #[usdt::provider(provider = "qorb")]
 mod probes {
     /// Fires right before attempting to acquire a claim from the pool.
-    fn claim__start(id: &usdt::UniqueId) {}
+    fn claim__start(pool: &str, claim_id: u64) {}
 
     /// Fires when a claim is successfully acquired from the pool.
-    fn claim__done(id: &usdt::UniqueId) {}
+    ///
+    /// Also identifies the underlying slot which is being used.
+    fn claim__done(pool: &str, claim_id: u64, slot_id: u64) {}
 
     /// Fires when we _fail_ to acquire a claim from the pool, with a string
     /// identifying the reason.
-    fn claim__failed(id: &usdt::UniqueId, reason: &str) {}
+    fn claim__failed(pool: &str, claim_id: u64, reason: &str) {}
 
     /// Fires right before attempting to make a connection, with the address
     /// we're connecting to.
-    fn connect__start(id: &usdt::UniqueId, addr: &str) {}
+    fn connect__start(pool: &str, slot_id: u64, addr: &str) {}
 
     /// Fires just after successfully making a connection.
-    fn connect__done(id: &usdt::UniqueId) {}
+    fn connect__done(pool: &str, slot_id: u64, addr: &str) {}
 
-    /// Fires just after failing to make a connectiona, with a string
+    /// Fires just after failing to make a connection, with a string
     /// identifying the reason.
-    fn connect__failed(id: &usdt::UniqueId, reason: &str) {}
+    fn connect__failed(pool: &str, slot_id: u64, addr: &str, reason: &str) {}
+
+    /// Fires when the pool is attempting to make a claim.
+    ///
+    /// This is similar to "claim__start", but it follows the internal
+    /// pool-specific task, which may happen multiple times if e.g.
+    /// waiting for a backend to be ready.
+    ///
+    /// For example: a user may try to claim a connection before any backends
+    /// are ready. This will call "pool__claim__start" and later fail, but the
+    /// request will remain enqueued. Once a new backend is available, and
+    /// has claims that can be used, this probe will fire again.
+    fn pool__claim__start(pool: &str, claim_id: u64) {}
+
+    /// Fires when the pool has made a claim successfully.
+    fn pool__claim__done(pool: &str, claim_id: u64, slot_id: u64) {}
+
+    /// Fires when the pool has failed to make any claim.
+    fn pool__claim__failed(pool: &str, claim_id: u64) {}
+
+    /// Fires when a claim request has been made to a specific backend
+    fn slot__set__claim__start(pool: &str, claim_id: u64, addr: &str) {}
+
+    /// Fires when a slot claim to a specific backend completes successfully
+    fn slot__set__claim__done(pool: &str, claim_id: u64, slot_id: u64) {}
+
+    /// Fires when a slot claim to a specific backend fails
+    fn slot__set__claim__failed(pool: &str, claim_id: u64, reason: &str) {}
+
+    /// Fires when a slot set has become online, and has unclaimed slots.
+    fn slot__set__online(pool: &str, addr: &str, has_unclaimed_slots: bool) {}
+
+    /// Fires when a slot set has become offline.
+    fn slot__set__offline(pool: &str, addr: &str) {}
+
+    /// Fires whenever stats for a slot set are updated.
+    ///
+    /// "addr" identifies the address of the backend being used
+    /// "slot_id" identifies which slot is undergoing a state change
+    /// "old" is the name of the old state
+    /// "new" is the name of the new state
+    /// "stats" is serialized as a JSON object, and contains information
+    /// about all slots within this backend.
+    fn slot__state__change(
+        pool: &str,
+        addr: &str,
+        slot_id: u64,
+        old: &str,
+        new: &str,
+        stats: &crate::slot::Stats,
+    ) {
+    }
 
     /// Fires when qorb creates a new handle, before returning it in a call to
     /// `qorb::Pool::claim()`. This includes an ID for the handle, and the
     /// address of the backend the handle is connected to.
-    fn handle__claimed(id: usize, addr: &str) {}
+    ///
+    /// This fires within the "slot set", the moment the slot has been
+    /// grabbed successfully.
+    fn handle__claimed(pool: &str, claim_id: u64, slot_id: u64, addr: &str) {}
 
     /// Fires when a handle is returned to qorb, usually when it is dropped.
-    fn handle__returned(id: usize) {}
+    fn handle__returned(pool: &str, slot_id: u64) {}
 
     /// Fires just before we start a health-check to a backend.
-    fn health__check__start(id: &usdt::UniqueId, addr: &str) {}
+    fn health__check__start(pool: &str, slot_id: u64, addr: &str) {}
 
     /// Fires after a successful health-check to a backend.
-    fn health__check__done(id: &usdt::UniqueId) {}
+    fn health__check__done(pool: &str, slot_id: u64) {}
 
     /// Fires after a failed health-check to a backend.
-    fn health__check__failed(id: &usdt::UniqueId, reason: &str) {}
+    fn health__check__failed(pool: &str, slot_id: u64, reason: &str) {}
 
     /// Fires just before we recycle a connection to a backend.
-    fn recycle__start(id: &usdt::UniqueId, addr: &str) {}
+    fn recycle__start(pool: &str, slot_id: u64, addr: &str) {}
 
     /// Fires after successfully recycling a connection to a backend.
-    fn recycle__done(id: &usdt::UniqueId) {}
+    fn recycle__done(pool: &str, slot_id: u64) {}
 
     /// Fires after failing to recycle a connection to a backend.
-    fn recycle__failed(id: &usdt::UniqueId, reason: &str) {}
+    fn recycle__failed(pool: &str, slot_id: u64, reason: &str) {}
+
+    /// Fires when the connection pool is rebalancing
+    fn rebalance__start(pool: &str) {}
+
+    /// Fires when the connection pool has finished rebalancing
+    fn rebalance__done(pool: &str) {}
 }
