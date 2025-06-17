@@ -187,6 +187,13 @@ mod probes {
     fn slot__set__offline(pool: &str, addr: &str) {}
 
     /// Fires whenever stats for a slot set are updated.
+    ///
+    /// "addr" identifies the address of the backend being used
+    /// "slot_id" identifies which slot is undergoing a state change
+    /// "old" is the name of the old state
+    /// "new" is the name of the new state
+    /// "stats" is serialized as a JSON object, and contains information
+    /// about all slots within this backend.
     fn slot__state__change(
         pool: &str,
         addr: &str,
