@@ -763,7 +763,7 @@ impl<Conn: Connection + Send + 'static> Pool<Conn> {
                 continue;
             };
             if let Err(err) = result {
-                event!(Level::TRACE, "Failed performing 'on_acquire' on claim");
+                event!(Level::TRACE, error=%err, "Failed performing 'on_acquire' on claim");
                 #[cfg(feature = "probes")]
                 probes::claim__acquire__failed!(|| (
                     self.name.as_str(),
