@@ -874,6 +874,7 @@ impl<Conn: Connection> SetWorker<Conn> {
     // Borrows a connection out of the first unclaimed slot.
     //
     // Returns a Handle which has enough context to put the claim back,
+    // once it's dropped by the client.
     #[instrument(
         skip(self, permit)
         fields(pool_name = %self.pool_name),
