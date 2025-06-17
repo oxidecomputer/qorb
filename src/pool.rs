@@ -532,6 +532,7 @@ impl<Conn: Connection> PoolInner<Conn> {
 
 /// Manages a set of connections to a service
 pub struct Pool<Conn: Connection> {
+    #[cfg_attr(not(feature = "probes"), allow(dead_code))]
     name: Name,
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     tx: mpsc::Sender<Request<Conn>>,

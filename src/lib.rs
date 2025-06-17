@@ -96,14 +96,27 @@ mod window_counter;
 pub mod connectors;
 pub mod resolvers;
 
-/// Uniquely identifies a claim
+/// Uniquely identifies a claim for probes
+#[cfg(feature = "probes")]
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ClaimId(pub u64);
 
+#[cfg(not(feature = "probes"))]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ClaimId;
+
+#[cfg(feature = "probes")]
 impl ClaimId {
     fn new() -> Self {
         let id = usdt::UniqueId::new().as_u64();
         Self(id)
+    }
+}
+
+#[cfg(not(feature = "probes"))]
+impl ClaimId {
+    fn new() -> Self {
+        Self
     }
 }
 
