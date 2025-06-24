@@ -138,6 +138,9 @@ mod probes {
     /// Also identifies the underlying slot which is being used.
     fn claim__done(pool: &str, claim_id: u64, slot_id: u64) {}
 
+    /// Fires when the "on_acquire" call on a claim fails.
+    fn claim__acquire__failed(pool: &str, claim_id: u64, reason: &str) {}
+
     /// Fires when we _fail_ to acquire a claim from the pool, with a string
     /// identifying the reason.
     fn claim__failed(pool: &str, claim_id: u64, reason: &str) {}
