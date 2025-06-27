@@ -16,9 +16,10 @@ pub type AllBackends = Arc<BTreeMap<backend::Name, Backend>>;
 /// all possible backends, but not reporting nor tracking their health.
 #[async_trait]
 pub trait Resolver: Send + Sync {
-    /// Start running a resolver.
+    /// Returns a receiver to track the latest known set of backends.
     ///
-    /// Returns a receiver to track ongoing activity.
+    /// Note that if the `Resolver` is dropped or terminated,
+    /// this watch channel will stop updating this backend set.
     fn monitor(&mut self) -> watch::Receiver<AllBackends>;
 
     /// Cleanly terminates the server.
