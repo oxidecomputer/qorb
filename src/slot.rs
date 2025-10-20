@@ -1219,6 +1219,20 @@ pub(crate) enum SetState {
     Offline,
 }
 
+impl SetState {
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            SetState::Online {
+                has_unclaimed_slots: true,
+            } => "online-with-unclaimed-slots",
+            SetState::Online {
+                has_unclaimed_slots: false,
+            } => "online-without-unclaimed-slots",
+            SetState::Offline => "offline",
+        }
+    }
+}
+
 /// A set of slots for a particular backend.
 pub(crate) struct Set<Conn: Connection> {
     tx: mpsc::Sender<SetRequest<Conn>>,

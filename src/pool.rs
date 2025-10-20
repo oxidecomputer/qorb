@@ -286,12 +286,16 @@ impl<Conn: Connection> PoolInner<Conn> {
                 request = self.rx.recv() => {
                     match request {
                         Some(Request::Claim { id, tx }) => {
+                            #[cfg(feature = "probes")]
+                            probes::pool__select__request__claim!(|| (self.name.as_str(), id.0));
                             self.claim_or_enqueue(id, tx).await
                         }
                         // The caller has explicitly asked us to terminate, and
                         // we should respond to them once we've stopped doing
                         // work.
                         Some(Request::Terminate) => {
+                            #[cfg(feature = "probes")]
+                            probes::pool__select__request__terminate!(|| self.name.as_str());
                             self.terminate().await;
                             return;
                         },
@@ -301,15 +305,23 @@ impl<Conn: Connection> PoolInner<Conn> {
                         // notify. Given that the caller no longer needs the
                         // pool, we choose to terminate to avoid leaks.
                         None => {
+                            #[cfg(feature = "probes")]
+                            probes::pool__select__abandoned!(|| self.name.as_str());
                             self.terminate().await;
                             return;
                         }
                     }
                 }
                 // Timeout old requests from clients
-                _ = next_request_timeout => self.fail_claim(),
+                _ = next_request_timeout => {
+                    #[cfg(feature = "probes")]
+                    probes::pool__select__request__timeout!(|| self.name.as_str());
+                    self.fail_claim()
+                }
                 // Handle updates from the resolver
                 Some(all_backends) = resolver_stream.next() => {
+                    #[cfg(feature = "probes")]
+                    probes::pool__select__updated__backends!(|| self.name.as_str());
                     event!(Level::INFO, "Resolver updated known backends");
                     // Update the set of backends we know about,
                     // and gather the list of all "new" backends.
@@ -325,11 +337,19 @@ impl<Conn: Connection> PoolInner<Conn> {
                 }
                 // Periodically rebalance the allocation of slots to backends
                 _ = rebalance_interval.tick() => {
+                    #[cfg(feature = "probes")]
+                    probes::pool__select__periodic__rebalance!(|| self.name.as_str());
                     event!(Level::INFO, "Rebalancing: timer tick");
                     self.rebalance().await;
                 }
                 // If any of the slots change state, update their allocations.
                 Some((name, status)) = &mut backend_status_stream.next(), if !backend_status_stream.is_empty() => {
+                    #[cfg(feature = "probes")]
+                    probes::pool__select__updated__backend__status!(|| (
+                        self.name.as_str(),
+                        &name.0,
+                        status.as_str(),
+                    ));
                     event!(Level::INFO, name = ?name, status = ?status, "Rebalancing: Backend has new status");
                     rebalance_interval.reset();
                     self.rebalance().await;
