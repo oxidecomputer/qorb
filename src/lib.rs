@@ -156,6 +156,23 @@ mod probes {
     /// identifying the reason.
     fn connect__failed(pool: &str, slot_id: u64, addr: &str, reason: &str) {}
 
+    /// Fires when the pool has received a claim request from a client
+    fn pool__select__request__claim(pool: &str, claim_id: u64) {}
+    /// Fires when the pool has received an explicit termination request from a
+    /// client
+    fn pool__select__request__terminate(pool: &str) {}
+    /// Fires when the pool has received an implicit termination request from a
+    /// client (they dropped their connection to the pool)
+    fn pool__select__abandoned(pool: &str) {}
+    /// Fires when an enqueued client request has timed out
+    fn pool__select__request__timeout(pool: &str) {}
+    /// Fires when the resolver updates the list of backends
+    fn pool__select__updated__backends(pool: &str) {}
+    /// Fires periodically to rebalance slots across all backends
+    fn pool__select__periodic__rebalance(pool: &str) {}
+    /// Fires when a backend has a new status
+    fn pool__select__updated__backend__status(pool: &str, backend: &str, status: &str) {}
+
     /// Fires when the pool is attempting to make a claim.
     ///
     /// This is similar to "claim__start", but it follows the internal
