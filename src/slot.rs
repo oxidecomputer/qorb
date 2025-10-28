@@ -14,7 +14,7 @@ use derive_where::derive_where;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, watch, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 use tracing::{event, instrument, span, Instrument, Level};
@@ -304,7 +304,13 @@ impl<Conn: Connection> Slot<Conn> {
                             return true;
                         }
                         Err(err) => {
-                            event!(Level::WARN, pool_name = self.inner.pool_name.as_str(), ?err, ?backend, "Failed to connect");
+                            event!(
+                                Level::WARN,
+                                pool_name = self.inner.pool_name.as_str(),
+                                ?err,
+                                ?backend,
+                                "Failed to connect"
+                            );
                             self.inner.failure_window.add(1);
                             retry_duration =
                                 retry_duration.exponential_backoff(config.max_connection_backoff);
@@ -642,45 +648,24 @@ impl Stats {
     }
 }
 
-enum SetRequest<Conn: Connection> {
-    Claim {
-        id: ClaimId,
-        tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>,
-    },
-    SetWantedCount {
-        count: usize,
-    },
-}
-
-// Owns and runs work on behalf of a [Set].
-struct SetWorker<Conn: Connection> {
+// Provides direct access to all underlying slots
+//
+// Shared by both a [`SetWorker`] and [`Set`]
+struct Slots<Conn: Connection> {
     pool_name: pool::Name,
     name: backend::Name,
     backend: Backend,
     config: SetConfig,
 
-    wanted_count: usize,
+    // If "true", new requests are rejected
+    terminating: bool,
 
     // Interface for actually connecting to backends
     backend_connector: SharedConnector<Conn>,
 
-    // Interface for receiving client requests
-    rx: mpsc::Receiver<SetRequest<Conn>>,
-
-    // Identifies that the set worker should terminate immediately
-    terminate_rx: tokio::sync::oneshot::Receiver<()>,
-
     // Interface for communicating backend status
     status_tx: watch::Sender<SetState>,
 
-    // Sender and receiver for returning old handles.
-    //
-    // This is to guarantee a size, and to vend out permits to claim::Handles so they can be sure
-    // that their connections can return to the set without error.
-    slot_tx: mpsc::Sender<BorrowedConnection<Conn>>,
-    slot_rx: mpsc::Receiver<BorrowedConnection<Conn>>,
-
-    // The actual slots themselves.
     slots: BTreeMap<SlotId, Slot<Conn>>,
 
     // Summary information about the health of all slots.
@@ -690,54 +675,215 @@ struct SetWorker<Conn: Connection> {
 
     failure_window: Arc<WindowedCounter>,
 
+    // Sender for returning old handles.
+    slot_tx: mpsc::Sender<BorrowedConnection<Conn>>,
+
+    // The desired number of slots
+    wanted_count: usize,
+
     next_slot_id: SlotId,
 }
 
-impl<Conn: Connection> SetWorker<Conn> {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        pool_name: pool::Name,
-        set_id: u16,
-        name: backend::Name,
-        rx: mpsc::Receiver<SetRequest<Conn>>,
-        terminate_rx: tokio::sync::oneshot::Receiver<()>,
-        status_tx: watch::Sender<SetState>,
-        config: SetConfig,
-        wanted_count: usize,
-        backend: Backend,
-        backend_connector: SharedConnector<Conn>,
-        stats: Arc<Mutex<Stats>>,
-        failure_window: Arc<WindowedCounter>,
-    ) -> Self {
-        let (slot_tx, slot_rx) = mpsc::channel(config.max_count);
-        let mut set = Self {
-            pool_name,
-            name,
-            backend,
-            config,
-            wanted_count,
-            backend_connector,
-            stats,
-            failure_window,
-            rx,
-            terminate_rx,
-            status_tx,
-            slot_tx,
-            slot_rx,
-            slots: BTreeMap::new(),
-            next_slot_id: SlotId::first(set_id),
+impl<Conn: Connection> Slots<Conn> {
+    #[instrument(
+        level = "trace",
+        skip(self),
+        err,
+        name = "Slots::claim",
+        fields(name = ?self.name),
+    )]
+    fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
+        #[cfg(feature = "probes")]
+        probes::slot__set__claim__start!(|| (
+            self.pool_name.as_str(),
+            id.0,
+            self.backend.address.to_string()
+        ));
+
+        // Before we vend out the slot's connection to a client, make sure that
+        // we have space to take it back once they're done with it.
+        let Ok(permit) = self.slot_tx.clone().try_reserve_owned() else {
+            event!(Level::TRACE, "Could not reserve slot_tx permit");
+
+            #[cfg(feature = "probes")]
+            probes::slot__set__claim__failed!(|| (
+                self.pool_name.as_str(),
+                id.0,
+                "Could not reserve slot_tx permit; all slots used"
+            ));
+
+            // This is more of an "all slots in-use" error,
+            // but it should look the same to clients.
+            return Err(Error::NoSlotsReady);
         };
-        set.set_wanted_count(wanted_count);
-        set
+
+        let Some(handle) = self.take_connected_unclaimed_slot(permit, id) else {
+            event!(Level::TRACE, "Failed to take unclaimed slot");
+
+            #[cfg(feature = "probes")]
+            probes::slot__set__claim__failed!(|| (
+                self.pool_name.as_str(),
+                id.0,
+                "No unclaimed slots"
+            ));
+            return Err(Error::NoSlotsReady);
+        };
+
+        #[cfg(feature = "probes")]
+        probes::slot__set__claim__done!(|| (
+            self.pool_name.as_str(),
+            id.0,
+            handle.slot_id().as_u64()
+        ));
+
+        return Ok(handle);
     }
 
-    // Creates a new Slot, which always starts as "Connecting", and spawn a task
-    // to actually connect to the backend and monitor slot health.
+    // Borrows a connection out of the first unclaimed slot.
+    //
+    // Returns a Handle which has enough context to put the claim back,
+    // once it's dropped by the client.
     #[instrument(
-        skip(self)
+        skip(self, permit)
         fields(pool_name = %self.pool_name),
-        name = "SetWorker::create_slot"
+        name = "Slots::take_connected_unclaimed_slot"
     )]
+    fn take_connected_unclaimed_slot(
+        &mut self,
+        permit: mpsc::OwnedPermit<BorrowedConnection<Conn>>,
+        claim_id: ClaimId,
+    ) -> Option<claim::Handle<Conn>> {
+        for (id, slot) in &self.slots {
+            let guarded = slot.inner.guarded.lock().unwrap();
+            event!(Level::TRACE, slot_id = id.as_u64(), state = ?guarded.state, "Considering slot");
+            if matches!(guarded.state, State::ConnectedUnclaimed(_)) {
+                event!(Level::TRACE, slot_id = id.as_u64(), "Found unclaimed slot");
+                // We intentionally "take the connection out" of the slot and
+                // "place it into a claim::Handle" in the same method.
+                //
+                // This makes it difficult to leak a connection, unless the drop
+                // method of the claim::Handle is skipped.
+                let State::ConnectedUnclaimed(DebugIgnore(conn)) = slot.inner.state_transition(
+                    *id,
+                    &self.backend,
+                    guarded,
+                    State::ConnectedClaimed,
+                ) else {
+                    panic!(
+                        "We just matched this type before replacing it; this should be impossible"
+                    );
+                };
+
+                let borrowed_conn = BorrowedConnection::new(conn, *id);
+
+                #[cfg(feature = "probes")]
+                crate::probes::handle__claimed!(|| {
+                    (
+                        self.pool_name.as_str(),
+                        claim_id.0,
+                        borrowed_conn.id.as_u64(),
+                        self.backend.address.to_string(),
+                    )
+                });
+
+                // The "drop" method of the claim::Handle will return it to
+                // the slot set, through the permit (which is connected to
+                // slot_rx).
+                return Some(claim::Handle::new(borrowed_conn, permit));
+            }
+        }
+        None
+    }
+
+    fn set_wanted_count(&mut self, count: usize) {
+        self.wanted_count = std::cmp::min(count, self.config.max_count);
+        self.conform_slot_count();
+    }
+
+    fn conform_slot_count(&mut self) {
+        let desired = self.wanted_count;
+
+        use std::cmp::Ordering::*;
+        match desired.cmp(&self.slots.len()) {
+            Less => {
+                // Fewer slots wanted. Remove as many as we can.
+                event!(
+                    Level::TRACE,
+                    current = self.slots.len(),
+                    "Reducing slot count"
+                );
+
+                // Gather all the keys we are trying to remove.
+                //
+                // If there are many non-removable slots, it's possible
+                // we don't immediately quiesce to this smaller requested count.
+                let count_to_remove = self.slots.len() - desired;
+                let mut to_remove = Vec::with_capacity(count_to_remove);
+
+                // We iterate through all slots twice:
+                // - First, we try to remove unconnected slots
+                // - Then we remove any removable slots remaining
+                //
+                // This is a minor optimization that avoids tearing down a
+                // connected spare while also trying to create a new one.
+                let filters = [
+                    |slot: &SlotInnerGuarded<Conn>| {
+                        !slot.state.connected() && slot.state.removable()
+                    },
+                    |slot: &SlotInnerGuarded<Conn>| slot.state.removable(),
+                ];
+                for filter in filters {
+                    for (slot_id, slot) in &self.slots {
+                        if to_remove.len() >= count_to_remove {
+                            break;
+                        }
+                        let guarded = slot.inner.guarded.lock().unwrap();
+                        if filter(&*guarded) {
+                            to_remove.push(*slot_id);
+
+                            // It's important that we terminate the slot
+                            // immediately, so the task which manages the slot
+                            // will not continue modifying the state.
+                            slot.inner.state_transition(
+                                *slot_id,
+                                &self.backend,
+                                guarded,
+                                State::Terminated,
+                            );
+                        }
+                    }
+                }
+
+                for slot_id in to_remove {
+                    event!(Level::TRACE, slot_id = slot_id.as_u64(), "Removing slot");
+                    let Some(slot) = self.slots.remove(&slot_id) else {
+                        continue;
+                    };
+                    let Some(handle) = slot.inner.guarded.lock().unwrap().handle.take() else {
+                        continue;
+                    };
+                    event!(Level::TRACE, slot_id = slot_id.as_u64(), "Aborting task");
+                    handle.abort();
+                }
+            }
+            Greater => {
+                // More slots wanted. This case is easy, we can always fill
+                // in "connecting" slots immediately.
+                event!(
+                    Level::TRACE,
+                    current = self.slots.len(),
+                    "Increasing slot count"
+                );
+                let new_slots = (desired - self.slots.len()) as u64;
+                for slot_id in self.next_slot_id.0..self.next_slot_id.0 + new_slots {
+                    self.create_slot(SlotId(slot_id));
+                }
+                self.next_slot_id.0 += new_slots;
+            }
+            Equal => {}
+        }
+    }
+
     fn create_slot(&mut self, slot_id: SlotId) {
         let (terminate_tx, mut terminate_rx) = tokio::sync::oneshot::channel();
         let slot = Slot {
@@ -841,7 +987,11 @@ impl<Conn: Connection> SetWorker<Conn> {
                                 _ = &mut terminate_rx => {
                                     // If we've been instructed to bail out,
                                     // do that immediately.
-                                    event!(Level::TRACE, slot_id = slot_id.as_u64(), "Terminating while monitoring");
+                                    event!(
+                                        Level::TRACE,
+                                        slot_id = slot_id.as_u64(),
+                                        "Terminating while monitoring"
+                                    );
                                     return;
                                 },
                                 _ = interval.tick() => {
@@ -870,61 +1020,68 @@ impl<Conn: Connection> SetWorker<Conn> {
             }
         }));
     }
+}
 
-    // Borrows a connection out of the first unclaimed slot.
+// Owns and runs work on behalf of a [Set].
+struct SetWorker<Conn: Connection> {
+    pool_name: pool::Name,
+    name: backend::Name,
+    backend: Backend,
+
+    // Identifies that the set worker should terminate immediately
+    terminate_rx: tokio::sync::oneshot::Receiver<()>,
+
+    // Sender and receiver for returning old handles.
     //
-    // Returns a Handle which has enough context to put the claim back,
-    // once it's dropped by the client.
-    #[instrument(
-        skip(self, permit)
-        fields(pool_name = %self.pool_name),
-        name = "SetWorker::take_connected_unclaimed_slot"
-    )]
-    fn take_connected_unclaimed_slot(
-        &mut self,
-        permit: mpsc::OwnedPermit<BorrowedConnection<Conn>>,
-        claim_id: ClaimId,
-    ) -> Option<claim::Handle<Conn>> {
-        for (id, slot) in &mut self.slots {
-            let guarded = slot.inner.guarded.lock().unwrap();
-            event!(Level::TRACE, slot_id = id.as_u64(), state = ?guarded.state, "Considering slot");
-            if matches!(guarded.state, State::ConnectedUnclaimed(_)) {
-                event!(Level::TRACE, slot_id = id.as_u64(), "Found unclaimed slot");
-                // We intentionally "take the connection out" of the slot and
-                // "place it into a claim::Handle" in the same method.
-                //
-                // This makes it difficult to leak a connection, unless the drop
-                // method of the claim::Handle is skipped.
-                let State::ConnectedUnclaimed(DebugIgnore(conn)) = slot.inner.state_transition(
-                    *id,
-                    &self.backend,
-                    guarded,
-                    State::ConnectedClaimed,
-                ) else {
-                    panic!(
-                        "We just matched this type before replacing it; this should be impossible"
-                    );
-                };
+    // This is to guarantee a size, and to vend out permits to claim::Handles so
+    // they can be sure that their connections can return to the set without
+    // error.
+    slot_rx: mpsc::Receiver<BorrowedConnection<Conn>>,
 
-                let borrowed_conn = BorrowedConnection::new(conn, *id);
+    // The actual slots themselves.
+    slots: Arc<Mutex<Slots<Conn>>>,
+}
 
-                #[cfg(feature = "probes")]
-                crate::probes::handle__claimed!(|| {
-                    (
-                        self.pool_name.as_str(),
-                        claim_id.0,
-                        borrowed_conn.id.as_u64(),
-                        self.backend.address.to_string(),
-                    )
-                });
-
-                // The "drop" method of the claim::Handle will return it to
-                // the slot set, through the permit (which is connected to
-                // slot_rx).
-                return Some(claim::Handle::new(borrowed_conn, permit));
-            }
-        }
-        None
+impl<Conn: Connection> SetWorker<Conn> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        pool_name: pool::Name,
+        set_id: u16,
+        name: backend::Name,
+        terminate_rx: tokio::sync::oneshot::Receiver<()>,
+        status_tx: watch::Sender<SetState>,
+        config: SetConfig,
+        wanted_count: usize,
+        backend: Backend,
+        backend_connector: SharedConnector<Conn>,
+        stats: Arc<Mutex<Stats>>,
+        failure_window: Arc<WindowedCounter>,
+    ) -> Self {
+        let (slot_tx, slot_rx) = mpsc::channel(config.max_count);
+        let mut set = Self {
+            pool_name: pool_name.clone(),
+            name: name.clone(),
+            backend: backend.clone(),
+            terminate_rx,
+            slot_rx,
+            slots: Arc::new(Mutex::new(Slots {
+                pool_name,
+                name,
+                backend,
+                config,
+                terminating: false,
+                backend_connector,
+                status_tx,
+                slots: BTreeMap::new(),
+                stats,
+                failure_window,
+                slot_tx,
+                wanted_count,
+                next_slot_id: SlotId::first(set_id),
+            })),
+        };
+        set.set_wanted_count(wanted_count);
+        set
     }
 
     // Takes back borrowed slots from clients who dropped their claim handles.
@@ -941,7 +1098,9 @@ impl<Conn: Connection> SetWorker<Conn> {
         let slot_id = borrowed_conn.id;
         #[cfg(feature = "probes")]
         crate::probes::handle__returned!(|| (self.pool_name.as_str(), slot_id.as_u64()));
-        let inner = self
+
+        let mut slots = self.slots.lock().unwrap();
+        let inner = slots
             .slots
             .get_mut(&slot_id)
             .expect(
@@ -969,178 +1128,14 @@ impl<Conn: Connection> SetWorker<Conn> {
         // If we tried to shrink the slot count while too many connections were
         // in-use, it's possible there's more work to do. Try to conform the
         // slot count after recycling each connection.
-        self.conform_slot_count();
+        slots.conform_slot_count();
 
         inner.recycling_needed.notify_one();
     }
 
     fn set_wanted_count(&mut self, count: usize) {
-        self.wanted_count = std::cmp::min(count, self.config.max_count);
-        self.conform_slot_count();
-    }
-
-    // Makes the number of slots as close to "desired_count" as we can get.
-    #[instrument(
-        level = "trace",
-        skip(self),
-        fields(
-            wanted_count = self.wanted_count,
-            name = ?self.name,
-        ),
-        name = "SetWorker::conform_slot_count"
-    )]
-    fn conform_slot_count(&mut self) {
-        let desired = self.wanted_count;
-
-        use std::cmp::Ordering::*;
-        match desired.cmp(&self.slots.len()) {
-            Less => {
-                // Fewer slots wanted. Remove as many as we can.
-                event!(
-                    Level::TRACE,
-                    current = self.slots.len(),
-                    "Reducing slot count"
-                );
-
-                // Gather all the keys we are trying to remove.
-                //
-                // If there are many non-removable slots, it's possible
-                // we don't immediately quiesce to this smaller requested count.
-                let count_to_remove = self.slots.len() - desired;
-                let mut to_remove = Vec::with_capacity(count_to_remove);
-
-                // We iterate through all slots twice:
-                // - First, we try to remove unconnected slots
-                // - Then we remove any removable slots remaining
-                //
-                // This is a minor optimization that avoids tearing down a
-                // connected spare while also trying to create a new one.
-                let filters = [
-                    |slot: &SlotInnerGuarded<Conn>| {
-                        !slot.state.connected() && slot.state.removable()
-                    },
-                    |slot: &SlotInnerGuarded<Conn>| slot.state.removable(),
-                ];
-                for filter in filters {
-                    for (slot_id, slot) in &self.slots {
-                        if to_remove.len() >= count_to_remove {
-                            break;
-                        }
-                        let guarded = slot.inner.guarded.lock().unwrap();
-                        if filter(&*guarded) {
-                            to_remove.push(*slot_id);
-
-                            // It's important that we terminate the slot
-                            // immediately, so the task which manages the slot
-                            // will not continue modifying the state.
-                            slot.inner.state_transition(
-                                *slot_id,
-                                &self.backend,
-                                guarded,
-                                State::Terminated,
-                            );
-                        }
-                    }
-                }
-
-                for slot_id in to_remove {
-                    event!(Level::TRACE, slot_id = slot_id.as_u64(), "Removing slot");
-                    let Some(slot) = self.slots.remove(&slot_id) else {
-                        continue;
-                    };
-                    let Some(handle) = slot.inner.guarded.lock().unwrap().handle.take() else {
-                        continue;
-                    };
-                    event!(Level::TRACE, slot_id = slot_id.as_u64(), "Aborting task");
-                    handle.abort();
-                }
-            }
-            Greater => {
-                // More slots wanted. This case is easy, we can always fill
-                // in "connecting" slots immediately.
-                event!(
-                    Level::TRACE,
-                    current = self.slots.len(),
-                    "Increasing slot count"
-                );
-                let new_slots = (desired - self.slots.len()) as u64;
-                for slot_id in self.next_slot_id.0..self.next_slot_id.0 + new_slots {
-                    self.create_slot(SlotId(slot_id));
-                }
-                self.next_slot_id.0 += new_slots;
-            }
-            Equal => {}
-        }
-    }
-
-    #[instrument(
-        level = "trace",
-        skip(self),
-        err,
-        name = "SetWorker::claim",
-        fields(name = ?self.name),
-    )]
-    fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
-        #[cfg(feature = "probes")]
-        probes::slot__set__claim__start!(|| (
-            self.pool_name.as_str(),
-            id.0,
-            self.backend.address.to_string()
-        ));
-
-        // Before we vend out the slot's connection to a client, make sure that
-        // we have space to take it back once they're done with it.
-        let Ok(permit) = self.slot_tx.clone().try_reserve_owned() else {
-            event!(Level::TRACE, "Could not reserve slot_tx permit");
-
-            #[cfg(feature = "probes")]
-            probes::slot__set__claim__failed!(|| (
-                self.pool_name.as_str(),
-                id.0,
-                "Could not reserve slot_tx permit; all slots used"
-            ));
-
-            // This is more of an "all slots in-use" error,
-            // but it should look the same to clients.
-            return Err(Error::NoSlotsReady);
-        };
-
-        let Some(handle) = self.take_connected_unclaimed_slot(permit, id) else {
-            event!(Level::TRACE, "Failed to take unclaimed slot");
-
-            #[cfg(feature = "probes")]
-            probes::slot__set__claim__failed!(|| (
-                self.pool_name.as_str(),
-                id.0,
-                "No unclaimed slots"
-            ));
-            return Err(Error::NoSlotsReady);
-        };
-
-        #[cfg(feature = "probes")]
-        probes::slot__set__claim__done!(|| (
-            self.pool_name.as_str(),
-            id.0,
-            handle.slot_id().as_u64()
-        ));
-
-        return Ok(handle);
-    }
-
-    // Note that this function is not asynchronous.
-    //
-    // This is intentional: We should not be await-ing in the SetWorker
-    // task when servicing client requests.
-    fn handle_client_request(&mut self, request: SetRequest<Conn>) {
-        match request {
-            SetRequest::Claim { id, tx } => {
-                let result = self.claim(id);
-                let _ = tx.send(result);
-            }
-            SetRequest::SetWantedCount { count } => {
-                self.set_wanted_count(count);
-            }
-        }
+        let mut slots = self.slots.lock().unwrap();
+        slots.set_wanted_count(count);
     }
 
     #[instrument(
@@ -1168,22 +1163,16 @@ impl<Conn: Connection> SetWorker<Conn> {
                         },
                     }
                 },
-                // Handle requests from clients
-                request = self.rx.recv() => {
-                    if let Some(request) = request {
-                        self.handle_client_request(request);
-                    } else {
-                        // All clients have gone away, so terminate the set.
-                        // Break out of the loop rather than return, so that the
-                        // termination code runs.
-                        break;
-                    }
-                }
             }
         }
 
         // If we have exited from the run loop, tear down the background tasks
-        while let Some((_id, slot)) = self.slots.pop_first() {
+        let mut slots = {
+            let mut slots_lock = self.slots.lock().unwrap();
+            slots_lock.terminating = true;
+            std::mem::take(&mut slots_lock.slots)
+        };
+        while let Some((_id, slot)) = slots.pop_first() {
             let handle = {
                 let mut lock = slot.inner.guarded.lock().unwrap();
 
@@ -1221,7 +1210,7 @@ pub(crate) enum SetState {
 
 /// A set of slots for a particular backend.
 pub(crate) struct Set<Conn: Connection> {
-    tx: mpsc::Sender<SetRequest<Conn>>,
+    slots: Arc<Mutex<Slots<Conn>>>,
 
     status_rx: watch::Receiver<SetState>,
 
@@ -1249,37 +1238,35 @@ impl<Conn: Connection> Set<Conn> {
         backend: Backend,
         backend_connector: SharedConnector<Conn>,
     ) -> Self {
-        let (tx, rx) = mpsc::channel(1);
         let (terminate_tx, terminate_rx) = tokio::sync::oneshot::channel();
         let (status_tx, status_rx) = watch::channel(SetState::Offline);
         let failure_duration = config.max_connection_backoff * 2;
         let stats = Arc::new(Mutex::new(Stats::default()));
         let failure_window = Arc::new(WindowedCounter::new(failure_duration));
+
+        let mut worker = SetWorker::new(
+            pool_name,
+            set_id,
+            name.clone(),
+            terminate_rx,
+            status_tx,
+            config,
+            wanted_count,
+            backend,
+            backend_connector,
+            stats.clone(),
+            failure_window.clone(),
+        );
+        let slots = worker.slots.clone();
+
         let handle = tokio::task::spawn({
-            let stats = stats.clone();
-            let failure_window = failure_window.clone();
-            let name = name.clone();
             async move {
-                let mut worker = SetWorker::new(
-                    pool_name,
-                    set_id,
-                    name,
-                    rx,
-                    terminate_rx,
-                    status_tx,
-                    config,
-                    wanted_count,
-                    backend,
-                    backend_connector,
-                    stats,
-                    failure_window,
-                );
                 worker.run().await;
             }
         });
 
         Self {
-            tx,
+            slots,
             status_rx,
             name,
             stats,
@@ -1321,15 +1308,12 @@ impl<Conn: Connection> Set<Conn> {
         name = "Set::claim",
         fields(name = ?self.name),
     )]
-    pub(crate) async fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
-        let (tx, rx) = oneshot::channel();
-
-        self.tx
-            .send(SetRequest::Claim { id, tx })
-            .await
-            .map_err(|_| Error::SlotWorkerTerminated)?;
-
-        rx.await.map_err(|_| Error::SlotWorkerTerminated)?
+    pub(crate) fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
+        let mut slots = self.slots.lock().unwrap();
+        if slots.terminating {
+            return Err(Error::SlotWorkerTerminated);
+        }
+        slots.claim(id)
     }
 
     /// Updates the number of "wanted" slots within the slot set.
@@ -1342,11 +1326,12 @@ impl<Conn: Connection> Set<Conn> {
         name = "Set::set_wanted_count",
         fields(name = ?self.name),
     )]
-    pub(crate) async fn set_wanted_count(&mut self, count: usize) -> Result<(), Error> {
-        self.tx
-            .send(SetRequest::SetWantedCount { count })
-            .await
-            .map_err(|_| Error::SlotWorkerTerminated)?;
+    pub(crate) fn set_wanted_count(&mut self, count: usize) -> Result<(), Error> {
+        let mut slots = self.slots.lock().unwrap();
+        if slots.terminating {
+            return Err(Error::SlotWorkerTerminated);
+        }
+        slots.set_wanted_count(count);
         Ok(())
     }
 
@@ -1547,7 +1532,7 @@ mod test {
             .await
             .unwrap();
 
-        let _conn = set.claim(ClaimId::new()).await.unwrap();
+        let _conn = set.claim(ClaimId::new()).unwrap();
     }
 
     #[tokio::test]
@@ -1570,8 +1555,8 @@ mod test {
             .unwrap();
 
         // Grab a connection, then set the "Wanted" count to zero.
-        let conn = set.claim(ClaimId::new()).await.unwrap();
-        set.set_wanted_count(0).await.unwrap();
+        let conn = set.claim(ClaimId::new()).unwrap();
+        set.set_wanted_count(0).unwrap();
 
         // Let the connections drain
         loop {
@@ -1610,13 +1595,12 @@ mod test {
 
         // We start with nothing available
         set.claim(ClaimId::new())
-            .await
             .map(|_| ())
             .expect_err("Should not be able to get claims yet");
         assert_eq!(set.get_state(), SetState::Offline);
 
         // We can later adjust the count of desired slots
-        set.set_wanted_count(3).await.unwrap();
+        set.set_wanted_count(3).unwrap();
 
         // Let the connections fill up
         set.monitor()
@@ -1625,7 +1609,7 @@ mod test {
             .unwrap();
 
         // When this completes, the connections may be claimed
-        let _conn = set.claim(ClaimId::new()).await.unwrap();
+        let _conn = set.claim(ClaimId::new()).unwrap();
     }
 
     #[tokio::test]
@@ -1652,12 +1636,11 @@ mod test {
             }
         }
 
-        let _conn1 = set.claim(ClaimId::new()).await.unwrap();
-        let _conn2 = set.claim(ClaimId::new()).await.unwrap();
-        let conn3 = set.claim(ClaimId::new()).await.unwrap();
+        let _conn1 = set.claim(ClaimId::new()).unwrap();
+        let _conn2 = set.claim(ClaimId::new()).unwrap();
+        let conn3 = set.claim(ClaimId::new()).unwrap();
 
         set.claim(ClaimId::new())
-            .await
             .map(|_| ())
             .expect_err("We should fail to acquire a 4th claim from 3 slot set");
 
@@ -1675,7 +1658,7 @@ mod test {
             }
         }
 
-        let _conn4 = set.claim(ClaimId::new()).await.unwrap();
+        let _conn4 = set.claim(ClaimId::new()).unwrap();
     }
 
     #[tokio::test]
@@ -1728,14 +1711,13 @@ mod test {
         ));
 
         // Grab three connections
-        let _claim1 = set.claim(ClaimId::new()).await.expect("Failed to claim");
-        let _claim2 = set.claim(ClaimId::new()).await.expect("Failed to claim");
-        let claim3 = set.claim(ClaimId::new()).await.expect("Failed to claim");
+        let _claim1 = set.claim(ClaimId::new()).expect("Failed to claim");
+        let _claim2 = set.claim(ClaimId::new()).expect("Failed to claim");
+        let claim3 = set.claim(ClaimId::new()).expect("Failed to claim");
 
         // Cannot claim the fourth connection, this slot set is all used.
         assert!(matches!(
             set.claim(ClaimId::new())
-                .await
                 .map(|_| ())
                 .expect_err("Should have reached claim capacity"),
             Error::NoSlotsReady,
@@ -1869,7 +1851,7 @@ mod test {
         }
 
         // Grab one of the slots. Inspect the state, validating it is connected.
-        let conn = set.claim(ClaimId::new()).await.unwrap();
+        let conn = set.claim(ClaimId::new()).unwrap();
         let raw_conn = conn.clone();
         assert_eq!(raw_conn.get_state(), TestConnectionState::Connected);
         drop(conn);
@@ -1891,7 +1873,7 @@ mod test {
         assert_eq!(raw_conn.get_state(), TestConnectionState::Recycled);
 
         connector.set_recyclable(false);
-        let conn = set.claim(ClaimId::new()).await.unwrap();
+        let conn = set.claim(ClaimId::new()).unwrap();
         let raw_conn = conn.clone();
         assert_eq!(raw_conn.get_state(), TestConnectionState::Recycled);
         drop(conn);
@@ -1946,7 +1928,7 @@ mod test {
         //
         // This means no new connections, and existing connections will die
         // when health checked.
-        let conn = set.claim(ClaimId::new()).await.unwrap();
+        let conn = set.claim(ClaimId::new()).unwrap();
         connector.set_connectable(false);
         connector.set_valid(false);
         let raw_conn = conn.clone();
@@ -1991,19 +1973,21 @@ mod test {
             .await
             .unwrap();
 
-        let conn = set.claim(ClaimId::new()).await.unwrap();
+        let conn = set.claim(ClaimId::new()).unwrap();
 
         // We should be able to terminate, even with a claim out.
         set.terminate().await;
 
-        assert!(matches!(
-            set.claim(ClaimId::new()).await.map(|_| ()).unwrap_err(),
-            Error::SlotWorkerTerminated,
-        ));
-        assert!(matches!(
-            set.set_wanted_count(1).await.unwrap_err(),
-            Error::SlotWorkerTerminated
-        ));
+        let err = set.claim(ClaimId::new()).map(|_| ()).unwrap_err();
+        assert!(
+            matches!(err, Error::SlotWorkerTerminated,),
+            "Unexpected error: {err}"
+        );
+        let err = set.set_wanted_count(1).unwrap_err();
+        assert!(
+            matches!(err, Error::SlotWorkerTerminated),
+            "Unexpected error: {err}"
+        );
 
         drop(conn);
     }
@@ -2106,14 +2090,14 @@ mod test {
                     })
                     .await
                     .unwrap();
-                handles.push(set.claim(ClaimId::new()).await.unwrap());
+                handles.push(set.claim(ClaimId::new()).unwrap());
             }
 
             // All future connections should be slow!
             connector.stall();
 
             // This should start making new connections...
-            set.set_wanted_count(config.new_wanted).await.unwrap();
+            set.set_wanted_count(config.new_wanted).unwrap();
 
             set.terminate().await;
 
@@ -2121,10 +2105,11 @@ mod test {
 
             drop(handles);
 
-            assert!(matches!(
-                set.claim(ClaimId::new()).await.map(|_| ()).unwrap_err(),
-                Error::SlotWorkerTerminated,
-            ));
+            let err = set.claim(ClaimId::new()).map(|_| ()).unwrap_err();
+            assert!(
+                matches!(err, Error::SlotWorkerTerminated,),
+                "Unexpected err: {err}"
+            );
         }
     }
 }
