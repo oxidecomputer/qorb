@@ -655,33 +655,29 @@ struct Slots<Conn: Connection> {
     pool_name: pool::Name,
     name: backend::Name,
     backend: Backend,
+    // Interface for actually connecting to backends
+    backend_connector: SharedConnector<Conn>,
     config: SetConfig,
+
+    // The actual underlying slots, by ID.
+    slots: BTreeMap<SlotId, Slot<Conn>>,
+    // The desired number of slots
+    wanted_count: usize,
+    next_slot_id: SlotId,
 
     // If "true", new requests are rejected
     terminating: bool,
 
-    // Interface for actually connecting to backends
-    backend_connector: SharedConnector<Conn>,
-
     // Interface for communicating backend status
     status_tx: watch::Sender<SetState>,
-
-    slots: BTreeMap<SlotId, Slot<Conn>>,
+    // Sender for returning old handles.
+    slot_tx: mpsc::Sender<BorrowedConnection<Conn>>,
 
     // Summary information about the health of all slots.
     //
     // Must be kept in lockstep with "Self::slots"
     stats: Arc<Mutex<Stats>>,
-
     failure_window: Arc<WindowedCounter>,
-
-    // Sender for returning old handles.
-    slot_tx: mpsc::Sender<BorrowedConnection<Conn>>,
-
-    // The desired number of slots
-    wanted_count: usize,
-
-    next_slot_id: SlotId,
 }
 
 impl<Conn: Connection> Slots<Conn> {
@@ -1068,16 +1064,16 @@ impl<Conn: Connection> SetWorker<Conn> {
                 pool_name,
                 name,
                 backend,
-                config,
-                terminating: false,
                 backend_connector,
-                status_tx,
+                config,
                 slots: BTreeMap::new(),
-                stats,
-                failure_window,
-                slot_tx,
                 wanted_count,
                 next_slot_id: SlotId::first(set_id),
+                terminating: false,
+                status_tx,
+                slot_tx,
+                stats,
+                failure_window,
             })),
         };
         set.set_wanted_count(wanted_count);
