@@ -281,6 +281,12 @@ impl<Conn: Connection> PoolInner<Conn> {
                 }
             };
 
+            // Cancel safety: All branches of this select! statement are
+            // cancel-safe (mpsc::Receiver::recv, tokio::time::sleep_until,
+            // monitoring the tokio::sync::watch::Receivers)
+            //
+            // Futurelock safety: All select arms are queried concurrently. No
+            // awaiting happens outside this concurrent polling.
             tokio::select! {
                 // Handle requests from clients
                 request = self.rx.recv() => {
@@ -334,6 +340,12 @@ impl<Conn: Connection> PoolInner<Conn> {
                 },
             }
         }
+
+        // Out of an abundance of caution, to avoid futurelock: drop all
+        // possible unpolled futures before invoking terminate.
+        drop(rebalance_interval);
+        drop(backend_status_stream);
+        drop(resolver_stream);
 
         self.terminate().await;
     }

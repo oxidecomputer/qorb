@@ -14,7 +14,7 @@ use derive_where::derive_where;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 use tracing::{event, instrument, span, Instrument, Level};
@@ -121,8 +121,8 @@ struct SlotInner<Conn: Connection> {
     // All fields of the slot which need to be guarded behind a mutex
     guarded: Mutex<SlotInnerGuarded<Conn>>,
 
-    // A notification channel indicating that the slot needs recyling
-    recycling_needed: Notify,
+    // A watch channel indicating that the slot needs recycling
+    recycling_needed_tx: tokio::sync::watch::Sender<bool>,
 
     // This is wrapped in an "Arc" because it's shared with all slots in the slot set.
     stats: Arc<Mutex<Stats>>,
@@ -284,13 +284,17 @@ impl<Conn: Connection> Slot<Conn> {
         backend: &Backend,
         terminate_rx: &mut tokio::sync::oneshot::Receiver<()>,
     ) -> bool {
+        // Cancel safety: We don't care about the state of the slot if we're terminating.
+        //
+        // Futurelock safety: Both select arms are queried concurrently. No awaiting happens
+        // outside this concurrent polling.
         tokio::select! {
             biased;
             _ = &mut *terminate_rx => {
-                return false;
+                false
             }
             _ = self.try_connect_forever(slot_id, config, connector, backend) => {
-                return true;
+                true
             }
         }
     }
@@ -364,6 +368,37 @@ impl<Conn: Connection> Slot<Conn> {
         res
     }
 
+    // Returns "true" if we should terminate, returns "false" otherwise.
+    async fn recycle_if_needed_or_terminate(
+        &self,
+        slot_id: SlotId,
+        connector: &SharedConnector<Conn>,
+        timeout: Duration,
+        backend: &Backend,
+        terminate_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    ) -> bool {
+        // Cancel safety: If we're terminating, we don't care about the state of the slot. If we
+        // finish recycling, "terminate_rx" is borrowed, and not cancelled.
+        //
+        // Futurelock safety: Both select arms are queried concurrently. No awaiting happens
+        // outside this concurrent polling.
+        tokio::select! {
+            biased;
+            _ = terminate_rx => {
+                event!(
+                    Level::TRACE,
+                    slot_id = slot_id.as_u64(),
+                    "Terminating while recycling"
+                );
+                true
+            },
+            _ = self.recycle_if_needed(slot_id, connector, timeout, backend) => {
+                false
+            }
+        }
+    }
+
+    // Recycles the connection, transitioning to "unclaimed" or "connecting".
     #[instrument(
         level = "trace",
         skip(self, connector),
@@ -457,6 +492,37 @@ impl<Conn: Connection> Slot<Conn> {
         }
     }
 
+    // Returns "true" if we should terminate, returns "false" otherwise.
+    async fn validate_health_if_connected_or_terminate(
+        &self,
+        slot_id: SlotId,
+        connector: &SharedConnector<Conn>,
+        timeout: Duration,
+        backend: &Backend,
+        terminate_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    ) -> bool {
+        // Cancel safety: If we're terminating, we don't care about the state of the slot. If we
+        // finish recycling, "terminate_rx" is borrowed, and not cancelled.
+        //
+        // Futurelock safety: Both select arms are queried concurrently. No awaiting happens
+        // outside this concurrent polling.
+        tokio::select! {
+            biased;
+            _ = terminate_rx => {
+                event!(
+                    Level::TRACE,
+                    slot_id = slot_id.as_u64(),
+                    "Terminating while validating health"
+                );
+                true
+            },
+            _ = self.validate_health_if_connected(slot_id, connector, timeout, backend) => {
+                false
+            }
+        }
+    }
+
+    // Queries "is_valid" on a connection, updating the state based on health.
     #[instrument(
         level = "trace",
         skip(self, connector),
@@ -892,6 +958,7 @@ impl<Conn: Connection> Slots<Conn> {
 
     fn create_slot(&mut self, slot_id: SlotId) {
         let (terminate_tx, mut terminate_rx) = tokio::sync::oneshot::channel();
+        let (recycling_needed_tx, recycling_needed_rx) = tokio::sync::watch::channel(false);
         let slot = Slot {
             inner: Arc::new(SlotInner {
                 guarded: Mutex::new(SlotInnerGuarded {
@@ -900,7 +967,7 @@ impl<Conn: Connection> Slots<Conn> {
                     terminate_tx: Some(terminate_tx),
                     handle: None,
                 }),
-                recycling_needed: Notify::new(),
+                recycling_needed_tx,
                 stats: self.stats.clone(),
                 failure_window: self.failure_window.clone(),
                 pool_name: self.pool_name.clone(),
@@ -917,6 +984,7 @@ impl<Conn: Connection> Slots<Conn> {
             let config = self.config.clone();
             let connector = self.backend_connector.clone();
             let backend = self.backend.clone();
+            let mut recycling_needed_rx = recycling_needed_rx;
             async move {
                 let mut interval = interval(config.health_interval);
 
@@ -988,11 +1056,16 @@ impl<Conn: Connection> Slots<Conn> {
                             }
                         }
                         Work::DoMonitor => {
+                            // Cancel safety: "tick()" and "changed()" are both cancel-safe; if we
+                            // take one branch, the other is not consumed. "terminate_rx" is also
+                            // borrowed, and will not be cancelled.
+                            //
+                            // Futurelock safety: The only borrowed future is "terminate_rx", which
+                            // we will continue to poll in the other select arms. The other futures
+                            // are dropped immediately.
                             tokio::select! {
                                 biased;
                                 _ = &mut terminate_rx => {
-                                    // If we've been instructed to bail out,
-                                    // do that immediately.
                                     event!(
                                         Level::TRACE,
                                         slot_id = slot_id.as_u64(),
@@ -1001,23 +1074,27 @@ impl<Conn: Connection> Slots<Conn> {
                                     return;
                                 },
                                 _ = interval.tick() => {
-                                    slot.validate_health_if_connected(
+                                    if slot.validate_health_if_connected_or_terminate(
                                         slot_id,
                                         &connector,
                                         config.health_check_timeout,
                                         &backend,
+                                        &mut terminate_rx,
                                     )
-                                    .await;
-                                    interval
-                                        .reset_after(interval.period().add_spread(config.spread));
+                                    .await { return; }
+                                    interval.reset_after(interval.period().add_spread(config.spread));
                                 },
-                                _ = slot.inner.recycling_needed.notified() => {
-                                    slot.recycle_if_needed(
-                                        slot_id,
-                                        &connector,
-                                        config.health_check_timeout,
-                                        &backend,
-                                    ).await;
+                                _ = recycling_needed_rx.changed() => {
+                                    if *recycling_needed_rx.borrow_and_update() {
+                                        if slot.recycle_if_needed_or_terminate(
+                                            slot_id,
+                                            &connector,
+                                            config.health_check_timeout,
+                                            &backend,
+                                            &mut terminate_rx,
+                                        ).await { return; }
+                                        let _ = slot.inner.recycling_needed_tx.send(false);
+                                    }
                                 },
                             }
                         }
@@ -1136,7 +1213,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         // slot count after recycling each connection.
         slots.conform_slot_count();
 
-        inner.recycling_needed.notify_one();
+        let _ = inner.recycling_needed_tx.send(true);
     }
 
     fn set_wanted_count(&mut self, count: usize) {
@@ -1152,6 +1229,11 @@ impl<Conn: Connection> SetWorker<Conn> {
     )]
     async fn run(&mut self) {
         loop {
+            // Cancel safety: "recv()" is cancel-safe, but we also don't care about it if
+            // we're terminating. "terminate_rx" is borrowed, and will not be cancelled.
+            //
+            // Futurelock safety: Both select arms are queried concurrently. No awaiting happens
+            // outside this concurrent polling.
             tokio::select! {
                 biased;
                 // If we should exit, terminate immediately.
@@ -2117,5 +2199,124 @@ mod test {
                 "Unexpected err: {err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_terminate_during_health_validation() {
+        setup_tracing_subscriber();
+
+        let connector = Arc::new(crate::test_utils::SlowConnector::new());
+        let mut set = Set::new(
+            0,
+            pool::Name::new("my-pool"),
+            SetConfig {
+                // Fast health checks so they run frequently
+                health_interval: Duration::from_millis(1),
+                spread: Duration::ZERO,
+                // Explicit timeout for health checks
+                health_check_timeout: Duration::from_secs(5),
+                ..Default::default()
+            },
+            3,
+            backend::Name::new("Test set"),
+            backend::Backend { address: BACKEND },
+            connector.clone(),
+        );
+
+        // Wait for the connections to come online
+        set.monitor()
+            .wait_for(|state| matches!(state, SetState::Online { .. }))
+            .await
+            .unwrap();
+
+        // Make health validation take forever
+        connector.stall();
+
+        // Give the health check time to start (it runs every 1ms)
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Terminate should complete quickly, even though health checks are blocked
+        let start = std::time::Instant::now();
+        set.terminate().await;
+        let elapsed = start.elapsed();
+
+        // Termination should be fast (less than 1 second)
+        // If it's slow, it means we waited for the stalled health check
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Termination took too long: {:?}",
+            elapsed
+        );
+
+        // After termination, connector should not be accessed
+        connector.panic_on_access();
+
+        let err = set.claim(ClaimId::new()).map(|_| ()).unwrap_err();
+        assert!(
+            matches!(err, Error::SlotWorkerTerminated,),
+            "Unexpected err: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_terminate_during_recycling() {
+        setup_tracing_subscriber();
+
+        let connector = Arc::new(crate::test_utils::SlowConnector::new());
+        let mut set = Set::new(
+            0,
+            pool::Name::new("my-pool"),
+            SetConfig {
+                // Make health checks slow so they don't interfere
+                health_interval: Duration::from_secs(1000),
+                // Explicit timeout for recycling operations
+                health_check_timeout: Duration::from_secs(5),
+                ..Default::default()
+            },
+            3,
+            backend::Name::new("Test set"),
+            backend::Backend { address: BACKEND },
+            connector.clone(),
+        );
+
+        // Wait for the connections to come online
+        set.monitor()
+            .wait_for(|state| matches!(state, SetState::Online { .. }))
+            .await
+            .unwrap();
+
+        // Claim a connection to trigger recycling later
+        let handle = set.claim(ClaimId::new()).unwrap();
+
+        // Make recycling take forever
+        connector.stall();
+
+        // Return the handle to trigger recycling
+        drop(handle);
+
+        // Give recycling time to start
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Terminate should complete quickly, even though recycling is blocked
+        let start = std::time::Instant::now();
+        set.terminate().await;
+        let elapsed = start.elapsed();
+
+        // Termination should be fast (less than 1 second)
+        // If it's slow, it means we waited for the stalled recycling
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Termination took too long: {:?}",
+            elapsed
+        );
+
+        // After termination, connector should not be accessed
+        connector.panic_on_access();
+
+        let err = set.claim(ClaimId::new()).map(|_| ()).unwrap_err();
+        assert!(
+            matches!(err, Error::SlotWorkerTerminated,),
+            "Unexpected err: {err}"
+        );
     }
 }

@@ -172,6 +172,7 @@ impl DnsResolverWorker {
             .or_insert_with(|| Client::new(&self.config, address, failure_window));
     }
 
+    // This function is cancel-safe.
     async fn tick_and_query_dns(&mut self, query_interval: &mut tokio::time::Interval) {
         // We want to wait for "query_interval"'s timeout to pass before
         // starting to query DNS. However, if we're partway through "query_dns"
@@ -198,6 +199,10 @@ impl DnsResolverWorker {
         loop {
             let next_backend_expiration = self.sleep_until_next_backend_expiration();
 
+            // Cancel safety: All branches are cancel-safe.
+            //
+            // Futurelock safety: All select arms are queried concurrently. No
+            // awaiting happens outside this concurrent polling.
             tokio::select! {
                 _ = &mut terminate_rx => return,
                 _ = self.tick_and_query_dns(&mut query_interval) => {},
@@ -356,6 +361,7 @@ impl DnsResolverWorker {
         });
     }
 
+    // This function is cancel-safe.
     fn sleep_until_next_backend_expiration(&self) -> impl Future<Output = backend::Name> {
         let next_expiration = self.backends.iter().reduce(|soonest, backend| {
             let Some(backend_expiration) = backend.1.expires_at else {
