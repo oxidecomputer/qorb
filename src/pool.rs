@@ -291,19 +291,13 @@ impl<Conn: Connection> PoolInner<Conn> {
                         // The caller has explicitly asked us to terminate, and
                         // we should respond to them once we've stopped doing
                         // work.
-                        Some(Request::Terminate) => {
-                            self.terminate().await;
-                            return;
-                        },
+                        Some(Request::Terminate) => break,
                         // The caller has abandoned their connection to the pool.
                         //
                         // We stop handling new requests, but have no one to
                         // notify. Given that the caller no longer needs the
                         // pool, we choose to terminate to avoid leaks.
-                        None => {
-                            self.terminate().await;
-                            return;
-                        }
+                        None => break,
                     }
                 }
                 // Timeout old requests from clients
@@ -329,7 +323,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                     self.rebalance();
                 }
                 // If any of the slots change state, update their allocations.
-                Some((name, status)) = &mut backend_status_stream.next(), if !backend_status_stream.is_empty() => {
+                Some((name, status)) = backend_status_stream.next(), if !backend_status_stream.is_empty() => {
                     event!(Level::INFO, name = ?name, status = ?status, "Rebalancing: Backend has new status");
                     rebalance_interval.reset();
                     self.rebalance();
@@ -340,6 +334,8 @@ impl<Conn: Connection> PoolInner<Conn> {
                 },
             }
         }
+
+        self.terminate().await;
     }
 
     fn claim_or_enqueue(

@@ -284,39 +284,49 @@ impl<Conn: Connection> Slot<Conn> {
         backend: &Backend,
         terminate_rx: &mut tokio::sync::oneshot::Receiver<()>,
     ) -> bool {
-        let mut retry_duration = config.min_connection_backoff.add_spread(config.spread);
+        tokio::select! {
+            biased;
+            _ = &mut *terminate_rx => {
+                return false;
+            }
+            _ = self.try_connect_forever(slot_id, config, connector, backend) => {
+                return true;
+            }
+        }
+    }
 
+    async fn try_connect_forever(
+        &self,
+        #[cfg_attr(not(feature = "probes"), allow(unused_variables))] slot_id: SlotId,
+        config: &SetConfig,
+        connector: &SharedConnector<Conn>,
+        backend: &Backend,
+    ) {
+        let mut retry_duration = config.min_connection_backoff.add_spread(config.spread);
         loop {
-            tokio::select! {
-                biased;
-                _ = &mut *terminate_rx => {
-                    return false;
+            let result = self.do_connect(slot_id, connector, backend).await;
+            match result {
+                Ok(conn) => {
+                    self.inner.state_transition(
+                        slot_id,
+                        backend,
+                        self.inner.guarded.lock().unwrap(),
+                        State::ConnectedUnclaimed(DebugIgnore(conn)),
+                    );
+                    return;
                 }
-                result = self.do_connect(slot_id, connector, backend) => {
-                    match result {
-                        Ok(conn) => {
-                            self.inner.state_transition(
-                                slot_id,
-                                backend,
-                                self.inner.guarded.lock().unwrap(),
-                                State::ConnectedUnclaimed(DebugIgnore(conn)),
-                            );
-                            return true;
-                        }
-                        Err(err) => {
-                            event!(
-                                Level::WARN,
-                                pool_name = self.inner.pool_name.as_str(),
-                                ?err,
-                                ?backend,
-                                "Failed to connect"
-                            );
-                            self.inner.failure_window.add(1);
-                            retry_duration =
-                                retry_duration.exponential_backoff(config.max_connection_backoff);
-                            tokio::time::sleep(retry_duration).await;
-                        }
-                    }
+                Err(err) => {
+                    event!(
+                        Level::WARN,
+                        pool_name = self.inner.pool_name.as_str(),
+                        ?err,
+                        ?backend,
+                        "Failed to connect"
+                    );
+                    self.inner.failure_window.add(1);
+                    retry_duration =
+                        retry_duration.exponential_backoff(config.max_connection_backoff);
+                    tokio::time::sleep(retry_duration).await;
                 }
             }
         }

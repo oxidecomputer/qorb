@@ -15,6 +15,7 @@ use hickory_resolver::config::ResolverOpts;
 use hickory_resolver::error::{ResolveError, ResolveErrorKind};
 use hickory_resolver::TokioAsyncResolver;
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::net::SocketAddrV6;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -171,22 +172,35 @@ impl DnsResolverWorker {
             .or_insert_with(|| Client::new(&self.config, address, failure_window));
     }
 
+    async fn tick_and_query_dns(&mut self, query_interval: &mut tokio::time::Interval) {
+        // We want to wait for "query_interval"'s timeout to pass before
+        // starting to query DNS. However, if we're partway through "query_dns"
+        // and we are cancelled, we'd like to resume immediately.
+        //
+        // To accomplish this:
+        // - After we tick once, we "reset_immediately" so tick will fire
+        // again immediately if this future is dropped and re-created.
+        // - Once we finish "query_dns", we reset the query interval to
+        // actually respect the "tick period" of time.
+        query_interval.tick().await;
+        query_interval.reset_immediately();
+
+        self.query_dns().await;
+        if self.backends.is_empty() {
+            query_interval.reset_after(self.config.query_retry_if_no_records_found);
+        } else {
+            query_interval.reset();
+        }
+    }
+
     async fn run(mut self, mut terminate_rx: tokio::sync::oneshot::Receiver<()>) {
         let mut query_interval = tokio::time::interval(self.config.query_interval);
         loop {
-            let next_tick = query_interval.tick();
             let next_backend_expiration = self.sleep_until_next_backend_expiration();
 
             tokio::select! {
-                _ = &mut terminate_rx => {
-                    return;
-                },
-                _ = next_tick => {
-                    self.query_dns().await;
-                    if self.backends.is_empty() {
-                        query_interval.reset_after(self.config.query_retry_if_no_records_found);
-                    }
-                },
+                _ = &mut terminate_rx => return,
+                _ = self.tick_and_query_dns(&mut query_interval) => {},
                 backend_name = next_backend_expiration => {
                     if self.backends.remove(&backend_name).is_some() {
                         self.watch_tx.send_modify(|backends| {
@@ -342,7 +356,7 @@ impl DnsResolverWorker {
         });
     }
 
-    async fn sleep_until_next_backend_expiration(&self) -> backend::Name {
+    fn sleep_until_next_backend_expiration(&self) -> impl Future<Output = backend::Name> {
         let next_expiration = self.backends.iter().reduce(|soonest, backend| {
             let Some(backend_expiration) = backend.1.expires_at else {
                 return soonest;
@@ -364,20 +378,21 @@ impl DnsResolverWorker {
             }
         });
 
-        let Some((
-            name,
-            BackendRecord {
-                expires_at: Some(deadline),
-                ..
-            },
-        )) = next_expiration
-        else {
-            let () = futures::future::pending().await;
-            unreachable!();
+        let (name, deadline) = match next_expiration {
+            Some((
+                name,
+                BackendRecord {
+                    expires_at: Some(deadline),
+                    ..
+                },
+            )) => (name.clone(), *deadline),
+            _ => return futures::future::Either::Left(futures::future::pending()),
         };
 
-        tokio::time::sleep_until((*deadline).into()).await;
-        name.clone()
+        futures::future::Either::Right(async move {
+            tokio::time::sleep_until(deadline.into()).await;
+            name
+        })
     }
 }
 
