@@ -688,7 +688,7 @@ impl<Conn: Connection> Slots<Conn> {
         name = "Slots::claim",
         fields(name = ?self.name),
     )]
-    fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
+    fn claim(&self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
         #[cfg(feature = "probes")]
         probes::slot__set__claim__start!(|| (
             self.pool_name.as_str(),
@@ -745,7 +745,7 @@ impl<Conn: Connection> Slots<Conn> {
         name = "Slots::take_connected_unclaimed_slot"
     )]
     fn take_connected_unclaimed_slot(
-        &mut self,
+        &self,
         permit: mpsc::OwnedPermit<BorrowedConnection<Conn>>,
         claim_id: ClaimId,
     ) -> Option<claim::Handle<Conn>> {
@@ -1054,7 +1054,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         failure_window: Arc<WindowedCounter>,
     ) -> Self {
         let (slot_tx, slot_rx) = mpsc::channel(config.max_count);
-        let mut set = Self {
+        let set = Self {
             pool_name: pool_name.clone(),
             name: name.clone(),
             backend: backend.clone(),
@@ -1090,7 +1090,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         ),
         name = "SetWorker::recycle_connection"
     )]
-    fn recycle_connection(&mut self, borrowed_conn: BorrowedConnection<Conn>) {
+    fn recycle_connection(&self, borrowed_conn: BorrowedConnection<Conn>) {
         let slot_id = borrowed_conn.id;
         #[cfg(feature = "probes")]
         crate::probes::handle__returned!(|| (self.pool_name.as_str(), slot_id.as_u64()));
@@ -1129,7 +1129,7 @@ impl<Conn: Connection> SetWorker<Conn> {
         inner.recycling_needed.notify_one();
     }
 
-    fn set_wanted_count(&mut self, count: usize) {
+    fn set_wanted_count(&self, count: usize) {
         let mut slots = self.slots.lock().unwrap();
         slots.set_wanted_count(count);
     }
@@ -1304,8 +1304,8 @@ impl<Conn: Connection> Set<Conn> {
         name = "Set::claim",
         fields(name = ?self.name),
     )]
-    pub(crate) fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
-        let mut slots = self.slots.lock().unwrap();
+    pub(crate) fn claim(&self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
+        let slots = self.slots.lock().unwrap();
         if slots.terminating {
             return Err(Error::SlotWorkerTerminated);
         }
@@ -1322,7 +1322,7 @@ impl<Conn: Connection> Set<Conn> {
         name = "Set::set_wanted_count",
         fields(name = ?self.name),
     )]
-    pub(crate) fn set_wanted_count(&mut self, count: usize) -> Result<(), Error> {
+    pub(crate) fn set_wanted_count(&self, count: usize) -> Result<(), Error> {
         let mut slots = self.slots.lock().unwrap();
         if slots.terminating {
             return Err(Error::SlotWorkerTerminated);
@@ -1512,7 +1512,7 @@ mod test {
     #[tokio::test]
     async fn test_one_claim() {
         setup_tracing_subscriber();
-        let mut set = Set::new(
+        let set = Set::new(
             0,
             pool::Name::new("my-pool"),
             SetConfig::default(),
@@ -1534,7 +1534,7 @@ mod test {
     #[tokio::test]
     async fn test_drain_slots() {
         setup_tracing_subscriber();
-        let mut set = Set::new(
+        let set = Set::new(
             0,
             pool::Name::new("my-pool"),
             SetConfig::default(),
@@ -1579,7 +1579,7 @@ mod test {
     #[tokio::test]
     async fn test_no_slots_add_some_later() {
         setup_tracing_subscriber();
-        let mut set = Set::new(
+        let set = Set::new(
             0,
             pool::Name::new("my-pool"),
             SetConfig::default(),
@@ -1611,7 +1611,7 @@ mod test {
     #[tokio::test]
     async fn test_all_claims() {
         setup_tracing_subscriber();
-        let mut set = Set::new(
+        let set = Set::new(
             0,
             pool::Name::new("my-pool"),
             SetConfig::default(),
@@ -1663,7 +1663,7 @@ mod test {
 
         let connector = Arc::new(TestConnector::new());
 
-        let mut set = Set::new(
+        let set = Set::new(
             0,
             pool::Name::new("my-pool"),
             SetConfig {
@@ -1820,7 +1820,7 @@ mod test {
 
         let wanted_count = 5;
         let connector = Arc::new(TestConnector::new());
-        let mut set = Set::new(
+        let set = Set::new(
             0,
             pool::Name::new("my-pool"),
             SetConfig {
@@ -1901,7 +1901,7 @@ mod test {
         let wanted_count = 5;
         let connector = Arc::new(TestConnector::new());
         let health_interval = Duration::from_millis(1);
-        let mut set = Set::new(
+        let set = Set::new(
             0,
             pool::Name::new("my-pool"),
             SetConfig {
