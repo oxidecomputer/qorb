@@ -286,7 +286,7 @@ impl<Conn: Connection> PoolInner<Conn> {
                 request = self.rx.recv() => {
                     match request {
                         Some(Request::Claim { id, tx }) => {
-                            self.claim_or_enqueue(id, tx).await
+                            self.claim_or_enqueue(id, tx)
                         }
                         // The caller has explicitly asked us to terminate, and
                         // we should respond to them once we've stopped doing
@@ -326,28 +326,28 @@ impl<Conn: Connection> PoolInner<Conn> {
                 // Periodically rebalance the allocation of slots to backends
                 _ = rebalance_interval.tick() => {
                     event!(Level::INFO, "Rebalancing: timer tick");
-                    self.rebalance().await;
+                    self.rebalance();
                 }
                 // If any of the slots change state, update their allocations.
                 Some((name, status)) = &mut backend_status_stream.next(), if !backend_status_stream.is_empty() => {
                     event!(Level::INFO, name = ?name, status = ?status, "Rebalancing: Backend has new status");
                     rebalance_interval.reset();
-                    self.rebalance().await;
+                    self.rebalance();
 
                     if matches!(status, slot::SetState::Online { has_unclaimed_slots: true }) {
-                        self.try_claim_from_queue().await;
+                        self.try_claim_from_queue();
                     }
                 },
             }
         }
     }
 
-    async fn claim_or_enqueue(
+    fn claim_or_enqueue(
         &mut self,
         id: ClaimId,
         tx: oneshot::Sender<Result<claim::Handle<Conn>, Error>>,
     ) {
-        let result = self.claim(id).await;
+        let result = self.claim(id);
         if result.is_ok() {
             let _ = tx.send(result);
             return;
@@ -364,13 +364,13 @@ impl<Conn: Connection> PoolInner<Conn> {
         });
     }
 
-    async fn try_claim_from_queue(&mut self) {
+    fn try_claim_from_queue(&mut self) {
         loop {
             let Some(request) = self.request_queue.pop_front() else {
                 return;
             };
 
-            let result = self.claim(request.id).await;
+            let result = self.claim(request.id);
             if result.is_ok() {
                 let _ = request.tx.send(result);
             } else {
@@ -394,16 +394,16 @@ impl<Conn: Connection> PoolInner<Conn> {
     }
 
     #[instrument(skip(self), name = "PoolInner::rebalance")]
-    async fn rebalance(&mut self) {
+    fn rebalance(&mut self) {
         #[cfg(feature = "probes")]
         probes::rebalance__start!(|| self.name.as_str());
-        self.rebalance_inner().await;
+        self.rebalance_inner();
 
         #[cfg(feature = "probes")]
         probes::rebalance__done!(|| self.name.as_str());
     }
 
-    async fn rebalance_inner(&mut self) {
+    fn rebalance_inner(&mut self) {
         let mut questionable_backend_count = 0;
         let mut usable_backends = vec![];
 
@@ -412,7 +412,7 @@ impl<Conn: Connection> PoolInner<Conn> {
         for (name, slot_set) in iter {
             match slot_set.get_state() {
                 slot::SetState::Offline => {
-                    let _ = slot_set.set_wanted_count(1).await;
+                    let _ = slot_set.set_wanted_count(1);
                     questionable_backend_count += 1;
                 }
                 slot::SetState::Online { .. } => {
@@ -442,7 +442,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             let Some(slot_set) = self.slots.get_mut(&name) else {
                 continue;
             };
-            let _ = slot_set.set_wanted_count(slots_wanted_per_backend).await;
+            let _ = slot_set.set_wanted_count(slots_wanted_per_backend);
         }
 
         let mut new_priority_list = PriorityList::new();
@@ -472,7 +472,7 @@ impl<Conn: Connection> PoolInner<Conn> {
         self.priority_list = new_priority_list;
     }
 
-    async fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
+    fn claim(&mut self, id: ClaimId) -> Result<claim::Handle<Conn>, Error> {
         let mut attempted_backend = vec![];
         let mut result = Err(Error::NoBackends);
 
@@ -504,7 +504,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             //
             // Either way, put this backend back in the priority list after
             // we're done with it.
-            let Ok(claim) = set.claim(id).await else {
+            let Ok(claim) = set.claim(id) else {
                 event!(Level::DEBUG, "Failed to actually get claim for backend");
                 rebalancer::claimed_err(&mut weighted_backend);
                 attempted_backend.push(weighted_backend);
@@ -525,7 +525,7 @@ impl<Conn: Connection> PoolInner<Conn> {
             Err(_) => probes::pool__claim__failed!(|| (self.name.as_str(), id.0)),
         }
 
-        self.priority_list.extend(attempted_backend.into_iter());
+        self.priority_list.extend(attempted_backend);
         result
     }
 }
